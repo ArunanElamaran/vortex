@@ -281,6 +281,17 @@ inline __attribute__((const)) int vx_shfl_idx(size_t value, int bval, int cval, 
     return ret;
 }
 
+// DOT8
+inline int vx_dot8(int a, int b) {
+  size_t ret;
+  __asm__ volatile (
+        ".insn r %1, 0, 3, %0, %2, %3"
+        : "=r"(ret)
+        : "i"(RISCV_CUSTOM0), "r"(a), "r"(b)
+    );
+  return ret;
+}
+
 #ifdef __cplusplus
 }
 #endif
