@@ -157,7 +157,9 @@ int main(int argc, char *argv[]) {
   RT_CHECK(vx_dev_open(&device));
 
   uint32_t size_sq = size * size;
-  uint32_t buf_size = size_sq * sizeof(TYPE);
+  // uint32_t buf_size = size_sq * sizeof(TYPE);
+  uint32_t buf_size_in_mod = size_sq * sizeof(int8_t);
+  uint32_t buf_size_out_mod = size_sq * sizeof(int32_t);
 
   std::cout << "data type: " << Comparator<TYPE>::type_str() << std::endl;
   std::cout << "matrix size: " << size << "x" << size << std::endl;
@@ -168,11 +170,11 @@ int main(int argc, char *argv[]) {
 
   // allocate device memory
   std::cout << "allocate device memory" << std::endl;
-  RT_CHECK(vx_mem_alloc(device, buf_size, VX_MEM_READ, &A_buffer));
+  RT_CHECK(vx_mem_alloc(device, buf_size_in_mod, VX_MEM_READ, &A_buffer));
   RT_CHECK(vx_mem_address(A_buffer, &kernel_arg.A_addr));
-  RT_CHECK(vx_mem_alloc(device, buf_size, VX_MEM_READ, &B_buffer));
+  RT_CHECK(vx_mem_alloc(device, buf_size_in_mod, VX_MEM_READ, &B_buffer));
   RT_CHECK(vx_mem_address(B_buffer, &kernel_arg.B_addr));
-  RT_CHECK(vx_mem_alloc(device, buf_size, VX_MEM_WRITE, &C_buffer));
+  RT_CHECK(vx_mem_alloc(device, buf_size_out_mod, VX_MEM_WRITE, &C_buffer));
   RT_CHECK(vx_mem_address(C_buffer, &kernel_arg.C_addr));
 
   std::cout << "A_addr=0x" << std::hex << kernel_arg.A_addr << std::endl;
@@ -191,13 +193,13 @@ int main(int argc, char *argv[]) {
   // upload matrix A buffer
   {
     std::cout << "upload matrix A buffer" << std::endl;
-    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, buf_size));
+    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, buf_size_in_mod));
   }
 
   // upload matrix B buffer
   {
     std::cout << "upload matrix B buffer" << std::endl;
-    RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, buf_size));
+    RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, buf_size_in_mod));
   }
 
   // Upload kernel binary
@@ -224,7 +226,7 @@ int main(int argc, char *argv[]) {
 
   // download destination buffer
   std::cout << "download destination buffer" << std::endl;
-  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, buf_size));
+  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, buf_size_out_mod));
 
   // verify result
   std::cout << "verify result" << std::endl;
