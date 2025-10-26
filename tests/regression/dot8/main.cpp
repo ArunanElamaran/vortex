@@ -25,15 +25,15 @@ template <typename Type>
 class Comparator {};
 
 template <>
-class Comparator<int> {
+class Comparator<int32_t> {
 public:
   static const char* type_str() {
     return "integer";
   }
-  static int generate() {
+  static int32_t generate() {
     return rand();
   }
-  static bool compare(int a, int b, int index, int errors) {
+  static bool compare(int32_t a, int32_t b, int index, int errors) {
     if (a != b) {
       if (errors < 100) {
         printf("*** error: [%d] expected=%d, actual=%d\n", index, b, a);
@@ -45,29 +45,50 @@ public:
 };
 
 template <>
-class Comparator<float> {
+class Comparator<int8_t> {
 public:
   static const char* type_str() {
-    return "float";
+    return "integer";
   }
-  static float generate() {
-    return static_cast<float>(rand()) / RAND_MAX;
+  static int8_t generate() {
+    return rand();
   }
-  static bool compare(float a, float b, int index, int errors) {
-    union fi_t { float f; int32_t i; };
-    fi_t fa, fb;
-    fa.f = a;
-    fb.f = b;
-    auto d = std::abs(fa.i - fb.i);
-    if (d > FLOAT_ULP) {
+  static bool compare(int8_t a, int8_t b, int index, int errors) {
+    if (a != b) {
       if (errors < 100) {
-        printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
+        printf("*** error: [%d] expected=%d, actual=%d\n", index, b, a);
       }
       return false;
     }
     return true;
   }
 };
+
+// // Old Float
+// template <>
+// class Comparator<float> {
+// public:
+//   static const char* type_str() {
+//     return "float";
+//   }
+//   static float generate() {
+//     return static_cast<float>(rand()) / RAND_MAX;
+//   }
+//   static bool compare(float a, float b, int index, int errors) {
+//     union fi_t { float f; int32_t i; };
+//     fi_t fa, fb;
+//     fa.f = a;
+//     fb.f = b;
+//     auto d = std::abs(fa.i - fb.i);
+//     if (d > FLOAT_ULP) {
+//       if (errors < 100) {
+//         printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
+//       }
+//       return false;
+//     }
+//     return true;
+//   }
+// };
 
 static void matmul_cpu(int32_t* out, const int8_t* A, const int8_t* B, uint32_t width, uint32_t height) {
   for (uint32_t row = 0; row < height; ++row) {
@@ -155,7 +176,7 @@ int main(int argc, char *argv[]) {
   uint32_t buf_size_in_mod = size_sq * sizeof(int8_t);
   uint32_t buf_size_out_mod = size_sq * sizeof(int32_t);
 
-  std::cout << "data type: " << Comparator<TYPE>::type_str() << std::endl;
+  std::cout << "data type: " << Comparator<int8_t>::type_str() << std::endl;
   std::cout << "matrix size: " << size << "x" << size << std::endl;
 
   kernel_arg.grid_dim[0] = size;
@@ -176,12 +197,12 @@ int main(int argc, char *argv[]) {
   std::cout << "C_addr=0x" << std::hex << kernel_arg.C_addr << std::endl;
 
   // generate source data
-  std::vector<TYPE> h_A(size_sq);
-  std::vector<TYPE> h_B(size_sq);
-  std::vector<TYPE> h_C(size_sq);
+  std::vector<int8_t> h_A(size_sq);
+  std::vector<int8_t> h_B(size_sq);
+  std::vector<int32_t> h_C(size_sq);
   for (uint32_t i = 0; i < size_sq; ++i) {
-    h_A[i] = Comparator<TYPE>::generate();
-    h_B[i] = Comparator<TYPE>::generate();
+    h_A[i] = Comparator<int8_t>::generate();
+    h_B[i] = Comparator<int8_t>::generate();
   }
 
   // upload matrix A buffer
@@ -226,11 +247,11 @@ int main(int argc, char *argv[]) {
   std::cout << "verify result" << std::endl;
   int errors = 0;
   {
-    std::vector<TYPE> h_ref(size_sq);
+    std::vector<int32_t> h_ref(size_sq);
     matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), size, size);
 
     for (uint32_t i = 0; i < h_ref.size(); ++i) {
-      if (!Comparator<TYPE>::compare(h_C[i], h_ref[i], i, errors)) {
+      if (!Comparator<int32_t>::compare(h_C[i], h_ref[i], i, errors)) {
         ++errors;
       }
     }

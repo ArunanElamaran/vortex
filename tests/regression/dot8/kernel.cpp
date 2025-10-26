@@ -14,7 +14,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
     TYPE sum(0);
     for (int e = 0; e < size; e+=4) {
         // Pack 4 int8_t elements from A and B into 32-bit integers
-        uint32_t packedA = *((int*)(A[row * size + e]));
+        uint32_t packedA = *((int*)(&A[row * size + e]));
         uint32_t packedB = ((uint8_t)B[(e+0)*size + col] << 0)
                          | ((uint8_t)B[(e+1)*size + col] << 8)
                          | ((uint8_t)B[(e+2)*size + col] << 16)
