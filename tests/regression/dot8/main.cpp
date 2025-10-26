@@ -72,16 +72,16 @@ public:
 static void matmul_cpu(int32_t* out, const int8_t* A, const int8_t* B, uint32_t width, uint32_t height) {
   for (uint32_t row = 0; row < height; ++row) {
     for (uint32_t col = 0; col < width; ++col) {
-      out[row][col] = 0;
+      out[row * width + col] = 0;
       for (uint32_t e = 0; e < width; e+=4) {
         // Pack 4 int8_t elements from A and B into 32-bit integers
-        uint32_t packedA = *((int*)(A[row] + e));
-        uint32_t packedB = ((uint8_t)B[e+0][col] << 0)
-                         | ((uint8_t)B[e+1][col] << 8)
-                         | ((uint8_t)B[e+2][col] << 16)
-                         | ((uint8_t)B[e+3][col] << 24);
+        uint32_t packedA = *((int*)(A[row * width + e]));
+        uint32_t packedB = ((uint8_t)B[(e+0)*width + col] << 0)
+                         | ((uint8_t)B[(e+1)*width + col] << 8)
+                         | ((uint8_t)B[(e+2)*width + col] << 16)
+                         | ((uint8_t)B[(e+3)*width + col] << 24);
         // Accumulate the dot product result into the C
-        out[row][col] += vx_dot8(packedA, packedB);
+        out[row * width + col] += vx_dot8(packedA, packedB);
       }
     }
   }
