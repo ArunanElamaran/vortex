@@ -112,6 +112,13 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
       case AluType::CZERO: return {aluArgs.imm ? "CZERO.NEZ":"CZERO.EQZ", ""};
+      case AluType::DOT8: {
+        if (aluArgs.is_imm) {
+          return {"DOT8", to_hex_str(aluArgs.imm)};
+        } else {
+          return {"DOT8", ""};
+        }
+      }
       default:
         std::abort();
       }
@@ -1075,6 +1082,26 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         std::abort();
       }
       ibuffer.push_back(instr);
+    } break;
+    // funct7 case 3
+    case 3: {
+      switch (funct3) {
+        case 0: { // DOT8
+          auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::ALU);
+          instr->setOpType(AluType::DOT8);
+          instr->setArgs(IntrAluArgs{0, 0, 0});
+
+          // set destination register
+          instr->setDestReg(rd, RegType::Integer);
+
+          // set source registers
+          instr->setSrcReg(0, rs1, RegType::Integer);
+          instr->setSrcReg(1, rs2, RegType::Integer);
+          ibuffer.push_back(instr);
+        } break;
+        default:
+          std::abort();
+      }
     } break;
   #ifdef EXT_TCU_ENABLE
     case 2: {

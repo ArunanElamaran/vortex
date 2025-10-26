@@ -300,6 +300,24 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           rd_data[t].i = cond ? 0 : rs1_data[t].i;
         }
       } break;
+      case AluType::DOT8: {
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          uint32_t packedA = rs1_data[t].u;
+          uint32_t packedB = rs2_data[t].u;
+          
+          // Calculate sum:
+          int32_t sum = 0;
+          for(int i = 0; i < 4; i++)
+          {
+            sum += (int8_t)((packedA>>(i*8)) & 0xFF) * (int8_t)((packedB>>(i*8)) & 0xFF);
+          }
+          
+          DP(3, "*** DOT8[" << t << "]: a=0x" << std::hex << packedA << ", b=0x" << packedB << ", c=0x" << sum << std::dec);
+          rd_data[t].i = sum;
+        }
+      } break;
       default:
         std::abort();
       }

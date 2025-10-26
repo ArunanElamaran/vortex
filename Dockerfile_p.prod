@@ -1,0 +1,44 @@
+# Use Ubuntu 22.04 as the base image
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install basic build and dev tools
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    build-essential \
+    python3 \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# Upgrade system packages
+RUN apt-get upgrade -y && apt-get update -y
+
+# Copy *current directory contents* (your local vortex checkout) into /vortex in the image
+# Because this Dockerfile is now inside vortex/, the build context is vortex itself.
+COPY . /vortex
+
+# Set working directory
+WORKDIR /vortex
+
+# Ensure submodules are initialized (if you haven’t already done this locally)
+RUN git submodule update --init --recursive || true
+
+# Install any dependencies needed for building Vortex
+RUN ./ci/install_dependencies.sh
+
+# Configure the build directory
+RUN mkdir -p build && cd build && ../configure
+
+# Install the RISC-V toolchain and other required components
+RUN cd build && ./ci/toolchain_install.sh --all
+
+# Automatically source toolchain environment variables in every new shell
+RUN echo "source /vortex/build/ci/toolchain_env.sh" >> ~/.bashrc
+
+# Default to working in build directory
+WORKDIR /vortex/build
