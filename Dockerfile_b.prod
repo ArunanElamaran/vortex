@@ -1,0 +1,39 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    build-essential \
+    python3 \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get upgrade -y && apt-get update -y
+
+# Create an empty /vortex directory in the image.
+# We'll mount our real source code here at runtime.
+RUN mkdir -p /vortex
+
+WORKDIR /vortex
+
+# We still need the toolchain + deps, but those scripts live in your repo.
+# So for build-time we can do a temporary copy, run setup, then delete.
+# (This gives us a configured environment without baking your code permanently.)
+
+# Copy the repo *just for setup steps*
+COPY . /tmp/vortex-setup
+WORKDIR /tmp/vortex-setup
+
+RUN git submodule update --init --recursive || true
+RUN ./ci/install_dependencies.sh
+RUN mkdir -p build && cd build && ../configure
+RUN cd build && ./ci/toolchain_install.sh --all
+RUN echo "source /tmp/vortex-setup/build/ci/toolchain_env.sh" >> ~/.bashrc
+
+# Clean up working dir back to /vortex (which will be volume-mounted later)
+WORKDIR /vortex
