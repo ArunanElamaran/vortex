@@ -11,7 +11,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
     int col = blockIdx.x;
     int row = blockIdx.y;
 
-    TYPE sum(0);
+    int32_t sum = 0;
     for (int e = 0; e < size; e+=4) {
         // Pack 4 int8_t elements from A and B into 32-bit integers
         uint32_t packedA = *((int*)(&A[row * size + e]));
