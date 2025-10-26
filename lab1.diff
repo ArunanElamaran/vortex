@@ -1,0 +1,790 @@
+diff --git a/Dockerfile_b.prod b/Dockerfile_b.prod
+new file mode 100644
+index 0000000..d9f8843
+--- /dev/null
++++ b/Dockerfile_b.prod
+@@ -0,0 +1,39 @@
++FROM ubuntu:22.04
++
++ARG DEBIAN_FRONTEND=noninteractive
++
++RUN apt-get update && apt-get install -y \
++    software-properties-common \
++    build-essential \
++    python3 \
++    git \
++    wget \
++    curl \
++    ca-certificates \
++    cmake && \
++    rm -rf /var/lib/apt/lists/*
++
++RUN apt-get upgrade -y && apt-get update -y
++
++# Create an empty /vortex directory in the image.
++# We'll mount our real source code here at runtime.
++RUN mkdir -p /vortex
++
++WORKDIR /vortex
++
++# We still need the toolchain + deps, but those scripts live in your repo.
++# So for build-time we can do a temporary copy, run setup, then delete.
++# (This gives us a configured environment without baking your code permanently.)
++
++# Copy the repo *just for setup steps*
++COPY . /tmp/vortex-setup
++WORKDIR /tmp/vortex-setup
++
++RUN git submodule update --init --recursive || true
++RUN ./ci/install_dependencies.sh
++RUN mkdir -p build && cd build && ../configure
++RUN cd build && ./ci/toolchain_install.sh --all
++RUN echo "source /tmp/vortex-setup/build/ci/toolchain_env.sh" >> ~/.bashrc
++
++# Clean up working dir back to /vortex (which will be volume-mounted later)
++WORKDIR /vortex
+diff --git a/hw/rtl/VX_config.vh b/hw/rtl/VX_config.vh
+index eef7bed..730382b 100644
+--- a/hw/rtl/VX_config.vh
++++ b/hw/rtl/VX_config.vh
+@@ -501,6 +501,11 @@
+ `define LATENCY_FCVT 5
+ `endif
+ 
++// DOT8 Latency
++`ifndef LATENCY_DOT8
++`define LATENCY_DOT8 2
++`endif
++
+ // FMA Bandwidth ratio
+ `ifndef FMA_PE_RATIO
+ `define FMA_PE_RATIO 1
+diff --git a/hw/rtl/VX_gpu_pkg.sv b/hw/rtl/VX_gpu_pkg.sv
+index f2f00ed..2ef9ae2 100644
+--- a/hw/rtl/VX_gpu_pkg.sv
++++ b/hw/rtl/VX_gpu_pkg.sv
+@@ -182,7 +182,7 @@ package VX_gpu_pkg;
+     ///////////////////////////////////////////////////////////////////////////
+ 
+     localparam INST_ALU_ADD =    4'b0000;
+-    //localparam INST_ALU_UNUSED=4'b0001;
++    localparam INST_ALU_DOT8 =   4'b0001; // DOT8 Instruction Added
+     localparam INST_ALU_LUI =    4'b0010;
+     localparam INST_ALU_AUIPC =  4'b0011;
+     localparam INST_ALU_SLTU =   4'b0100;
+diff --git a/hw/rtl/VX_trace_pkg.sv b/hw/rtl/VX_trace_pkg.sv
+index cfc12d6..a4b3012 100644
+--- a/hw/rtl/VX_trace_pkg.sv
++++ b/hw/rtl/VX_trace_pkg.sv
+@@ -103,6 +103,7 @@ package VX_trace_pkg;
+                                 INST_ALU_AND:   `TRACE(level, ("AND"))
+                                 INST_ALU_CZEQ:  `TRACE(level, ("CZERO.EQZ"))
+                                 INST_ALU_CZNE:  `TRACE(level, ("CZERO.NEZ"))
++                                INST_ALU_DOT8:  `TRACE(level, ("DOT8"))
+                                 default:        `TRACE(level, ("?"))
+                             endcase
+                         end
+diff --git a/hw/rtl/core/VX_alu_dot8.sv b/hw/rtl/core/VX_alu_dot8.sv
+new file mode 100644
+index 0000000..702bfcf
+--- /dev/null
++++ b/hw/rtl/core/VX_alu_dot8.sv
+@@ -0,0 +1,123 @@
++`include "VX_define.vh"
++
++module VX_alu_dot8 import VX_gpu_pkg::*; #(
++    parameter `STRING INSTANCE_ID = "",
++    parameter NUM_LANES = 1
++) (
++    input wire          clk,
++    input wire          reset,
++
++    // Inputs
++    VX_execute_if.slave execute_if,
++
++    // Outputs
++    VX_result_if.master result_if
++);
++    `UNUSED_SPARAM (INSTANCE_ID)
++    localparam PID_BITS = `CLOG2(`NUM_THREADS / NUM_LANES);
++    localparam PID_WIDTH = `UP(PID_BITS);
++    localparam TAG_WIDTH = UUID_WIDTH + NW_WIDTH + NUM_LANES + PC_BITS + 1 + NUM_REGS_BITS + PID_WIDTH + 1 + 1;
++    localparam LATENCY_DOT8 = `LATENCY_DOT8;
++    localparam PE_RATIO = 1;
++    localparam NUM_PES = `UP(NUM_LANES / PE_RATIO);
++
++    `UNUSED_VAR (execute_if.data.op_type)
++    `UNUSED_VAR (execute_if.data.op_args)
++    `UNUSED_VAR (execute_if.data.rs3_data)
++
++    wire pe_enable;
++    wire [NUM_LANES-1:0][2*`XLEN-1:0] data_in;
++    wire [NUM_PES-1:0][2*`XLEN-1:0] pe_data_in;
++    wire [NUM_PES-1:0][`XLEN-1:0] pe_data_out;
++
++    for (genvar i = 0; i < NUM_LANES; ++i) begin : g_data_in
++        assign data_in[i][0 +: `XLEN] = execute_if.data.rs1_data[i];
++        assign data_in[i][`XLEN +: `XLEN] = execute_if.data.rs2_data[i];
++    end
++
++    // PEs time-multiplexing
++    VX_pe_serializer #(
++        .NUM_LANES  (NUM_LANES),
++        .NUM_PES    (NUM_PES),
++        .LATENCY    (LATENCY_DOT8),
++        .DATA_IN_WIDTH (2 * `XLEN),
++        .DATA_OUT_WIDTH (`XLEN),
++        .TAG_WIDTH  (TAG_WIDTH),
++        .PE_REG     (1)
++    ) pe_serializer (
++        .clk        (clk),
++        .reset      (reset),
++        .valid_in   (execute_if.valid),
++        .data_in    (data_in),
++        .tag_in     ({
++            execute_if.data.uuid,
++            execute_if.data.wid,
++            execute_if.data.tmask,
++            execute_if.data.PC,
++            execute_if.data.wb,
++            execute_if.data.rd,
++            execute_if.data.pid,
++            execute_if.data.sop,
++            execute_if.data.eop
++        }),
++        .ready_in   (execute_if.ready),
++        .pe_enable  (pe_enable),
++        .pe_data_in (pe_data_out),
++        .pe_data_out(pe_data_in),
++        .valid_out  (result_if.valid),
++        .data_out   (result_if.data.data),
++        .tag_out    ({
++            result_if.data.uuid,
++            result_if.data.wid,
++            result_if.data.tmask,
++            result_if.data.PC,
++            result_if.data.wb,
++            result_if.data.rd,
++            result_if.data.pid,
++            result_if.data.sop,
++            result_if.data.eop
++        }),
++        .ready_out  (result_if.ready)
++    );
++
++    // PEs instancing
++    for (genvar i = 0; i < NUM_PES; ++i) begin : g_PEs
++        wire [`XLEN-1:0] a = pe_data_in[i][0 +: `XLEN];
++        wire [`XLEN-1:0] b = pe_data_in[i][`XLEN +: `XLEN];
++        wire signed [31:0] c;
++        wire [31:0] result;
++
++        // Unpack the packed arrays
++        wire signed [7:0] A1 = a[7:0];
++        wire signed [7:0] A2 = a[15:8];
++        wire signed [7:0] A3 = a[23:16];
++        wire signed [7:0] A4 = a[31:24];
++
++        wire signed [7:0] B1 = b[7:0];
++        wire signed [7:0] B2 = b[15:8];
++        wire signed [7:0] B3 = b[23:16];
++        wire signed [7:0] B4 = b[31:24];
++
++        // Calculate C
++        // Each multiplication is 16 bits signed
++        wire signed [15:0] P1 = A1 * B1;
++        wire signed [15:0] P2 = A2 * B2;
++        wire signed [15:0] P3 = A3 * B3;
++        wire signed [15:0] P4 = A4 * B4;
++
++        // Sign-extend each product to 32 bits before adding
++        assign c = {{16{P1[15]}}, P1} + {{16{P2[15]}}, P2} + {{16{P3[15]}}, P3} + {{16{P4[15]}}, P4};
++
++        `BUFFER_EX(result, c, pe_enable, 1, LATENCY_DOT8);
++        assign pe_data_out[i] = `XLEN'(result);
++
++    `ifdef DBG_TRACE_PIPELINE
++        always @(posedge clk) begin
++            if (pe_enable) begin
++                `TRACE(2, ("%t: %s dot8[%0d]: a=0%0h, b=0x%0h, c=0x%0h\n", $time, INSTANCE_ID, i, a, b, c))
++            end
++        end
++    `endif
++    end
++
++endmodule
+diff --git a/hw/rtl/core/VX_alu_unit.sv b/hw/rtl/core/VX_alu_unit.sv
+index 1b7f9b6..156d3d2 100644
+--- a/hw/rtl/core/VX_alu_unit.sv
++++ b/hw/rtl/core/VX_alu_unit.sv
+@@ -31,10 +31,11 @@ module VX_alu_unit import VX_gpu_pkg::*; #(
+     localparam BLOCK_SIZE   = `NUM_ALU_BLOCKS;
+     localparam NUM_LANES    = `NUM_ALU_LANES;
+     localparam PARTIAL_BW   = (BLOCK_SIZE != `ISSUE_WIDTH) || (NUM_LANES != `SIMD_WIDTH);
+-    localparam PE_COUNT     = 1 + `EXT_M_ENABLED;
++    localparam PE_COUNT     = 1 + `EXT_M_ENABLED + 1;
+     localparam PE_SEL_BITS  = `CLOG2(PE_COUNT);
+     localparam PE_IDX_INT   = 0;
+     localparam PE_IDX_MDV   = PE_IDX_INT + `EXT_M_ENABLED;
++    localparam PE_IDX_DOT8  = PE_IDX_MDV + 1;
+ 
+     VX_execute_if #(
+         .data_t (alu_exe_t)
+@@ -70,6 +71,8 @@ module VX_alu_unit import VX_gpu_pkg::*; #(
+             pe_select = PE_IDX_INT;
+             if (`EXT_M_ENABLED && (per_block_execute_if[block_idx].data.op_args.alu.xtype == ALU_TYPE_MULDIV))
+                 pe_select = PE_IDX_MDV;
++            else if(per_block_execute_if[block_idx].data.op_type == INST_ALU_DOT8)
++                pe_select = PE_IDX_DOT8;
+         end
+ 
+         VX_pe_switch #(
+@@ -111,6 +114,15 @@ module VX_alu_unit import VX_gpu_pkg::*; #(
+             .result_if  (pe_result_if[PE_IDX_MDV])
+         );
+     `endif
++        VX_alu_dot8 #(
++            .INSTANCE_ID (`SFORMATF(("%s-dot8%0d", INSTANCE_ID, block_idx))),
++            .NUM_LANES (NUM_LANES)
++        ) dot8_unit (
++            .clk            (clk),
++            .reset          (reset),
++            .execute_if (pe_execute_if[PE_IDX_DOT8]),
++            .result_if  (pe_result_if[PE_IDX_DOT8])
++        );
+     end
+ 
+     VX_gather_unit #(
+diff --git a/hw/rtl/core/VX_decode.sv b/hw/rtl/core/VX_decode.sv
+index 6669f26..243343a 100644
+--- a/hw/rtl/core/VX_decode.sv
++++ b/hw/rtl/core/VX_decode.sv
+@@ -534,6 +534,21 @@ module VX_decode import VX_gpu_pkg::*; #(
+                         endcase
+                     end
+                 `endif
++                    7'h03: begin
++                        case (funct3)
++                            3'h0: begin // DOT8
++                                ex_type = EX_ALU; // destination functional unit
++                                op_type = INST_OP_BITS'(INST_ALU_DOT8); // DOT8 instruction type
++                                op_args.alu = '0;
++                                op_args.alu.xtype = ALU_TYPE_ARITH; // arithmetic ALU
++                                use_rd = 1; // this instruction does writeback 
++                                `USED_IREG (rd);  // set using rd
++                                `USED_IREG (rs1); // set using rs1
++                                `USED_IREG (rs2); // set using rs2
++                            end
++                            default:;
++                        endcase
++                    end
+                     default:;
+                 endcase
+             end
+diff --git a/kernel/include/vx_intrinsics.h b/kernel/include/vx_intrinsics.h
+index 71d4cd5..d5f0c0b 100644
+--- a/kernel/include/vx_intrinsics.h
++++ b/kernel/include/vx_intrinsics.h
+@@ -281,6 +281,17 @@ inline __attribute__((const)) int vx_shfl_idx(size_t value, int bval, int cval,
+     return ret;
+ }
+ 
++// DOT8
++inline int vx_dot8(int a, int b) {
++  size_t ret;
++  __asm__ volatile (
++        ".insn r %1, 0, 3, %0, %2, %3"
++        : "=r"(ret)
++        : "i"(RISCV_CUSTOM0), "r"(a), "r"(b)
++    );
++  return ret;
++}
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/sim/simx/decode.cpp b/sim/simx/decode.cpp
+index f2d6cc3..65e2abd 100644
+--- a/sim/simx/decode.cpp
++++ b/sim/simx/decode.cpp
+@@ -112,6 +112,13 @@ static op_string_t op_string(const Instr &instr) {
+         }
+       }
+       case AluType::CZERO: return {aluArgs.imm ? "CZERO.NEZ":"CZERO.EQZ", ""};
++      case AluType::DOT8: {
++        if (aluArgs.is_imm) {
++          return {"DOT8", to_hex_str(aluArgs.imm)};
++        } else {
++          return {"DOT8", ""};
++        }
++      }
+       default:
+         std::abort();
+       }
+@@ -1076,6 +1083,26 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
+       }
+       ibuffer.push_back(instr);
+     } break;
++    // funct7 case 3
++    case 3: {
++      switch (funct3) {
++        case 0: { // DOT8
++          auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::ALU);
++          instr->setOpType(AluType::DOT8);
++          instr->setArgs(IntrAluArgs{0, 0, 0});
++
++          // set destination register
++          instr->setDestReg(rd, RegType::Integer);
++
++          // set source registers
++          instr->setSrcReg(0, rs1, RegType::Integer);
++          instr->setSrcReg(1, rs2, RegType::Integer);
++          ibuffer.push_back(instr);
++        } break;
++        default:
++          std::abort();
++      }
++    } break;
+   #ifdef EXT_TCU_ENABLE
+     case 2: {
+       switch (funct3) {
+diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
+index 3829260..6155027 100644
+--- a/sim/simx/execute.cpp
++++ b/sim/simx/execute.cpp
+@@ -300,6 +300,24 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
+           rd_data[t].i = cond ? 0 : rs1_data[t].i;
+         }
+       } break;
++      case AluType::DOT8: {
++        for (uint32_t t = thread_start; t < num_threads; ++t) {
++          if (!warp.tmask.test(t))
++            continue;
++          uint32_t packedA = rs1_data[t].u;
++          uint32_t packedB = rs2_data[t].u;
++          
++          // Calculate sum:
++          int32_t sum = 0;
++          for(int i = 0; i < 4; i++)
++          {
++            sum += (int8_t)((packedA>>(i*8)) & 0xFF) * (int8_t)((packedB>>(i*8)) & 0xFF);
++          }
++          
++          DP(3, "*** DOT8[" << t << "]: a=0x" << std::hex << packedA << ", b=0x" << packedB << ", c=0x" << sum << std::dec);
++          rd_data[t].i = sum;
++        }
++      } break;
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/func_unit.cpp b/sim/simx/func_unit.cpp
+index 42cbeb9..dd5efba 100644
+--- a/sim/simx/func_unit.cpp
++++ b/sim/simx/func_unit.cpp
+@@ -51,6 +51,7 @@ void AluUnit::tick() {
+ 			case AluType::AND:
+ 			case AluType::OR:
+ 			case AluType::CZERO:
++			case AluType::DOT8:
+ 				delay = 2;
+ 				break;
+ 			default:
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index d069bda..70be5ac 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -169,7 +169,8 @@ enum class AluType {
+   AND,
+   OR,
+   XOR,
+-  CZERO
++  CZERO,
++  DOT8
+ };
+ 
+ struct IntrAluArgs {
+@@ -193,6 +194,7 @@ inline std::ostream &operator<<(std::ostream &os, const AluType& type) {
+   case AluType::OR:      os << "OR"; break;
+   case AluType::XOR:     os << "XOR"; break;
+   case AluType::CZERO:   os << "CZERO"; break;
++  case AluType::DOT8:   os << "DOT8"; break;
+   default:
+     assert(false);
+   }
+diff --git a/tests/regression/dot8/Makefile b/tests/regression/dot8/Makefile
+new file mode 100644
+index 0000000..44e0176
+--- /dev/null
++++ b/tests/regression/dot8/Makefile
+@@ -0,0 +1,14 @@
++ROOT_DIR := $(realpath ../../..)
++include $(ROOT_DIR)/config.mk
++
++PROJECT := dot8
++
++SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
++
++SRCS := $(SRC_DIR)/main.cpp
++
++VX_SRCS := $(SRC_DIR)/kernel.cpp
++
++OPTS ?= -n32
++
++include ../common.mk
+\ No newline at end of file
+diff --git a/tests/regression/dot8/common.h b/tests/regression/dot8/common.h
+new file mode 100644
+index 0000000..b58ec5f
+--- /dev/null
++++ b/tests/regression/dot8/common.h
+@@ -0,0 +1,16 @@
++#ifndef _COMMON_H_
++#define _COMMON_H_
++
++#ifndef TYPE
++#define TYPE float
++#endif
++
++typedef struct {
++  uint32_t grid_dim[2];
++  uint32_t size;
++  uint64_t A_addr;
++  uint64_t B_addr;
++  uint64_t C_addr;
++} kernel_arg_t;
++
++#endif
+diff --git a/tests/regression/dot8/kernel.cpp b/tests/regression/dot8/kernel.cpp
+new file mode 100644
+index 0000000..173514f
+--- /dev/null
++++ b/tests/regression/dot8/kernel.cpp
+@@ -0,0 +1,48 @@
++#include <vx_spawn.h>
++#include "common.h"
++
++void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
++	// New Code
++    auto A = reinterpret_cast<int8_t*>(arg->A_addr);
++	auto B = reinterpret_cast<int8_t*>(arg->B_addr);
++	auto C = reinterpret_cast<int32_t*>(arg->C_addr);
++    auto size = arg->size;
++
++    int col = blockIdx.x;
++    int row = blockIdx.y;
++
++    int32_t sum = 0;
++    for (int e = 0; e < size; e+=4) {
++        // Pack 4 int8_t elements from A and B into 32-bit integers
++        uint32_t packedA = *((int*)(&A[row * size + e]));
++        uint32_t packedB = ((uint8_t)B[(e+0)*size + col] << 0)
++                         | ((uint8_t)B[(e+1)*size + col] << 8)
++                         | ((uint8_t)B[(e+2)*size + col] << 16)
++                         | ((uint8_t)B[(e+3)*size + col] << 24);
++        // Accumulate the dot product result into the C
++        sum += vx_dot8(packedA, packedB);
++    }
++
++    C[row * size + col] = sum;
++    
++    // // Original Code
++    // auto A = reinterpret_cast<TYPE*>(arg->A_addr);
++	// auto B = reinterpret_cast<TYPE*>(arg->B_addr);
++	// auto C = reinterpret_cast<TYPE*>(arg->C_addr);
++    // auto size = arg->size;
++
++    // int col = blockIdx.x;
++    // int row = blockIdx.y;
++
++    // TYPE sum(0);
++    // for (int e = 0; e < size; ++e) {
++    //     sum += A[row * size + e] * B[e * size + col];
++    // }
++
++    // C[row * size + col] = sum;
++}
++
++int main() {
++	kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
++	return vx_spawn_threads(2, arg->grid_dim, nullptr, (vx_kernel_func_cb)kernel_body, arg);
++}
+diff --git a/tests/regression/dot8/main.cpp b/tests/regression/dot8/main.cpp
+new file mode 100644
+index 0000000..7a37be9
+--- /dev/null
++++ b/tests/regression/dot8/main.cpp
+@@ -0,0 +1,273 @@
++#include <iostream>
++#include <unistd.h>
++#include <string.h>
++#include <vector>
++#include <chrono>
++#include <vortex.h>
++#include <cmath>
++#include "common.h"
++
++#define FLOAT_ULP 6
++
++#define RT_CHECK(_expr)                                         \
++   do {                                                         \
++     int _ret = _expr;                                          \
++     if (0 == _ret)                                             \
++       break;                                                   \
++     printf("Error: '%s' returned %d!\n", #_expr, (int)_ret);   \
++	 cleanup();			                                              \
++     exit(-1);                                                  \
++   } while (false)
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename Type>
++class Comparator {};
++
++template <>
++class Comparator<int32_t> {
++public:
++  static const char* type_str() {
++    return "integer";
++  }
++  static int32_t generate() {
++    return rand();
++  }
++  static bool compare(int32_t a, int32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < 100) {
++        printf("*** error: [%d] expected=%d, actual=%d\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<int8_t> {
++public:
++  static const char* type_str() {
++    return "integer";
++  }
++  static int8_t generate() {
++    return rand();
++  }
++  static bool compare(int8_t a, int8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < 100) {
++        printf("*** error: [%d] expected=%d, actual=%d\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++// // Old Float
++// template <>
++// class Comparator<float> {
++// public:
++//   static const char* type_str() {
++//     return "float";
++//   }
++//   static float generate() {
++//     return static_cast<float>(rand()) / RAND_MAX;
++//   }
++//   static bool compare(float a, float b, int index, int errors) {
++//     union fi_t { float f; int32_t i; };
++//     fi_t fa, fb;
++//     fa.f = a;
++//     fb.f = b;
++//     auto d = std::abs(fa.i - fb.i);
++//     if (d > FLOAT_ULP) {
++//       if (errors < 100) {
++//         printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
++//       }
++//       return false;
++//     }
++//     return true;
++//   }
++// };
++
++static void matmul_cpu(int32_t* out, const int8_t* A, const int8_t* B, uint32_t width, uint32_t height) {
++  for (uint32_t row = 0; row < height; ++row) {
++    for (uint32_t col = 0; col < width; ++col) {
++      int32_t sum(0);
++      for (uint32_t e = 0; e < width; ++e) {
++          sum += A[row * width + e] * B[e * width + col];
++      }
++      out[row * width + col] = sum;
++    }
++  }
++
++  // // Original Code
++  // for (uint32_t row = 0; row < height; ++row) {
++  //   for (uint32_t col = 0; col < width; ++col) {
++  //     TYPE sum(0);
++  //     for (uint32_t e = 0; e < width; ++e) {
++  //         sum += A[row * width + e] * B[e * width + col];
++  //     }
++  //     out[row * width + col] = sum;
++  //   }
++  // }
++}
++
++const char* kernel_file = "kernel.vxbin";
++uint32_t size = 32;
++
++vx_device_h device = nullptr;
++vx_buffer_h A_buffer = nullptr;
++vx_buffer_h B_buffer = nullptr;
++vx_buffer_h C_buffer = nullptr;
++vx_buffer_h krnl_buffer = nullptr;
++vx_buffer_h args_buffer = nullptr;
++kernel_arg_t kernel_arg = {};
++
++static void show_usage() {
++   std::cout << "Vortex Test." << std::endl;
++   std::cout << "Usage: [-k: kernel] [-n size] [-h: help]" << std::endl;
++}
++
++static void parse_args(int argc, char **argv) {
++  int c;
++  while ((c = getopt(argc, argv, "n:k:h")) != -1) {
++    switch (c) {
++    case 'n':
++      size = atoi(optarg);
++      break;
++    case 'k':
++      kernel_file = optarg;
++      break;
++    case 'h':
++      show_usage();
++      exit(0);
++      break;
++    default:
++      show_usage();
++      exit(-1);
++    }
++  }
++}
++
++void cleanup() {
++  if (device) {
++    vx_mem_free(A_buffer);
++    vx_mem_free(B_buffer);
++    vx_mem_free(C_buffer);
++    vx_mem_free(krnl_buffer);
++    vx_mem_free(args_buffer);
++    vx_dev_close(device);
++  }
++}
++
++int main(int argc, char *argv[]) {
++  // parse command arguments
++  parse_args(argc, argv);
++
++  std::srand(50);
++
++  // open device connection
++  std::cout << "open device connection" << std::endl;
++  RT_CHECK(vx_dev_open(&device));
++
++  uint32_t size_sq = size * size;
++  // uint32_t buf_size = size_sq * sizeof(TYPE);
++  uint32_t buf_size_in_mod = size_sq * sizeof(int8_t);
++  uint32_t buf_size_out_mod = size_sq * sizeof(int32_t);
++
++  std::cout << "data type: " << Comparator<int8_t>::type_str() << std::endl;
++  std::cout << "matrix size: " << size << "x" << size << std::endl;
++
++  kernel_arg.grid_dim[0] = size;
++  kernel_arg.grid_dim[1] = size;
++  kernel_arg.size = size;
++
++  // allocate device memory
++  std::cout << "allocate device memory" << std::endl;
++  RT_CHECK(vx_mem_alloc(device, buf_size_in_mod, VX_MEM_READ, &A_buffer));
++  RT_CHECK(vx_mem_address(A_buffer, &kernel_arg.A_addr));
++  RT_CHECK(vx_mem_alloc(device, buf_size_in_mod, VX_MEM_READ, &B_buffer));
++  RT_CHECK(vx_mem_address(B_buffer, &kernel_arg.B_addr));
++  RT_CHECK(vx_mem_alloc(device, buf_size_out_mod, VX_MEM_WRITE, &C_buffer));
++  RT_CHECK(vx_mem_address(C_buffer, &kernel_arg.C_addr));
++
++  std::cout << "A_addr=0x" << std::hex << kernel_arg.A_addr << std::endl;
++  std::cout << "B_addr=0x" << std::hex << kernel_arg.B_addr << std::endl;
++  std::cout << "C_addr=0x" << std::hex << kernel_arg.C_addr << std::endl;
++
++  // generate source data
++  std::vector<int8_t> h_A(size_sq);
++  std::vector<int8_t> h_B(size_sq);
++  std::vector<int32_t> h_C(size_sq);
++  for (uint32_t i = 0; i < size_sq; ++i) {
++    h_A[i] = Comparator<int8_t>::generate();
++    h_B[i] = Comparator<int8_t>::generate();
++  }
++
++  // upload matrix A buffer
++  {
++    std::cout << "upload matrix A buffer" << std::endl;
++    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, buf_size_in_mod));
++  }
++
++  // upload matrix B buffer
++  {
++    std::cout << "upload matrix B buffer" << std::endl;
++    RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, buf_size_in_mod));
++  }
++
++  // Upload kernel binary
++  std::cout << "Upload kernel binary" << std::endl;
++  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
++
++  // upload kernel argument
++  std::cout << "upload kernel argument" << std::endl;
++  RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
++
++  auto time_start = std::chrono::high_resolution_clock::now();
++
++  // start device
++  std::cout << "start device" << std::endl;
++  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
++
++  // wait for completion
++  std::cout << "wait for completion" << std::endl;
++  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
++
++  auto time_end = std::chrono::high_resolution_clock::now();
++  double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
++  printf("Elapsed time: %lg ms\n", elapsed);
++
++  // download destination buffer
++  std::cout << "download destination buffer" << std::endl;
++  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, buf_size_out_mod));
++
++  // verify result
++  std::cout << "verify result" << std::endl;
++  int errors = 0;
++  {
++    std::vector<int32_t> h_ref(size_sq);
++    matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), size, size);
++
++    for (uint32_t i = 0; i < h_ref.size(); ++i) {
++      if (!Comparator<int32_t>::compare(h_C[i], h_ref[i], i, errors)) {
++        ++errors;
++      }
++    }
++  }
++
++  // cleanup
++  std::cout << "cleanup" << std::endl;
++  cleanup();
++
++  if (errors != 0) {
++    std::cout << "Found " << std::dec << errors << " errors!" << std::endl;
++    std::cout << "FAILED!" << std::endl;
++    return errors;
++  }
++
++  std::cout << "PASSED!" << std::endl;
++
++  return 0;
++}
+\ No newline at end of file
