@@ -534,6 +534,21 @@ module VX_decode import VX_gpu_pkg::*; #(
                         endcase
                     end
                 `endif
+                    7'h03: begin
+                        case (funct3)
+                            3'h0: begin // DOT8
+                                ex_type = EX_ALU; // destination functional unit
+                                op_type = INST_OP_BITS'(INST_ALU_DOT8); // DOT8 instruction type
+                                op_args.alu = '0;
+                                op_args.alu.xtype = ALU_TYPE_ARITH; // arithmetic ALU
+                                use_rd = 1; // this instruction does writeback 
+                                `USED_IREG (rd);  // set using rd
+                                `USED_IREG (rs1); // set using rs1
+                                `USED_IREG (rs2); // set using rs2
+                            end
+                            default:;
+                        endcase
+                    end
                     default:;
                 endcase
             end
