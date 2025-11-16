@@ -48,11 +48,19 @@ module VX_tcu_fedp_bhf #(
     wire [TCK-1:0][15:0] a_row16;
     wire [TCK-1:0][15:0] b_col16;
 
+    // Specific for the TF32 instructions
+    wire [N-1:0][18:0] a_row_tf32;
+    wire [N-1:0][18:0] b_col_tf32;
+
     for (genvar i = 0; i < N; i++) begin : g_unpack
         assign a_row16[2*i]   = a_row[i][15:0];
         assign a_row16[2*i+1] = a_row[i][31:16];
         assign b_col16[2*i]   = b_col[i][15:0];
         assign b_col16[2*i+1] = b_col[i][31:16];
+
+        // Compact TF32: 1 sign, 8 exponent, top 10 mantissa bits
+        assign a_row_tf32[i] = {a_row[i][18], a_row[i][17:10], a_row[i][9:0]};
+        assign b_col_tf32[i] = {b_col[i][18], b_col[i][17:10], b_col[i][9:0]};
     end
 
     // Transprecision Multiply
@@ -75,6 +83,7 @@ module VX_tcu_fedp_bhf #(
     for (genvar i = 0; i < TCK; i++) begin : g_prod
         wire [32:0] mult_result_fp16;
         wire [32:0] mult_result_bf16;
+        wire [32:0] mult_result_tf32;
 
         // FP16 multiplication
         VX_tcu_bhf_fmul #(
@@ -118,11 +127,40 @@ module VX_tcu_fedp_bhf #(
             `UNUSED_PIN(fflags)
         );
 
+        // TF32 multiplication
+        // Only instantiate the module N times
+        if (i % 2 == 0) begin : g_tf32
+            // TF32: 1 sign, 8 exponent, 10 mantissa -> IN_SIGW = 10 + 1 (hidden bit)
+            VX_tcu_bhf_fmul #(
+                .IN_EXPW (8),
+                .IN_SIGW (10+1),
+                .OUT_EXPW(8),
+                .OUT_SIGW(24),
+                .IN_REC  (0),
+                .OUT_REC (1),
+                .MUL_LATENCY (FMUL_LATENCY),
+                .RND_LATENCY (FRND_LATENCY)
+            ) tf32_mul (
+                .clk    (clk),
+                .reset  (reset),
+                .enable (enable),
+                .frm    (frm),
+                .a      (a_row_tf32[i/2]),
+                .b      (b_col_tf32[i/2]),
+                .y      (mult_result_tf32),
+                `UNUSED_PIN(fflags)
+            );
+        end else begin : g_no_tf32
+            // If needed, drive zeros when there is no instance
+            assign mult_result_tf32 = 33'b0;
+        end
+
         logic [32:0] mult_result_mux;
         always_comb begin
             case(fmt_s_delayed)
                 3'd1: mult_result_mux = mult_result_fp16;
                 3'd2: mult_result_mux = mult_result_bf16;
+                3'd3: mult_result_mux = mult_result_tf32;
                 default: mult_result_mux = 'x;
             endcase
         end

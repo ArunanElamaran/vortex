@@ -83,6 +83,23 @@ struct FMA<vt::bf16, vt::bf16> {
   }
 };
 
+template <>
+struct FMA<vt::tf32, vt::fp32> {
+  static float eval(uint32_t a, uint32_t b, float c) {
+    // 8 exponent bits, 10 mantissa bits
+    auto xa = rv_xtof_s(a, 8, 10, 0, nullptr);
+    auto xb = rv_xtof_s(b, 8, 10, 0, nullptr);
+    auto xc = bit_cast<uint32_t>(c);
+
+    // Fused multiply-add in fp32: a * b + c
+    auto xd = rv_fmul_s(xa, xb, 0, nullptr);
+    auto xe = rv_fadd_s(xc, xd, 0, nullptr);
+
+    // Return proper type
+    return bit_cast<float>(xe);
+  }
+};
+
 template <typename It, typename Ot>
 struct FEDP {
   using itype = typename It::dtype;
@@ -152,6 +169,8 @@ static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
       return FEDP<vt::fp16, vt::fp32>::eval;
     case vt::bf16::id:
       return FEDP<vt::bf16, vt::fp32>::eval;
+    case vt::tf32::id:
+      return FEDP<vt::tf32, vt::fp32>::eval;
     default:
       std::cout << "Error: unsupported mma format: " << IT << " -> " << OT << "!" << std::endl;
       std::abort();
