@@ -1,0 +1,160 @@
+diff --git a/hw/rtl/tcu/VX_tcu_fedp_bhf.sv b/hw/rtl/tcu/VX_tcu_fedp_bhf.sv
+index d11cfc0..27f6a29 100644
+--- a/hw/rtl/tcu/VX_tcu_fedp_bhf.sv
++++ b/hw/rtl/tcu/VX_tcu_fedp_bhf.sv
+@@ -48,11 +48,19 @@ module VX_tcu_fedp_bhf #(
+     wire [TCK-1:0][15:0] a_row16;
+     wire [TCK-1:0][15:0] b_col16;
+ 
++    // Specific for the TF32 instructions
++    wire [N-1:0][18:0] a_row_tf32;
++    wire [N-1:0][18:0] b_col_tf32;
++
+     for (genvar i = 0; i < N; i++) begin : g_unpack
+         assign a_row16[2*i]   = a_row[i][15:0];
+         assign a_row16[2*i+1] = a_row[i][31:16];
+         assign b_col16[2*i]   = b_col[i][15:0];
+         assign b_col16[2*i+1] = b_col[i][31:16];
++
++        // Compact TF32: 1 sign, 8 exponent, top 10 mantissa bits
++        assign a_row_tf32[i] = {a_row[i][18], a_row[i][17:10], a_row[i][9:0]};
++        assign b_col_tf32[i] = {b_col[i][18], b_col[i][17:10], b_col[i][9:0]};
+     end
+ 
+     // Transprecision Multiply
+@@ -75,6 +83,7 @@ module VX_tcu_fedp_bhf #(
+     for (genvar i = 0; i < TCK; i++) begin : g_prod
+         wire [32:0] mult_result_fp16;
+         wire [32:0] mult_result_bf16;
++        wire [32:0] mult_result_tf32;
+ 
+         // FP16 multiplication
+         VX_tcu_bhf_fmul #(
+@@ -118,11 +127,40 @@ module VX_tcu_fedp_bhf #(
+             `UNUSED_PIN(fflags)
+         );
+ 
++        // TF32 multiplication
++        // Only instantiate the module N times
++        if (i % 2 == 0) begin : g_tf32
++            // TF32: 1 sign, 8 exponent, 10 mantissa -> IN_SIGW = 10 + 1 (hidden bit)
++            VX_tcu_bhf_fmul #(
++                .IN_EXPW (8),
++                .IN_SIGW (10+1),
++                .OUT_EXPW(8),
++                .OUT_SIGW(24),
++                .IN_REC  (0),
++                .OUT_REC (1),
++                .MUL_LATENCY (FMUL_LATENCY),
++                .RND_LATENCY (FRND_LATENCY)
++            ) tf32_mul (
++                .clk    (clk),
++                .reset  (reset),
++                .enable (enable),
++                .frm    (frm),
++                .a      (a_row_tf32[i/2]),
++                .b      (b_col_tf32[i/2]),
++                .y      (mult_result_tf32),
++                `UNUSED_PIN(fflags)
++            );
++        end else begin : g_no_tf32
++            // If needed, drive zeros when there is no instance
++            assign mult_result_tf32 = 33'b0;
++        end
++
+         logic [32:0] mult_result_mux;
+         always_comb begin
+             case(fmt_s_delayed)
+                 3'd1: mult_result_mux = mult_result_fp16;
+                 3'd2: mult_result_mux = mult_result_bf16;
++                3'd3: mult_result_mux = mult_result_tf32;
+                 default: mult_result_mux = 'x;
+             endcase
+         end
+diff --git a/hw/rtl/tcu/VX_tcu_pkg.sv b/hw/rtl/tcu/VX_tcu_pkg.sv
+index bd82aaa..5ad4713 100644
+--- a/hw/rtl/tcu/VX_tcu_pkg.sv
++++ b/hw/rtl/tcu/VX_tcu_pkg.sv
+@@ -29,6 +29,7 @@ package VX_tcu_pkg;
+     localparam TCU_FP32_ID = 0;
+     localparam TCU_FP16_ID = 1;
+     localparam TCU_BF16_ID = 2;
++    localparam TCU_TF32_ID = 3;
+     localparam TCU_I32_ID  = 8;
+     localparam TCU_I8_ID   = 9;
+     localparam TCU_U8_ID   = 10;
+@@ -87,6 +88,7 @@ package VX_tcu_pkg;
+             TCU_FP32_ID: `TRACE(level, ("fp32"))
+             TCU_FP16_ID: `TRACE(level, ("fp16"))
+             TCU_BF16_ID: `TRACE(level, ("bf16"))
++            TCU_TF32_ID: `TRACE(level, ("tf32"))
+             TCU_I32_ID:  `TRACE(level, ("i32"))
+             TCU_I8_ID:   `TRACE(level, ("i8"))
+             TCU_U8_ID:   `TRACE(level, ("u8"))
+diff --git a/hw/unittest/.DS_Store b/hw/unittest/.DS_Store
+new file mode 100644
+index 0000000..6c6c38a
+Binary files /dev/null and b/hw/unittest/.DS_Store differ
+diff --git a/sim/common/tensor_cfg.h b/sim/common/tensor_cfg.h
+index 9622ba9..99136ae 100644
+--- a/sim/common/tensor_cfg.h
++++ b/sim/common/tensor_cfg.h
+@@ -43,6 +43,13 @@ struct bf16 {
+   static constexpr const char* name = "bf16";
+ };
+ 
++struct tf32 {
++  using dtype = uint32_t;
++  static constexpr uint32_t id = 3;
++  static constexpr uint32_t bits = 32;
++  static constexpr const char* name = "tf32";
++};
++
+ struct int32 {
+   using dtype = int32_t;
+   static constexpr uint32_t id = 8;
+@@ -83,6 +90,7 @@ inline const char* fmt_string(uint32_t fmt) {
+   case fp32::id:  return fp32::name;
+   case fp16::id:  return fp16::name;
+   case bf16::id:  return bf16::name;
++  case tf32::id:  return tf32::name;
+   case int32::id: return int32::name;
+   case int8::id:  return int8::name;
+   case uint8::id: return uint8::name;
+diff --git a/sim/simx/tensor_unit.cpp b/sim/simx/tensor_unit.cpp
+index 1bb6da3..e6cf4a3 100644
+--- a/sim/simx/tensor_unit.cpp
++++ b/sim/simx/tensor_unit.cpp
+@@ -83,6 +83,23 @@ struct FMA<vt::bf16, vt::bf16> {
+   }
+ };
+ 
++template <>
++struct FMA<vt::tf32, vt::fp32> {
++  static float eval(uint32_t a, uint32_t b, float c) {
++    // 8 exponent bits, 10 mantissa bits
++    auto xa = rv_xtof_s(a, 8, 10, 0, nullptr);
++    auto xb = rv_xtof_s(b, 8, 10, 0, nullptr);
++    auto xc = bit_cast<uint32_t>(c);
++
++    // Fused multiply-add in fp32: a * b + c
++    auto xd = rv_fmul_s(xa, xb, 0, nullptr);
++    auto xe = rv_fadd_s(xc, xd, 0, nullptr);
++
++    // Return proper type
++    return bit_cast<float>(xe);
++  }
++};
++
+ template <typename It, typename Ot>
+ struct FEDP {
+   using itype = typename It::dtype;
+@@ -152,6 +169,8 @@ static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
+       return FEDP<vt::fp16, vt::fp32>::eval;
+     case vt::bf16::id:
+       return FEDP<vt::bf16, vt::fp32>::eval;
++    case vt::tf32::id:
++      return FEDP<vt::tf32, vt::fp32>::eval;
+     default:
+       std::cout << "Error: unsupported mma format: " << IT << " -> " << OT << "!" << std::endl;
+       std::abort();
