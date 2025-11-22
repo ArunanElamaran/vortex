@@ -1590,7 +1590,8 @@ public:
   SimPort<LsuReq> ReqDC;
   SimPort<LsuRsp> RspDC;
 
-  // TODO: Add ReqTmem, RspTmem ports for TCU local memory access
+  SimPort<LsuReq> ReqTmem;
+  SimPort<LsuRsp> RspTmem;
 
   LocalMemSwitch(
     const SimContext& ctx,
