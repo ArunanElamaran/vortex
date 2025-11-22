@@ -27,6 +27,7 @@
 #include "cluster.h"
 #include "processor_impl.h"
 #include "local_mem.h"
+#include "tensor_mem.h"
 
 using namespace vortex;
 
