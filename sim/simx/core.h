@@ -20,6 +20,7 @@
 #include "pipeline.h"
 #include "cache_sim.h"
 #include "local_mem.h"
+#include "tensor_mem.h"
 #include "ibuffer.h"
 #include "scoreboard.h"
 
@@ -147,6 +148,10 @@ public:
     return local_mem_;
   }
 
+  const TensorMem::Ptr& tensor_mem() const {
+    return tensor_mem_;
+  }
+
   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
     return mem_coalescers_.at(idx);
   }
@@ -208,6 +213,7 @@ private:
   std::vector<Dispatcher::Ptr> dispatchers_;
   std::vector<FuncUnit::Ptr> func_units_;
   LocalMem::Ptr local_mem_;
+  TensorMem::Ptr tensor_mem_;
   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
   std::vector<MemCoalescer::Ptr> mem_coalescers_;
 

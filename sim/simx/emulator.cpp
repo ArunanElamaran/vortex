@@ -313,6 +313,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
   auto type = get_addr_type(addr);
   if (type == AddrType::Shared) {
     core_->local_mem()->read(data, addr, size);
+  } else if (type == AddrType::Tensor) {
+    core_->tensor_mem()->read(data, addr, size);
   } else {
     try
     {
@@ -331,6 +333,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
   auto type = get_addr_type(addr);
   if (type == AddrType::Shared) {
     core_->local_mem()->read(data, addr, size);
+  } else if (type == AddrType::Tensor) {
+    core_->tensor_mem()->read(data, addr, size);
   } else {
     mmu_.read(data, addr, size, 0);
   }
@@ -348,6 +352,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
   } else {
     if (type == AddrType::Shared) {
       core_->local_mem()->write(data, addr, size);
+    } else if (type == AddrType::Tensor) {
+      core_->tensor_mem()->write(data, addr, size);
     } else {
       try
       {
@@ -372,6 +378,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
   } else {
     if (type == AddrType::Shared) {
       core_->local_mem()->write(data, addr, size);
+    } else if (type == AddrType::Tensor) {
+      core_->tensor_mem()->write(data, addr, size);
     } else {
       mmu_.write(data, addr, size, 0);
     }

@@ -708,7 +708,8 @@ using IntrArgs = std::variant<
 enum class AddrType {
   Global,
   Shared,
-  IO
+  IO,
+  Tensor
 };
 
 inline AddrType get_addr_type(uint64_t addr) {
@@ -720,6 +721,11 @@ inline AddrType get_addr_type(uint64_t addr) {
         return AddrType::Shared;
     }
   }
+  if (EXT_TCU_ENABLED) {
+    if (addr >= TMEM_BASE_ADDR && addr < TMEM_END_ADDR) {
+      return AddrType::Tensor;
+    }
+  }
   return AddrType::Global;
 }
 
@@ -728,6 +734,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
   case AddrType::Global: os << "Global"; break;
   case AddrType::Shared: os << "Shared"; break;
   case AddrType::IO:     os << "IO"; break;
+  case AddrType::Tensor: os << "Tensor"; break;
   default: assert(false);
   }
   return os;
@@ -1582,6 +1589,8 @@ public:
 
   SimPort<LsuReq> ReqDC;
   SimPort<LsuRsp> RspDC;
+
+  // TODO: Add ReqTmem, RspTmem ports for TCU local memory access
 
   LocalMemSwitch(
     const SimContext& ctx,

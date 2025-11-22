@@ -227,6 +227,17 @@
 `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
 `endif
 
+`ifndef TMEM_LOG_SIZE
+`define TMEM_LOG_SIZE   16  // 64KB tensor memory
+`endif
+
+`ifndef TMEM_BASE_ADDR
+`define TMEM_BASE_ADDR  (LMEM_BASE_ADDR + (1 << LMEM_LOG_SIZE))
+`endif
+
+`define TMEM_SIZE       (1 << TMEM_LOG_SIZE)
+`define TMEM_END_ADDR   (TMEM_BASE_ADDR + TMEM_SIZE)
+
 `ifndef IO_COUT_ADDR
 `define IO_COUT_ADDR    `IO_BASE_ADDR
 `endif
