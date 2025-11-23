@@ -41,8 +41,6 @@ void LocalMemSwitch::tick() {
     RspIn.push(out_rsp, 1);
     RspLmem.pop();
   }
-
-  // TODO: CHECK IF BELOW IS RIGHT
   if (!RspTmem.empty()) {
     auto& out_rsp = RspTmem.front();
     DT(4, this->name() << "-tmem-rsp: " << out_rsp);
@@ -57,7 +55,6 @@ void LocalMemSwitch::tick() {
   }
 
   // process incoming requests
-  // TODO: Route requests from to LMEM or TMEM depending on address received
   if (!ReqIn.empty()) {
     auto& in_req = ReqIn.front();
 
@@ -68,14 +65,21 @@ void LocalMemSwitch::tick() {
     out_dc_req.uuid  = in_req.uuid;
 
     LsuReq out_lmem_req(out_dc_req);
+    LsuReq out_tmem_req(out_dc_req);
 
     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
       if (in_req.mask.test(i)) {
         auto type = get_addr_type(in_req.addrs.at(i));
         if (type == AddrType::Shared) {
+          // LMEM
           out_lmem_req.mask.set(i);
           out_lmem_req.addrs.at(i) = in_req.addrs.at(i);
+        } else if (type == AddrType::Tensor) {
+          // TMEM
+          out_tmem_req.mask.set(i);
+          out_tmem_req.addrs.at(i) = in_req.addrs.at(i);
         } else {
+          // default: global / dcache
           out_dc_req.mask.set(i);
           out_dc_req.addrs.at(i) = in_req.addrs.at(i);
         }
@@ -92,10 +96,9 @@ void LocalMemSwitch::tick() {
       DT(4, this->name() << "-lmem-req: " << out_lmem_req);
     }
 
-    // TODO: Check if this is right
     if (!out_tmem_req.mask.none()) {
-      ReqLmem.push(out_lmem_req, delay_);
-      DT(4, this->name() << "-lmem-req: " << out_lmem_req);
+      ReqTmem.push(out_tmem_req, delay_);
+      DT(4, this->name() << "-tmem-req: " << out_tmem_req);
     }
 
     ReqIn.pop();
