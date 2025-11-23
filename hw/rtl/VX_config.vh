@@ -688,6 +688,21 @@
 `define LMEM_NUM_BANKS `NUM_LSU_LANES
 `endif
 
+// TMEM Configurable Knobs ////////////////////////////////////////////////////
+
+`ifndef TMEM_DISABLE
+`define TMEM_ENABLE
+`endif
+
+`ifndef TMEM_ENABLE
+    `define TMEM_NUM_BANKS 1
+`endif
+
+// Number of Banks
+`ifndef TMEM_NUM_BANKS
+`define TMEM_NUM_BANKS `NUM_LSU_LANES
+`endif
+
 // L2cache Configurable Knobs /////////////////////////////////////////////////
 
 // Cache Size

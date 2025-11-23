@@ -79,6 +79,16 @@ Core::Core(const SimContext& ctx,
     false
   });
 
+  // create tensor memory
+  snprintf(sname, 100, "%s-tmem", this->name().c_str());
+  tensor_mem_ = TensorMem::Create(sname, TensorMem::Config{
+    (1 << TMEM_LOG_SIZE),
+    LSU_WORD_SIZE,      // or TMEM_WORD_SIZE if different
+    LSU_CHANNELS,      // number of banks/channels
+    log2ceil(TMEM_NUM_BANKS),
+    false
+  });
+
   // create lmem switch
   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
     snprintf(sname, 100, "%s-lmem_switch%d", this->name().c_str(), b);
@@ -96,9 +106,26 @@ Core::Core(const SimContext& ctx,
   snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
   auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
 
+  // create tmem arbiter
+  snprintf(sname, 100, "%s-tmem_arb", this->name().c_str());
+  auto tmem_arb = LsuArbiter::Create(
+      sname,
+      ArbiterType::RoundRobin,
+      NUM_LSU_BLOCKS,    // one input per LSU block
+      1                  // single output
+  );
+
   // create lmem adapter
   snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
   auto lsu_lmem_adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
+
+  // create tmem adapter
+  snprintf(sname, 100, "%s-lsu_tmem_adapter", this->name().c_str());
+  auto lsu_tmem_adapter = LsuMemAdapter::Create(
+      sname,
+      LSU_CHANNELS,     // physical channels
+      1                  // one input stream from arbiter
+  );
 
   // connect lmem switch
   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
@@ -109,14 +136,30 @@ Core::Core(const SimContext& ctx,
     lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
   }
 
+  // connect tmem switch
+  for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+    lmem_switch_.at(b)->ReqTmem.bind(&tmem_arb->ReqIn.at(b));
+    tmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspTmem);
+  }
+
   // connect lmem arbiter
   lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
   lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
+
+  // connect tmem arbiter
+  tmem_arb->ReqOut.at(0).bind(&lsu_tmem_adapter->ReqIn);
+  lsu_tmem_adapter->RspIn.bind(&tmem_arb->RspOut.at(0));
 
   // connect lmem adapter
   for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
     lsu_lmem_adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(c));
     local_mem_->Outputs.at(c).bind(&lsu_lmem_adapter->RspOut.at(c));
+  }
+
+  // connect tmem adapter
+  for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
+    lsu_tmem_adapter->ReqOut.at(c).bind(&tensor_mem_->Inputs.at(c));
+    tensor_mem_->Outputs.at(c).bind(&lsu_tmem_adapter->RspOut.at(c));
   }
 
   // connect dcache coalescer

@@ -24,6 +24,8 @@ LocalMemSwitch::LocalMemSwitch(
   , RspIn(this)
   , ReqLmem(this)
   , RspLmem(this)
+  , ReqTmem(this)
+  , RspTmem(this)
   , ReqDC(this)
   , RspDC(this)
   , delay_(delay)
@@ -39,6 +41,14 @@ void LocalMemSwitch::tick() {
     RspIn.push(out_rsp, 1);
     RspLmem.pop();
   }
+
+  // TODO: CHECK IF BELOW IS RIGHT
+  if (!RspTmem.empty()) {
+    auto& out_rsp = RspTmem.front();
+    DT(4, this->name() << "-tmem-rsp: " << out_rsp);
+    RspIn.push(out_rsp, 1);
+    RspTmem.pop();
+  }
   if (!RspDC.empty()) {
     auto& out_rsp = RspDC.front();
     DT(4, this->name() << "-dc-rsp: " << out_rsp);
@@ -47,6 +57,7 @@ void LocalMemSwitch::tick() {
   }
 
   // process incoming requests
+  // TODO: Route requests from to LMEM or TMEM depending on address received
   if (!ReqIn.empty()) {
     auto& in_req = ReqIn.front();
 
@@ -80,6 +91,13 @@ void LocalMemSwitch::tick() {
       ReqLmem.push(out_lmem_req, delay_);
       DT(4, this->name() << "-lmem-req: " << out_lmem_req);
     }
+
+    // TODO: Check if this is right
+    if (!out_tmem_req.mask.none()) {
+      ReqLmem.push(out_lmem_req, delay_);
+      DT(4, this->name() << "-lmem-req: " << out_lmem_req);
+    }
+
     ReqIn.pop();
   }
 }
