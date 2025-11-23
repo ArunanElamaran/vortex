@@ -10,13 +10,16 @@ class TensorMem::Impl {
 protected:
 	TensorMem* simobject_;
 	Config    config_;
-	RAM       ram_; // TODO: is RAM the correct MemDevice here?
+	RAM       ram_;
 	uint32_t 	line_bits_;
 	MemCrossBar::Ptr mem_xbar_;
 	mutable PerfStats perf_stats_;
 
 	uint64_t to_local_addr(uint64_t addr) {
-		return bit_getw(addr, 0, line_bits_-1);
+		// assuming addr is in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
+		// TODO: CHECK IF BELOW IS APPROPRIATE CHANGE
+		uint64_t local = addr - TMEM_BASE_ADDR;
+		return bit_getw(local, 0, line_bits_ - 1);
 	}
 
 public:
@@ -51,13 +54,13 @@ public:
 
 	void read(void* data, uint64_t addr, uint32_t size) {
 		auto l_addr = to_local_addr(addr);
-		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
 		ram_.read(data, l_addr, size);
 	}
 
 	void write(const void* data, uint64_t addr, uint32_t size) {
 		auto l_addr = to_local_addr(addr);
-		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
 		ram_.write(data, l_addr, size);
 	}
 
