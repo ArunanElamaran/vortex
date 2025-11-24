@@ -1587,11 +1587,11 @@ public:
   SimPort<LsuReq> ReqLmem;
   SimPort<LsuRsp> RspLmem;
 
-  SimPort<LsuReq> ReqDC;
-  SimPort<LsuRsp> RspDC;
-
   SimPort<LsuReq> ReqTmem;
   SimPort<LsuRsp> RspTmem;
+
+  SimPort<LsuReq> ReqDC;
+  SimPort<LsuRsp> RspDC;
 
   LocalMemSwitch(
     const SimContext& ctx,
