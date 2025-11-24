@@ -22,10 +22,22 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   uint32_t tile_row = blockIdx.y * ctx::tileM;
   uint32_t tile_col = blockIdx.x * ctx::tileN;
 
+  // Calculate unique accumulator address in tensor memory for this block
+  // Each block gets its own space in tensor memory
+  uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+  uint32_t accum_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
+  auto pAccum = reinterpret_cast<ctx::output_t*>(TMEM_ACCUM_BASE + block_id * accum_size);
+
   // Initialize accumulator tile to zero
   ctx::fill_fragment(fragC, 0);
+  
+  // Store initial zero accumulator to tensor memory
+  ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
 
   for (int i = 0; i < K; i += ctx::tileK) {
+    // Load accumulator from tensor memory at the start of each iteration
+    ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
+    
     auto pTileA = pA + tile_row * K + i;
 
     // Load A tile
@@ -43,9 +55,15 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
 
     // Matrix multiply-accumulate: c += a * b
     ctx::mma_sync(fragC, fragA, fragB, fragC);
+    
+    // Store accumulator back to tensor memory after each iteration
+    ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
   }
 
-  // Store the computed C tile
+  // Load final accumulator from tensor memory
+  ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
+  
+  // Store the computed C tile to global memory
   auto pTileC = pC + tile_row * N + tile_col;
   ctx::store_matrix_sync(pTileC, fragC, N);
 }
