@@ -92,6 +92,7 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
             << ", num_clusters=" << arch.num_clusters()
             << ", socket_size=" << arch.socket_size()
             << ", local_mem_base=0x" << std::hex << arch.local_mem_base() << std::dec
+            << ", tensor_mem_base=0x" << std::hex << arch.tensor_mem_base() << std::dec
             << ", num_barriers=" << arch.num_barriers()
             << std::endl;
 #endif

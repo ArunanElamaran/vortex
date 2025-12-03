@@ -183,6 +183,7 @@ import VX_fpu_pkg::*;
             `VX_CSR_NUM_WARPS  : read_data_ro_w = `XLEN'(`NUM_WARPS);
             `VX_CSR_NUM_CORES  : read_data_ro_w = `XLEN'(`NUM_CORES * `NUM_CLUSTERS);
             `VX_CSR_LOCAL_MEM_BASE: read_data_ro_w = `XLEN'(`LMEM_BASE_ADDR);
+            `VX_CSR_TENSOR_MEM_BASE: read_data_ro_w = `XLEN'(`TMEM_BASE_ADDR);
 
             `CSR_READ_64(`VX_CSR_MCYCLE, read_data_ro_w, cycles);
 
