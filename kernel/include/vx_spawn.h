@@ -45,6 +45,9 @@ typedef void (*vx_serial_cb)(void *arg);
 #define __local_mem(size) \
   (void*)((int8_t*)csr_read(VX_CSR_LOCAL_MEM_BASE) + __local_group_id * size)
 
+#define __tensor_mem(size) \
+  (void*)((int8_t*)csr_read(VX_CSR_TENSOR_MEM_BASE) + __local_group_id * size)
+
 #define __syncthreads() \
   vx_barrier(__local_group_id, __warps_per_group)
 
