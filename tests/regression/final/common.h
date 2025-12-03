@@ -2,7 +2,6 @@
 #define _COMMON_H_
 
 #include <stdint.h>
-#include <VX_config.h>
 
 #ifndef NUM_THREADS
 #define NUM_THREADS 4
@@ -14,11 +13,6 @@
 
 #ifndef OTYPE
 #define OTYPE fp32
-#endif
-
-// Tensor memory base address for accumulator storage
-#ifndef TMEM_ACCUM_BASE
-#define TMEM_ACCUM_BASE TMEM_BASE_ADDR
 #endif
 
 typedef struct {
