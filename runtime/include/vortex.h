@@ -37,7 +37,7 @@ typedef void* vx_buffer_h;
 #define VX_CAPS_ISA_FLAGS           0x7
 #define VX_CAPS_NUM_MEM_BANKS       0x8
 #define VX_CAPS_MEM_BANK_SIZE       0x9
-#define VX_CAPS_TMEM_MEM_SIZE       0xA
+#define VX_CAPS_TENSOR_MEM_SIZE     0xA
 
 // device isa flags
 #define VX_ISA_STD_A                (1ull << ISA_STD_A)
@@ -135,7 +135,7 @@ int vx_upload_bytes(vx_device_h hdevice, const void* content, uint64_t size, vx_
 int vx_upload_file(vx_device_h hdevice, const char* filename, vx_buffer_h* hbuffer);
 
 // calculate cooperative threads array occupancy
-int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem);
+int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem, uint32_t* max_tensormem);
 
 // performance counters
 int vx_dump_perf(vx_device_h hdevice, FILE* stream);

@@ -99,7 +99,7 @@ public:
     case VX_CAPS_LOCAL_MEM_SIZE:
       _value = (1 << LMEM_LOG_SIZE);
       break;
-    case VX_CAPS_TMEM_MEM_SIZE:
+    case VX_CAPS_TENSOR_MEM_SIZE:
       _value = (1 << TMEM_LOG_SIZE);
       break;
     case VX_CAPS_ISA_FLAGS:

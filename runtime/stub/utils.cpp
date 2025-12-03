@@ -691,7 +691,7 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
   return 0;
 }
 
-int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem) {
+int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem, uint32_t* max_tensormem) {
    // check group size
   uint64_t warps_per_core, threads_per_warp;
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_WARPS, &warps_per_core), {
@@ -717,6 +717,15 @@ int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_l
       return err;
     });
     *max_localmem = local_mem_size / groups_per_core;
+  }
+
+  // check tensor memory capacity
+  if (max_tensormem) {
+    uint64_t tensor_mem_size;
+    CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_TENSOR_MEM_SIZE, &tensor_mem_size), {
+      return err;
+    });
+    *max_tensormem = tensor_mem_size / groups_per_core;
   }
 
   return 0;
