@@ -99,6 +99,9 @@ public:
     case VX_CAPS_LOCAL_MEM_SIZE:
       _value = (1 << LMEM_LOG_SIZE);
       break;
+    case VX_CAPS_TMEM_MEM_SIZE:
+      _value = (1 << TMEM_LOG_SIZE);
+      break;
     case VX_CAPS_ISA_FLAGS:
       _value = ((uint64_t(MISA_EXT)) << 32) | ((log2floor(XLEN) - 4) << 30) | MISA_STD;
       break;
