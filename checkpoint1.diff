@@ -1,0 +1,1681 @@
+diff --git a/hw/rtl/VX_config.vh b/hw/rtl/VX_config.vh
+index 730382b..b1f71a7 100644
+--- a/hw/rtl/VX_config.vh
++++ b/hw/rtl/VX_config.vh
+@@ -227,6 +227,17 @@
+ `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+ `endif
+ 
++`ifndef TMEM_LOG_SIZE
++`define TMEM_LOG_SIZE   16  // 64KB tensor memory
++`endif
++
++`ifndef TMEM_BASE_ADDR
++`define TMEM_BASE_ADDR  (LMEM_BASE_ADDR + (1 << LMEM_LOG_SIZE))
++`endif
++
++`define TMEM_SIZE       (1 << TMEM_LOG_SIZE)
++`define TMEM_END_ADDR   (TMEM_BASE_ADDR + TMEM_SIZE)
++
+ `ifndef IO_COUT_ADDR
+ `define IO_COUT_ADDR    `IO_BASE_ADDR
+ `endif
+@@ -677,6 +688,21 @@
+ `define LMEM_NUM_BANKS `NUM_LSU_LANES
+ `endif
+ 
++// TMEM Configurable Knobs ////////////////////////////////////////////////////
++
++`ifndef TMEM_DISABLE
++`define TMEM_ENABLE
++`endif
++
++`ifndef TMEM_ENABLE
++    `define TMEM_NUM_BANKS 1
++`endif
++
++// Number of Banks
++`ifndef TMEM_NUM_BANKS
++`define TMEM_NUM_BANKS `NUM_LSU_LANES
++`endif
++
+ // L2cache Configurable Knobs /////////////////////////////////////////////////
+ 
+ // Cache Size
+diff --git a/progress_diff.patch b/progress_diff.patch
+new file mode 100644
+index 0000000..b7f9a08
+--- /dev/null
++++ b/progress_diff.patch
+@@ -0,0 +1,313 @@
++diff --git a/sim/simx/core.h b/sim/simx/core.h
++index a8b674d..f6be86f 100644
++--- a/sim/simx/core.h
+++++ b/sim/simx/core.h
++@@ -20,6 +20,7 @@
++ #include "pipeline.h"
++ #include "cache_sim.h"
++ #include "local_mem.h"
+++#include "tensor_mem.h"
++ #include "ibuffer.h"
++ #include "scoreboard.h"
++ 
++@@ -147,6 +148,10 @@ public:
++     return local_mem_;
++   }
++ 
+++  const TensorMem::Ptr& tensor_mem() const {
+++    return tensor_mem_;
+++  }
+++
++   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
++     return mem_coalescers_.at(idx);
++   }
++@@ -208,6 +213,7 @@ private:
++   std::vector<Dispatcher::Ptr> dispatchers_;
++   std::vector<FuncUnit::Ptr> func_units_;
++   LocalMem::Ptr local_mem_;
+++  TensorMem::Ptr tensor_mem_;
++   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
++   std::vector<MemCoalescer::Ptr> mem_coalescers_;
++ 
++diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
++index 3eb62f9..658a750 100644
++--- a/sim/simx/emulator.cpp
+++++ b/sim/simx/emulator.cpp
++@@ -313,6 +313,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
++   auto type = get_addr_type(addr);
++   if (type == AddrType::Shared) {
++     core_->local_mem()->read(data, addr, size);
+++  } else if (type == AddrType::Tensor) {
+++    core_->tensor_mem()->read(data, addr, size);
++   } else {
++     try
++     {
++@@ -331,6 +333,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
++   auto type = get_addr_type(addr);
++   if (type == AddrType::Shared) {
++     core_->local_mem()->read(data, addr, size);
+++  } else if (type == AddrType::Tensor) {
+++    core_->tensor_mem()->read(data, addr, size);
++   } else {
++     mmu_.read(data, addr, size, 0);
++   }
++@@ -348,6 +352,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
++   } else {
++     if (type == AddrType::Shared) {
++       core_->local_mem()->write(data, addr, size);
+++    } else if (type == AddrType::Tensor) {
+++      core_->tensor_mem()->write(data, addr, size);
++     } else {
++       try
++       {
++@@ -372,6 +378,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
++   } else {
++     if (type == AddrType::Shared) {
++       core_->local_mem()->write(data, addr, size);
+++    } else if (type == AddrType::Tensor) {
+++      core_->tensor_mem()->write(data, addr, size);
++     } else {
++       mmu_.write(data, addr, size, 0);
++     }
++diff --git a/sim/simx/tensor_mem.cpp b/sim/simx/tensor_mem.cpp
++new file mode 100644
++index 0000000..c1f2b2e
++--- /dev/null
+++++ b/sim/simx/tensor_mem.cpp
++@@ -0,0 +1,127 @@
+++#include "tensor_mem.h"
+++#include "core.h"
+++#include <bitmanip.h>
+++#include <vector>
+++#include "types.h"
+++
+++using namespace vortex;
+++
+++class TensorMem::Impl {
+++protected:
+++	TensorMem* simobject_;
+++	Config    config_;
+++	RAM       ram_; // TODO: is RAM the correct MemDevice here?
+++	uint32_t 	line_bits_;
+++	MemCrossBar::Ptr mem_xbar_;
+++	mutable PerfStats perf_stats_;
+++
+++	uint64_t to_local_addr(uint64_t addr) {
+++		return bit_getw(addr, 0, line_bits_-1);
+++	}
+++
+++public:
+++	Impl(TensorMem* simobject, const Config& config)
+++		: simobject_(simobject)
+++		, config_(config)
+++		, ram_(config.capacity)
+++	{
+++		uint32_t total_lines = config.capacity / config.line_size;
+++		line_bits_ = log2ceil(total_lines);
+++
+++		char sname[100];
+++		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
+++		uint32_t lg2_line_size = log2ceil(config_.line_size);
+++		uint32_t num_banks = 1 << config.B;
+++		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
+++		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
+++    	// Custom logic to calculate the output index using bank interleaving
+++			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
+++		});
+++		for (uint32_t i = 0; i < config.num_reqs; ++i) {
+++			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
+++			mem_xbar_->RspIn.at(i).bind(&simobject->Outputs.at(i));
+++		}
+++	}
+++
+++	virtual ~Impl() {}
+++
+++	void reset() {
+++		perf_stats_ = PerfStats();
+++	}
+++
+++	void read(void* data, uint64_t addr, uint32_t size) {
+++		auto l_addr = to_local_addr(addr);
+++		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+++		ram_.read(data, l_addr, size);
+++	}
+++
+++	void write(const void* data, uint64_t addr, uint32_t size) {
+++		auto l_addr = to_local_addr(addr);
+++		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+++		ram_.write(data, l_addr, size);
+++	}
+++
+++	void tick() {
+++		// process bank requets from xbar
+++		uint32_t num_banks = (1 << config_.B);
+++		for (uint32_t i = 0; i < num_banks; ++i) {
+++			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
+++			if (xbar_req_out.empty())
+++				continue;
+++
+++			auto& bank_req = xbar_req_out.front();
+++			DT(4, simobject_->name() << "-bank" << i << "-req : " << bank_req);
+++
+++			if (!bank_req.write || config_.write_reponse) {
+++				// send xbar response
+++				MemRsp bank_rsp{bank_req.tag, bank_req.cid, bank_req.uuid};
+++				mem_xbar_->RspOut.at(i).push(bank_rsp);
+++			}
+++
+++			// update perf counters
+++			perf_stats_.reads += !bank_req.write;
+++			perf_stats_.writes += bank_req.write;
+++
+++			// remove input
+++			xbar_req_out.pop();
+++		}
+++	}
+++
+++	const PerfStats& perf_stats() const {
+++		perf_stats_.bank_stalls = mem_xbar_->collisions();
+++		return perf_stats_;
+++	}
+++};
+++
+++///////////////////////////////////////////////////////////////////////////////
+++
+++TensorMem::TensorMem(const SimContext& ctx, const char* name, const Config& config)
+++	: SimObject<TensorMem>(ctx, name)
+++	, Inputs(config.num_reqs, this)
+++	, Outputs(config.num_reqs, this)
+++	, impl_(new Impl(this, config))
+++{}
+++
+++TensorMem::~TensorMem() {
+++  delete impl_;
+++}
+++
+++void TensorMem::reset() {
+++  impl_->reset();
+++}
+++
+++void TensorMem::read(void* data, uint64_t addr, uint32_t size) {
+++  impl_->read(data, addr, size);
+++}
+++
+++void TensorMem::write(const void* data, uint64_t addr, uint32_t size) {
+++  impl_->write(data, addr, size);
+++}
+++
+++void TensorMem::tick() {
+++  impl_->tick();
+++}
+++
+++const TensorMem::PerfStats& TensorMem::perf_stats() const {
+++  return impl_->perf_stats();
+++}
++\ No newline at end of file
++diff --git a/sim/simx/tensor_mem.h b/sim/simx/tensor_mem.h
++new file mode 100644
++index 0000000..c4cda78
++--- /dev/null
+++++ b/sim/simx/tensor_mem.h
++@@ -0,0 +1,59 @@
+++#pragma once
+++
+++#include <simobject.h>
+++#include "types.h"
+++
+++namespace vortex {
+++
+++class TensorMem : public SimObject<TensorMem> {
+++public:
+++  struct Config {
+++    uint32_t capacity;
+++    uint32_t line_size;
+++    uint32_t num_reqs;
+++    uint32_t B; // log2 number of banks
+++    bool write_reponse;
+++  };
+++
+++  struct PerfStats {
+++    uint64_t reads;
+++    uint64_t writes;
+++    uint64_t bank_stalls;
+++
+++    PerfStats()
+++      : reads(0)
+++      , writes(0)
+++      , bank_stalls(0)
+++    {}
+++
+++    PerfStats& operator+=(const PerfStats& rhs) {
+++      this->reads += rhs.reads;
+++      this->writes += rhs.writes;
+++      this->bank_stalls += rhs.bank_stalls;
+++      return *this;
+++    }
+++  };
+++
+++  std::vector<SimPort<MemReq>> Inputs;
+++  std::vector<SimPort<MemRsp>> Outputs;
+++
+++  TensorMem(const SimContext& ctx, const char* name, const Config& config);
+++  virtual ~TensorMem();
+++
+++  void reset();
+++
+++  void read(void* data, uint64_t addr, uint32_t size);
+++
+++  void write(const void* data, uint64_t addr, uint32_t size);
+++
+++  void tick();
+++
+++  const PerfStats& perf_stats() const;
+++
+++protected:
+++
+++  class Impl;
+++  Impl* impl_;
+++};
+++
+++}
++diff --git a/sim/simx/types.h b/sim/simx/types.h
++index 3182c33..cfe115b 100644
++--- a/sim/simx/types.h
+++++ b/sim/simx/types.h
++@@ -708,7 +708,8 @@ using IntrArgs = std::variant<
++ enum class AddrType {
++   Global,
++   Shared,
++-  IO
+++  IO,
+++  Tensor
++ };
++ 
++ inline AddrType get_addr_type(uint64_t addr) {
++@@ -720,6 +721,11 @@ inline AddrType get_addr_type(uint64_t addr) {
++         return AddrType::Shared;
++     }
++   }
+++  if (EXT_TCU_ENABLED) {
+++    if (addr >= TMEM_BASE_ADDR && addr < TMEM_END_ADDR) {
+++      return AddrType::Tensor;
+++    }
+++  }
++   return AddrType::Global;
++ }
++ 
++@@ -728,6 +734,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
++   case AddrType::Global: os << "Global"; break;
++   case AddrType::Shared: os << "Shared"; break;
++   case AddrType::IO:     os << "IO"; break;
+++  case AddrType::Tensor: os << "Tensor"; break;
++   default: assert(false);
++   }
++   return os;
++@@ -1583,6 +1590,8 @@ public:
++   SimPort<LsuReq> ReqDC;
++   SimPort<LsuRsp> RspDC;
++ 
+++  // TODO: Add ReqTmem, RspTmem ports for TCU local memory access
+++
++   LocalMemSwitch(
++     const SimContext& ctx,
++     const char* name,
+diff --git a/sim/simx/Makefile b/sim/simx/Makefile
+index 1eca622..c769e09 100644
+--- a/sim/simx/Makefile
++++ b/sim/simx/Makefile
+@@ -24,7 +24,7 @@ SRCS = $(SW_COMMON_DIR)/util.cpp $(SW_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softf
+ SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/emulator.cpp
+ SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
+ SRCS += $(SRC_DIR)/execute.cpp $(SRC_DIR)/func_unit.cpp
+-SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
++SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/tensor_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
+ SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/types.cpp
+ 
+ # Add V extension sources
+diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
+index 5579190..d52569d 100644
+--- a/sim/simx/core.cpp
++++ b/sim/simx/core.cpp
+@@ -79,6 +79,16 @@ Core::Core(const SimContext& ctx,
+     false
+   });
+ 
++  // create tensor memory
++  snprintf(sname, 100, "%s-tmem", this->name().c_str());
++  tensor_mem_ = TensorMem::Create(sname, TensorMem::Config{
++    (1 << TMEM_LOG_SIZE),
++    LSU_WORD_SIZE,      // or TMEM_WORD_SIZE if different
++    LSU_CHANNELS,      // number of banks/channels
++    log2ceil(TMEM_NUM_BANKS),
++    false
++  });
++
+   // create lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     snprintf(sname, 100, "%s-lmem_switch%d", this->name().c_str(), b);
+@@ -96,10 +106,27 @@ Core::Core(const SimContext& ctx,
+   snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
+   auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
+ 
++  // create tmem arbiter
++  snprintf(sname, 100, "%s-tmem_arb", this->name().c_str());
++  auto tmem_arb = LsuArbiter::Create(
++      sname,
++      ArbiterType::RoundRobin,
++      NUM_LSU_BLOCKS,    // one input per LSU block
++      1                  // single output
++  );
++
+   // create lmem adapter
+   snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
+   auto lsu_lmem_adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
+ 
++  // create tmem adapter
++  snprintf(sname, 100, "%s-lsu_tmem_adapter", this->name().c_str());
++  auto lsu_tmem_adapter = LsuMemAdapter::Create(
++      sname,
++      LSU_CHANNELS,     // physical channels
++      1                  // one input stream from arbiter
++  );
++
+   // connect lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     lmem_switch_.at(b)->ReqDC.bind(&mem_coalescers_.at(b)->ReqIn);
+@@ -109,16 +136,32 @@ Core::Core(const SimContext& ctx,
+     lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
+   }
+ 
++  // connect tmem switch
++  for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
++    lmem_switch_.at(b)->ReqTmem.bind(&tmem_arb->ReqIn.at(b));
++    tmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspTmem);
++  }
++
+   // connect lmem arbiter
+   lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
+   lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
+ 
++  // connect tmem arbiter
++  tmem_arb->ReqOut.at(0).bind(&lsu_tmem_adapter->ReqIn);
++  lsu_tmem_adapter->RspIn.bind(&tmem_arb->RspOut.at(0));
++
+   // connect lmem adapter
+   for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
+     lsu_lmem_adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(c));
+     local_mem_->Outputs.at(c).bind(&lsu_lmem_adapter->RspOut.at(c));
+   }
+ 
++  // connect tmem adapter
++  for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
++    lsu_tmem_adapter->ReqOut.at(c).bind(&tensor_mem_->Inputs.at(c));
++    tensor_mem_->Outputs.at(c).bind(&lsu_tmem_adapter->RspOut.at(c));
++  }
++
+   // connect dcache coalescer
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     mem_coalescers_.at(b)->ReqOut.bind(&lsu_dcache_adapter.at(b)->ReqIn);
+diff --git a/sim/simx/core.h b/sim/simx/core.h
+index a8b674d..f6be86f 100644
+--- a/sim/simx/core.h
++++ b/sim/simx/core.h
+@@ -20,6 +20,7 @@
+ #include "pipeline.h"
+ #include "cache_sim.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ #include "ibuffer.h"
+ #include "scoreboard.h"
+ 
+@@ -147,6 +148,10 @@ public:
+     return local_mem_;
+   }
+ 
++  const TensorMem::Ptr& tensor_mem() const {
++    return tensor_mem_;
++  }
++
+   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
+     return mem_coalescers_.at(idx);
+   }
+@@ -208,6 +213,7 @@ private:
+   std::vector<Dispatcher::Ptr> dispatchers_;
+   std::vector<FuncUnit::Ptr> func_units_;
+   LocalMem::Ptr local_mem_;
++  TensorMem::Ptr tensor_mem_;
+   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
+   std::vector<MemCoalescer::Ptr> mem_coalescers_;
+ 
+diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
+index 3eb62f9..0b7633e 100644
+--- a/sim/simx/emulator.cpp
++++ b/sim/simx/emulator.cpp
+@@ -27,6 +27,7 @@
+ #include "cluster.h"
+ #include "processor_impl.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ 
+ using namespace vortex;
+ 
+@@ -313,6 +314,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     try
+     {
+@@ -331,6 +334,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     mmu_.read(data, addr, size, 0);
+   }
+@@ -348,6 +353,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       try
+       {
+@@ -372,6 +379,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       mmu_.write(data, addr, size, 0);
+     }
+diff --git a/sim/simx/tensor_mem.cpp b/sim/simx/tensor_mem.cpp
+new file mode 100644
+index 0000000..ff9c2f2
+--- /dev/null
++++ b/sim/simx/tensor_mem.cpp
+@@ -0,0 +1,130 @@
++#include "tensor_mem.h"
++#include "core.h"
++#include <bitmanip.h>
++#include <vector>
++#include "types.h"
++
++using namespace vortex;
++
++class TensorMem::Impl {
++protected:
++	TensorMem* simobject_;
++	Config    config_;
++	RAM       ram_;
++	uint32_t 	line_bits_;
++	MemCrossBar::Ptr mem_xbar_;
++	mutable PerfStats perf_stats_;
++
++	uint64_t to_local_addr(uint64_t addr) {
++		// assuming addr is in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
++		// TODO: CHECK IF BELOW IS APPROPRIATE CHANGE
++		uint64_t local = addr - TMEM_BASE_ADDR;
++		return bit_getw(local, 0, line_bits_ - 1);
++	}
++
++public:
++	Impl(TensorMem* simobject, const Config& config)
++		: simobject_(simobject)
++		, config_(config)
++		, ram_(config.capacity)
++	{
++		uint32_t total_lines = config.capacity / config.line_size;
++		line_bits_ = log2ceil(total_lines);
++
++		char sname[100];
++		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
++		uint32_t lg2_line_size = log2ceil(config_.line_size);
++		uint32_t num_banks = 1 << config.B;
++		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
++		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
++    	// Custom logic to calculate the output index using bank interleaving
++			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
++		});
++		for (uint32_t i = 0; i < config.num_reqs; ++i) {
++			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
++			mem_xbar_->RspIn.at(i).bind(&simobject->Outputs.at(i));
++		}
++	}
++
++	virtual ~Impl() {}
++
++	void reset() {
++		perf_stats_ = PerfStats();
++	}
++
++	void read(void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.read(data, l_addr, size);
++	}
++
++	void write(const void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.write(data, l_addr, size);
++	}
++
++	void tick() {
++		// process bank requets from xbar
++		uint32_t num_banks = (1 << config_.B);
++		for (uint32_t i = 0; i < num_banks; ++i) {
++			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
++			if (xbar_req_out.empty())
++				continue;
++
++			auto& bank_req = xbar_req_out.front();
++			DT(4, simobject_->name() << "-bank" << i << "-req : " << bank_req);
++
++			if (!bank_req.write || config_.write_reponse) {
++				// send xbar response
++				MemRsp bank_rsp{bank_req.tag, bank_req.cid, bank_req.uuid};
++				mem_xbar_->RspOut.at(i).push(bank_rsp);
++			}
++
++			// update perf counters
++			perf_stats_.reads += !bank_req.write;
++			perf_stats_.writes += bank_req.write;
++
++			// remove input
++			xbar_req_out.pop();
++		}
++	}
++
++	const PerfStats& perf_stats() const {
++		perf_stats_.bank_stalls = mem_xbar_->collisions();
++		return perf_stats_;
++	}
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++TensorMem::TensorMem(const SimContext& ctx, const char* name, const Config& config)
++	: SimObject<TensorMem>(ctx, name)
++	, Inputs(config.num_reqs, this)
++	, Outputs(config.num_reqs, this)
++	, impl_(new Impl(this, config))
++{}
++
++TensorMem::~TensorMem() {
++  delete impl_;
++}
++
++void TensorMem::reset() {
++  impl_->reset();
++}
++
++void TensorMem::read(void* data, uint64_t addr, uint32_t size) {
++  impl_->read(data, addr, size);
++}
++
++void TensorMem::write(const void* data, uint64_t addr, uint32_t size) {
++  impl_->write(data, addr, size);
++}
++
++void TensorMem::tick() {
++  impl_->tick();
++}
++
++const TensorMem::PerfStats& TensorMem::perf_stats() const {
++  return impl_->perf_stats();
++}
+\ No newline at end of file
+diff --git a/sim/simx/tensor_mem.h b/sim/simx/tensor_mem.h
+new file mode 100644
+index 0000000..c4cda78
+--- /dev/null
++++ b/sim/simx/tensor_mem.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <simobject.h>
++#include "types.h"
++
++namespace vortex {
++
++class TensorMem : public SimObject<TensorMem> {
++public:
++  struct Config {
++    uint32_t capacity;
++    uint32_t line_size;
++    uint32_t num_reqs;
++    uint32_t B; // log2 number of banks
++    bool write_reponse;
++  };
++
++  struct PerfStats {
++    uint64_t reads;
++    uint64_t writes;
++    uint64_t bank_stalls;
++
++    PerfStats()
++      : reads(0)
++      , writes(0)
++      , bank_stalls(0)
++    {}
++
++    PerfStats& operator+=(const PerfStats& rhs) {
++      this->reads += rhs.reads;
++      this->writes += rhs.writes;
++      this->bank_stalls += rhs.bank_stalls;
++      return *this;
++    }
++  };
++
++  std::vector<SimPort<MemReq>> Inputs;
++  std::vector<SimPort<MemRsp>> Outputs;
++
++  TensorMem(const SimContext& ctx, const char* name, const Config& config);
++  virtual ~TensorMem();
++
++  void reset();
++
++  void read(void* data, uint64_t addr, uint32_t size);
++
++  void write(const void* data, uint64_t addr, uint32_t size);
++
++  void tick();
++
++  const PerfStats& perf_stats() const;
++
++protected:
++
++  class Impl;
++  Impl* impl_;
++};
++
++}
+diff --git a/sim/simx/types.cpp b/sim/simx/types.cpp
+index 56bf60c..b6c500d 100644
+--- a/sim/simx/types.cpp
++++ b/sim/simx/types.cpp
+@@ -24,6 +24,8 @@ LocalMemSwitch::LocalMemSwitch(
+   , RspIn(this)
+   , ReqLmem(this)
+   , RspLmem(this)
++  , ReqTmem(this)
++  , RspTmem(this)
+   , ReqDC(this)
+   , RspDC(this)
+   , delay_(delay)
+@@ -39,6 +41,12 @@ void LocalMemSwitch::tick() {
+     RspIn.push(out_rsp, 1);
+     RspLmem.pop();
+   }
++  if (!RspTmem.empty()) {
++    auto& out_rsp = RspTmem.front();
++    DT(4, this->name() << "-tmem-rsp: " << out_rsp);
++    RspIn.push(out_rsp, 1);
++    RspTmem.pop();
++  }
+   if (!RspDC.empty()) {
+     auto& out_rsp = RspDC.front();
+     DT(4, this->name() << "-dc-rsp: " << out_rsp);
+@@ -57,14 +65,21 @@ void LocalMemSwitch::tick() {
+     out_dc_req.uuid  = in_req.uuid;
+ 
+     LsuReq out_lmem_req(out_dc_req);
++    LsuReq out_tmem_req(out_dc_req);
+ 
+     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
+       if (in_req.mask.test(i)) {
+         auto type = get_addr_type(in_req.addrs.at(i));
+         if (type == AddrType::Shared) {
++          // LMEM
+           out_lmem_req.mask.set(i);
+           out_lmem_req.addrs.at(i) = in_req.addrs.at(i);
++        } else if (type == AddrType::Tensor) {
++          // TMEM
++          out_tmem_req.mask.set(i);
++          out_tmem_req.addrs.at(i) = in_req.addrs.at(i);
+         } else {
++          // default: global / dcache
+           out_dc_req.mask.set(i);
+           out_dc_req.addrs.at(i) = in_req.addrs.at(i);
+         }
+@@ -80,6 +95,12 @@ void LocalMemSwitch::tick() {
+       ReqLmem.push(out_lmem_req, delay_);
+       DT(4, this->name() << "-lmem-req: " << out_lmem_req);
+     }
++
++    if (!out_tmem_req.mask.none()) {
++      ReqTmem.push(out_tmem_req, delay_);
++      DT(4, this->name() << "-tmem-req: " << out_tmem_req);
++    }
++
+     ReqIn.pop();
+   }
+ }
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 70be5ac..09da7ed 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -708,7 +708,8 @@ using IntrArgs = std::variant<
+ enum class AddrType {
+   Global,
+   Shared,
+-  IO
++  IO,
++  Tensor
+ };
+ 
+ inline AddrType get_addr_type(uint64_t addr) {
+@@ -720,6 +721,11 @@ inline AddrType get_addr_type(uint64_t addr) {
+         return AddrType::Shared;
+     }
+   }
++  if (EXT_TCU_ENABLED) {
++    if (addr >= TMEM_BASE_ADDR && addr < TMEM_END_ADDR) {
++      return AddrType::Tensor;
++    }
++  }
+   return AddrType::Global;
+ }
+ 
+@@ -728,6 +734,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
+   case AddrType::Global: os << "Global"; break;
+   case AddrType::Shared: os << "Shared"; break;
+   case AddrType::IO:     os << "IO"; break;
++  case AddrType::Tensor: os << "Tensor"; break;
+   default: assert(false);
+   }
+   return os;
+@@ -1580,6 +1587,9 @@ public:
+   SimPort<LsuReq> ReqLmem;
+   SimPort<LsuRsp> RspLmem;
+ 
++  SimPort<LsuReq> ReqTmem;
++  SimPort<LsuRsp> RspTmem;
++
+   SimPort<LsuReq> ReqDC;
+   SimPort<LsuRsp> RspDC;
+ 
+diff --git a/tests/regression/final/Makefile b/tests/regression/final/Makefile
+new file mode 100644
+index 0000000..f80fd0f
+--- /dev/null
++++ b/tests/regression/final/Makefile
+@@ -0,0 +1,16 @@
++ROOT_DIR := $(realpath ../../..)
++include $(ROOT_DIR)/config.mk
++
++PROJECT := final
++
++SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
++
++SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp
++
++VX_SRCS := $(SRC_DIR)/kernel.cpp
++
++CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
++
++LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
++
++include ../common.mk
+diff --git a/tests/regression/final/common.h b/tests/regression/final/common.h
+new file mode 100644
+index 0000000..f2cfc72
+--- /dev/null
++++ b/tests/regression/final/common.h
+@@ -0,0 +1,33 @@
++#ifndef _COMMON_H_
++#define _COMMON_H_
++
++#include <stdint.h>
++#include <VX_config.h>
++
++#ifndef NUM_THREADS
++#define NUM_THREADS 4
++#endif
++
++#ifndef ITYPE
++#define ITYPE fp16
++#endif
++
++#ifndef OTYPE
++#define OTYPE fp32
++#endif
++
++// Tensor memory base address for accumulator storage
++#ifndef TMEM_ACCUM_BASE
++#define TMEM_ACCUM_BASE TMEM_BASE_ADDR
++#endif
++
++typedef struct {
++  uint32_t grid_dim[2];
++  uint32_t block_dim[2];
++  uint32_t M, N, K;
++  uint64_t A_addr;
++  uint64_t B_addr;
++  uint64_t C_addr;
++} kernel_arg_t;
++
++#endif
+diff --git a/tests/regression/final/kernel.cpp b/tests/regression/final/kernel.cpp
+new file mode 100644
+index 0000000..6c3bc2b
+--- /dev/null
++++ b/tests/regression/final/kernel.cpp
+@@ -0,0 +1,74 @@
++#include "common.h"
++#include <vx_spawn.h>
++#include <vx_tensor.h>
++
++namespace vt = vortex::tensor;
++using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
++  auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
++  auto pB = reinterpret_cast<ctx::input_t *>(arg->B_addr);
++  auto pC = reinterpret_cast<ctx::output_t *>(arg->C_addr);
++
++  uint32_t M = arg->M;
++  uint32_t N = arg->N;
++  uint32_t K = arg->K;
++
++  ctx::fragment_a   fragA;
++  ctx::fragment_b   fragB;
++  ctx::fragment_acc fragC;
++
++  // calculate tile row & column based on block index
++  uint32_t tile_row = blockIdx.y * ctx::tileM;
++  uint32_t tile_col = blockIdx.x * ctx::tileN;
++
++  // Calculate unique accumulator address in tensor memory for this block
++  // Each block gets its own space in tensor memory
++  uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
++  uint32_t accum_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
++  auto pAccum = reinterpret_cast<ctx::output_t*>(TMEM_ACCUM_BASE + block_id * accum_size);
++
++  // Initialize accumulator tile to zero
++  ctx::fill_fragment(fragC, 0);
++  
++  // Store initial zero accumulator to tensor memory
++  ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
++
++  for (int i = 0; i < K; i += ctx::tileK) {
++    // Load accumulator from tensor memory at the start of each iteration
++    ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
++    
++    auto pTileA = pA + tile_row * K + i;
++
++    // Load A tile
++    ctx::load_matrix_sync(fragA, pTileA, K);
++
++    // Load B tile
++    if constexpr (vt::ITYPE::bits < 8) {
++      // For sub-byte matrix B must be in col-major format
++      auto pTileB = pB + tile_col * K + i;
++      ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K);
++    } else {
++      auto pTileB = pB + i * N + tile_col;
++      ctx::load_matrix_sync(fragB, pTileB, N);
++    }
++
++    // Matrix multiply-accumulate: c += a * b
++    ctx::mma_sync(fragC, fragA, fragB, fragC);
++    
++    // Store accumulator back to tensor memory after each iteration
++    ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
++  }
++
++  // Load final accumulator from tensor memory
++  ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
++  
++  // Store the computed C tile to global memory
++  auto pTileC = pC + tile_row * N + tile_col;
++  ctx::store_matrix_sync(pTileC, fragC, N);
++}
++
++int main() {
++  auto arg = (kernel_arg_t *)csr_read(VX_CSR_MSCRATCH);
++  return vx_spawn_threads(2, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)kernel_body, arg);
++}
+diff --git a/tests/regression/final/main.cpp b/tests/regression/final/main.cpp
+new file mode 100644
+index 0000000..132e412
+--- /dev/null
++++ b/tests/regression/final/main.cpp
+@@ -0,0 +1,689 @@
++#include "common.h"
++#include <chrono>
++#include <cmath>
++#include <iostream>
++#include <rvfloats.h>
++#include <string.h>
++#include <tensor_cfg.h>
++#include <unistd.h>
++#include <util.h>
++#include <vector>
++#include <vortex.h>
++
++#define FLOAT_ULP 6
++#define MAX_ERRORS 100
++
++#define RT_CHECK(_expr)                                      \
++  do {                                                       \
++    int _ret = _expr;                                        \
++    if (0 == _ret)                                           \
++      break;                                                 \
++    printf("Error: '%s' returned %d!\n", #_expr, (int)_ret); \
++    cleanup();                                               \
++    exit(-1);                                                \
++  } while (false)
++
++using namespace vortex;
++namespace vt = tensor;
++
++static bool g_enable_sparse = false;
++///////////////////////////////////////////////////////////////////////////////
++
++static void convert_row_to_col_major_4bit(uint8_t *dst, uint32_t width, uint32_t height, const uint8_t *src) {
++  // Calculate output size and stride
++  uint32_t out_bytes = (width * height + 1) / 2;
++  memset(dst, 0, out_bytes);
++  uint32_t dst_stride = (height + 1) / 2; // Bytes per column in output
++
++  // For each column in source (which becomes row in destination)
++  for (uint32_t c = 0; c < width; ++c) {
++    uint32_t base = c * dst_stride;
++
++    // For each row in source (which becomes column in destination)
++    for (uint32_t r = 0; r < height; r += 2) {
++      // Calculate source indices (row-major)
++      uint32_t idx_even = r * width + c;
++      uint32_t idx_odd = (r + 1) * width + c;
++
++      // Extract nibbles - consistent with data_accessor_t
++      uint8_t b_even = src[idx_even / 2];
++      uint8_t b_odd = (r + 1 < height) ? src[idx_odd / 2] : 0;
++
++      uint8_t nib_even = (idx_even & 1) ? (b_even >> 4) : (b_even & 0x0F);
++      uint8_t nib_odd = (r + 1 < height)
++                            ? ((idx_odd & 1) ? (b_odd >> 4) : (b_odd & 0x0F))
++                            : 0;
++
++      // Pack into destination: even row in low nibble, odd row in high nibble
++      dst[base + r / 2] = (nib_odd << 4) | nib_even;
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename T>
++struct data_accessor_t {
++  using Type = typename T::dtype;
++  static Type read(const Type *ptr, uint32_t offset) {
++    return ptr[offset];
++  }
++  static void write(Type *ptr, uint32_t offset, Type value) {
++    ptr[offset] = value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::int4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::uint4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename Type>
++class Comparator {};
++
++template <>
++class Comparator<vt::int8> {
++public:
++  static int8_t generate() {
++    return (int8_t)rand();
++  }
++  static bool compare(int8_t a, int8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint8> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand();
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int32> {
++public:
++  static int32_t generate() {
++    return (int32_t)rand();
++  }
++  static bool compare(int32_t a, int32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftoh_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::bf16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftob_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::tf32> {
++public:
++  static uint32_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftox_s(bit_cast<uint32_t>(fvalue), 8, 10, 0, nullptr);
++  }
++  static bool compare(uint32_t a, uint32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp32> {
++public:
++  static float generate() {
++    return static_cast<float>(rand()) / RAND_MAX;
++  }
++  static bool compare(float a, float b, int index, int errors) {
++    union fi_t {
++      float f;
++      int32_t i;
++    };
++    fi_t fa, fb;
++    fa.f = a;
++    fb.f = b;
++    auto d = std::abs(fa.i - fb.i);
++    if (d > FLOAT_ULP) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=%f, actual=%f\n", index, fb.f, fa.f);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename S, typename D>
++struct muladd_t {
++  using stype = typename S::dtype;
++  using dtype = typename D::dtype;
++  static dtype eval(stype a, stype b, dtype c) {
++    return static_cast<dtype>(a) * static_cast<dtype>(b) + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_htof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftoh_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::bf16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_btof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftob_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::tf32, vt::fp32> {
++  static float eval(uint32_t a, uint32_t b, float c) {
++    auto fa = bit_cast<float>(rv_xtof_s(a, 8, 10, 0, nullptr));
++    auto fb = bit_cast<float>(rv_xtof_s(b, 8, 10, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::int4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    if (a & 0x8) {
++      a_val |= 0xFFFFFFF0; // sign extend
++    }
++    int32_t b_val = b & 0xF;
++    if (b & 0x8) {
++      b_val |= 0xFFFFFFF0; // sign extend
++    }
++    return a_val * b_val + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::uint4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    int32_t b_val = b & 0xF;
++    return a_val * b_val + c;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++using cfg = vt::wmma_config_t<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++using itype_t = typename vt::ITYPE::dtype;
++using otype_t = typename vt::OTYPE::dtype;
++
++struct SparseMat {
++  std::vector<itype_t> values;   // non-zeros
++  std::vector<uint8_t> meta;     // Array of row-masks: 1 byte marks the columns
++                                  // of the 4 elements in the block that are non-zero.
++                                  // e.g. 0b0101 means 2nd and 4th elements are non-zero.
++
++  uint32_t rows, cols;           // original A dims (M × K)
++};
++
++static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
++  uint32_t subbytes = 8 / vt::ITYPE::bits;
++  uint32_t KS = subbytes ? (K * subbytes) : K;
++  for (uint32_t m = 0; m < M; ++m) {
++    for (uint32_t n = 0; n < N; ++n) {
++      otype_t sum(0);
++      for (uint32_t k = 0; k < KS; ++k) {
++        auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
++        auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
++        sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, sum);
++      }
++      data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++const char *kernel_file = "kernel.vxbin";
++
++uint32_t xm = 32;
++uint32_t xn = 32;
++uint32_t xk = 32;
++
++vx_device_h device = nullptr;
++vx_buffer_h A_buffer = nullptr;
++vx_buffer_h B_buffer = nullptr;
++vx_buffer_h C_buffer = nullptr;
++vx_buffer_h krnl_buffer = nullptr;
++vx_buffer_h args_buffer = nullptr;
++kernel_arg_t kernel_arg = {};
++
++std::string last_build_options;
++
++static void show_usage() {
++  std::cout << "Vortex Sgemm TCU Test." << std::endl;
++  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [-h: help]" << std::endl;
++  std::cout << "  -s  Enable 2:4 structured sparsity " << std::endl;
++}
++
++static void parse_args(int argc, char **argv) {
++  int c;
++  while ((c = getopt(argc, argv, "m:n:k:i:o:hs")) != -1) {
++    switch (c) {
++    case 'm':
++      xm = atoi(optarg);
++      break;
++    case 'n':
++      xn = atoi(optarg);
++      break;
++    case 'k':
++      xk = atoi(optarg);
++      break;
++    case 's':
++      g_enable_sparse = true;
++      std::cout << "Sparse mode enabled (-s)" << std::endl;
++      break;
++    case 'h':
++      show_usage();
++      exit(0);
++      break;
++    default:
++      show_usage();
++      exit(-1);
++    }
++  }
++}
++
++void cleanup() {
++  if (device) {
++    vx_mem_free(A_buffer);
++    vx_mem_free(B_buffer);
++    vx_mem_free(C_buffer);
++    vx_mem_free(krnl_buffer);
++    vx_mem_free(args_buffer);
++    vx_dev_close(device);
++  }
++}
++
++
++static SparseMat pruneAndCompressMatrixA(const std::vector<itype_t>& denseA,
++                                         uint32_t M, uint32_t K) {
++  SparseMat out;
++  out.rows = M;
++  out.cols = K;
++  out.values.reserve(M * K / 2); // Select 2 values every 4 values
++  out.meta.reserve(M * K / 4); // 1 byte for every 4 values
++
++  const itype_t* src = denseA.data();
++
++  for (uint32_t r = 0; r < M; ++r) {
++    for (uint32_t c = 0; c < K; c += 4) {
++      itype_t blk[4] = {src[r * K + c],
++                        src[r * K + c + 1],
++                        src[r * K + c + 2],
++                        src[r * K + c + 3]};
++
++      uint32_t idx[4] = {0, 1, 2, 3};
++      std::sort(idx, idx + 4,
++        [&](uint32_t a, uint32_t b) {
++          return std::abs((int)blk[a]) < std::abs((int)blk[b]);
++        }); //Sort the 4 elements by absolute value, ascending order
++
++      uint8_t keep0 = idx[3];
++      uint8_t keep1 = idx[2]; //idx of largest 2 elements
++
++      out.values.push_back(blk[keep0]);
++      out.values.push_back(blk[keep1]);
++
++      uint8_t m = (1u << keep0) | (1u << keep1);  // e.g. 0b0101
++      out.meta.push_back(m);
++    }
++  }
++  return out;
++}
++
++void test_pruneA() {
++  const uint32_t M = 4, K = 8;
++  std::vector<itype_t> denseA(M * K);
++  for (auto& v : denseA) v = Comparator<vt::ITYPE>::generate();
++
++  auto spA = pruneAndCompressMatrixA(denseA, M, K);
++
++  std::vector<itype_t> recovered(M * K, 0);
++  size_t v_idx = 0, m_idx = 0;
++  for (uint32_t r = 0; r < M; ++r)
++    for (uint32_t c = 0; c < K; c += 4) {
++      uint8_t m = spA.meta[m_idx++];
++      for (uint32_t i = 0; i < 4; ++i)
++        if (m & (1u << i))
++          recovered[r * K + c + i] = spA.values[v_idx++];
++    }
++
++  for (uint32_t i = 0; i < M * K; ++i)
++    assert(recovered[i] == denseA[i] || recovered[i] == 0); //Either the value is preserved or pruned
++  std::cout << "pruneAndCompressMatrixA passed\n";
++}
++
++
++int main(int argc, char *argv[]) {
++  // parse command arguments
++  parse_args(argc, argv);
++
++  if(g_enable_sparse) {
++    test_pruneA(); // Test the pruning function
++  }
++
++  std::srand(50);
++
++  // open device connection
++  std::cout << "open device connection" << std::endl;
++  RT_CHECK(vx_dev_open(&device));
++
++  uint64_t isa_flags;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_ISA_FLAGS, &isa_flags));
++  bool has_ext = (isa_flags & VX_ISA_EXT_TCU) != 0;
++  if (!has_ext) {
++    std::cout << "TCU extension not supported!" << std::endl;
++    cleanup();
++    return -1;
++  }
++
++  uint64_t NT;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT));
++  if (NT != NUM_THREADS) {
++    std::cout << "Error: device warp size (" << NT << ") must match NUM_THREADS=" << NUM_THREADS << "!" << std::endl;
++    return -1;
++  }
++
++  uint32_t M = xm;
++  uint32_t N = xn;
++  uint32_t K = xk;
++
++  if ((M % cfg::tileM) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileM!" << std::endl;
++    return -1;
++  }
++
++  if ((N % cfg::tileN) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileN!" << std::endl;
++    return -1;
++  }
++
++  if ((K % cfg::tileK) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileK!" << std::endl;
++    return -1;
++  }
++
++  size_t sizeA = M * K;
++  size_t sizeB = K * N;
++  size_t sizeC = M * N;
++
++  std::cout << "input data type: " << vt::ITYPE::name << " (id=" << vt::ITYPE::id << ")" << std::endl;
++  std::cout << "output data type: " << vt::OTYPE::name << " (id=" << vt::OTYPE::id << ")" << std::endl;
++  std::cout << "WMMA Core Dimension: M=" << cfg::tcM << ", N=" << cfg::tcN << ", K=" << cfg::tcK << std::endl;
++  std::cout << "WMMA Tile Dimension: M=" << cfg::tileM << ", N=" << cfg::tileN << ", K=" << cfg::tileK << std::endl;
++  std::cout << "matrix A: " << M << "x" << K << std::endl;
++  std::cout << "matrix B: " << K << "x" << N << std::endl;
++  std::cout << "matrix C: " << M << "x" << N << std::endl;
++
++  // set block size to warp size
++  kernel_arg.grid_dim[0] = N / cfg::tileN;
++  kernel_arg.grid_dim[1] = M / cfg::tileM;
++  kernel_arg.block_dim[0] = NT; // warp sizeb
++  kernel_arg.block_dim[1] = 1;
++
++  // set matrix dimensions
++  kernel_arg.M = M;
++  kernel_arg.N = N;
++  kernel_arg.K = K;
++
++  // allocate device memory
++  std::cout << "allocate device memory" << std::endl;
++  RT_CHECK(vx_mem_alloc(device, sizeA * sizeof(itype_t), VX_MEM_READ, &A_buffer));
++  RT_CHECK(vx_mem_address(A_buffer, &kernel_arg.A_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeB * sizeof(itype_t), VX_MEM_READ, &B_buffer));
++  RT_CHECK(vx_mem_address(B_buffer, &kernel_arg.B_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeC * sizeof(otype_t), VX_MEM_WRITE, &C_buffer));
++  RT_CHECK(vx_mem_address(C_buffer, &kernel_arg.C_addr));
++
++  std::cout << "A_addr=0x" << std::hex << kernel_arg.A_addr << std::endl;
++  std::cout << "B_addr=0x" << std::hex << kernel_arg.B_addr << std::endl;
++  std::cout << "C_addr=0x" << std::hex << kernel_arg.C_addr << std::endl;
++
++  // generate source data
++  std::vector<itype_t> h_A(sizeA);
++  std::vector<itype_t> h_B(sizeB);
++  for (uint32_t i = 0; i < sizeA; ++i) {
++    h_A[i] = Comparator<vt::ITYPE>::generate();
++  }
++  for (uint32_t i = 0; i < sizeB; ++i) {
++    h_B[i] = Comparator<vt::ITYPE>::generate();
++  }
++
++  // upload matrix A buffer
++  {
++    std::cout << "upload matrix A buffer" << std::endl;
++    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, sizeA * sizeof(itype_t)));
++  }
++
++  // upload matrix B buffer
++  {
++    std::cout << "upload matrix B buffer" << std::endl;
++    if constexpr (std::is_same<vt::ITYPE, vt::int4>::value || std::is_same<vt::ITYPE, vt::uint4>::value) {
++      // sub-byte matrix B must be in col-major format
++      // we convert the 4-bit row-major to col-major here
++      std::vector<uint8_t> h_B_col(sizeB);
++      convert_row_to_col_major_4bit(h_B_col.data(), N, 2 * K, (uint8_t*)h_B.data());
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B_col.data(), 0, sizeB));
++    } else {
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, sizeB * sizeof(itype_t)));
++    }
++  }
++
++  // upload program
++  std::cout << "upload program" << std::endl;
++  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
++
++  // upload kernel argument
++  std::cout << "upload kernel argument" << std::endl;
++  RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
++
++  auto time_start = std::chrono::high_resolution_clock::now();
++
++  // start device
++  std::cout << "start device" << std::endl;
++  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
++
++  // wait for completion
++  std::cout << "wait for completion" << std::endl;
++  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
++
++  auto time_end = std::chrono::high_resolution_clock::now();
++  double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
++  printf("Elapsed time: %lg ms\n", elapsed);
++
++  // download destination buffer
++  std::vector<otype_t> h_C(sizeC);
++  std::cout << "download destination buffer" << std::endl;
++  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, sizeC * sizeof(otype_t)));
++
++  // verify result
++  std::cout << "verify result" << std::endl;
++  int errors = 0;
++  {
++    std::vector<otype_t> h_ref(sizeC);
++    matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
++
++    for (uint32_t i = 0; i < h_ref.size(); ++i) {
++      if (!Comparator<vt::OTYPE>::compare(h_C[i], h_ref[i], i, errors)) {
++        ++errors;
++      }
++    }
++  }
++
++  // cleanup
++  std::cout << "cleanup" << std::endl;
++  cleanup();
++
++  if (errors != 0) {
++    std::cout << "Found " << std::dec << errors << " / " << sizeC << " errors!" << std::endl;
++    std::cout << "FAILED!" << std::endl;
++    return errors;
++  }
++
++  std::cout << "PASSED!" << std::endl;
++
++  return 0;
++}
+\ No newline at end of file
