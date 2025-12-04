@@ -179,6 +179,13 @@
 `define VX_CSR_MPM_LMEM_WRITES_H        12'hB9C
 `define VX_CSR_MPM_LMEM_BANK_ST         12'hB1D     // bank conflicts
 `define VX_CSR_MPM_LMEM_BANK_ST_H       12'hB9D
+// PERF: tmem
+`define VX_CSR_MPM_TMEM_READS           12'hB20     // tensor memory reads
+`define VX_CSR_MPM_TMEM_READS_H         12'hBA0
+`define VX_CSR_MPM_TMEM_WRITES          12'hB21     // tensor memory writes
+`define VX_CSR_MPM_TMEM_WRITES_H        12'hBA1
+`define VX_CSR_MPM_TMEM_BANK_ST         12'hB22     // tensor memory bank conflicts
+`define VX_CSR_MPM_TMEM_BANK_ST_H       12'hBA2
 // PERF: coalescer
 `define VX_CSR_MPM_COALESCER_MISS       12'hB1F     // coalescer misses
 `define VX_CSR_MPM_COALESCER_MISS_H     12'hB9F

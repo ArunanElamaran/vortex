@@ -519,6 +519,7 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         auto cluster_perf = core_->socket()->cluster()->perf_stats();
         auto socket_perf = core_->socket()->perf_stats();
         auto lmem_perf = core_->local_mem()->perf_stats();
+        auto tmem_perf = core_->tensor_mem()->perf_stats();
 
         uint64_t coalescer_misses = 0;
         for (uint i = 0; i < NUM_LSU_BLOCKS; ++i) {
@@ -561,6 +562,10 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_LMEM_READS, lmem_perf.reads);
         CSR_READ_64(VX_CSR_MPM_LMEM_WRITES, lmem_perf.writes);
         CSR_READ_64(VX_CSR_MPM_LMEM_BANK_ST, lmem_perf.bank_stalls);
+
+        CSR_READ_64(VX_CSR_MPM_TMEM_READS, tmem_perf.reads);
+        CSR_READ_64(VX_CSR_MPM_TMEM_WRITES, tmem_perf.writes);
+        CSR_READ_64(VX_CSR_MPM_TMEM_BANK_ST, tmem_perf.bank_stalls);
         }
       } break;
       default:
