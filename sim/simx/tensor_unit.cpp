@@ -296,6 +296,70 @@ public:
     }
   }
 
+  uint32_t tmem_ld32(uint64_t addr)
+  {
+
+  }
+	void tmem_st32(uint64_t addr, uint32_t value)
+  {
+
+  }
+
+  void umma(uint32_t wid,
+            uint32_t fmt_s,
+            uint32_t fmt_d,
+            uint32_t step_m,
+            uint32_t step_n,
+            uint64_t accum_base,                       // TMEM base address for this tile
+            bool accumulate,                          // false: D=A*B, true: D=A*B+D
+            const std::vector<reg_data_t>& rs1_data,  // A operands (same layout as WMMA)
+            const std::vector<reg_data_t>& rs2_data,  // B operands
+            ExeTraceData* trace_data) {
+    __unused(wid);
+    __unused(trace_data);
+
+    // Same FEDP selection as WMMA (IT -> OT)
+    auto fedp = select_FEDP(fmt_s, fmt_d);
+
+    // Same A/B sub-tiling offsets as WMMA
+    uint32_t a_off = (step_m % cfg::a_sub_blocks) * cfg::a_block_size;
+    uint32_t b_off = (step_n % cfg::b_sub_blocks) * cfg::b_block_size;
+
+    // Iterate over the logical tcM x tcN accumulator tile
+    for (uint32_t i = 0; i < cfg::tcM; ++i) {
+      for (uint32_t j = 0; j < cfg::tcN; ++j) {
+        // Rows of A, columns of B are still coming from registers
+        auto a_row = rs1_data.data() + a_off + i * cfg::tcK;
+        auto b_col = rs2_data.data() + b_off + j * cfg::tcK;
+
+        // Each accumulator element is a 32-bit cell in TMEM, laid out row-major
+        uint64_t elem_addr = accum_base + 4ull * (i * cfg::tcN + j);
+
+        // For UMMA:
+        //   D = A*B      -> start from 0
+        //   D = A*B + D  -> start from existing TMEM value
+        uint32_t c_val = 0u;
+        if (accumulate) {
+          c_val = core_->tmem_ld32(elem_addr);
+        }
+
+        // Compute the new accumulator value
+        uint32_t d_val = fedp(a_row, b_col, c_val);
+
+        // Write result back to TMEM, no register destination
+        core_->tmem_st32(elem_addr, d_val);
+
+        DTH(3, "UMMA: wid=" << wid
+                << ", i=" << i << ", j=" << j
+                << ", m=" << step_m << ", n=" << step_n
+                << ", addr=0x" << std::hex << elem_addr
+                << ", c_val=0x" << c_val
+                << ", d_val=0x" << d_val
+                << std::dec << std::endl);
+      }
+    }
+  }
+
   const PerfStats& perf_stats() const {
     return perf_stats_;
   }
@@ -356,4 +420,16 @@ void TensorUnit::wmma(uint32_t wid,
                       std::vector<reg_data_t>& rd_data,
                       ExeTraceData* trace_data) {
   impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+}
+
+void TensorUnit::umma(uint32_t wid,
+                      uint32_t fmt_s,
+                      uint32_t fmt_d,
+                      uint32_t step_m,
+                      uint32_t step_n,
+                      uint32_t tmem_base, // base TMEM address for accumulator tile
+                      const std::vector<reg_data_t>& rs1_data,
+                      const std::vector<reg_data_t>& rs2_data,
+                      ExeTraceData* trace_data) {
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, tmem_base, rs1_data, rs2_data, trace_data);
 }

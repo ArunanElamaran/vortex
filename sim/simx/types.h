@@ -642,7 +642,7 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
 ///////////////////////////////////////////////////////////////////////////////
 
 enum class TcuType {
-  WMMA,
+  WMMA, UMMA,
 };
 
 struct IntrTcuArgs {
@@ -655,6 +655,7 @@ struct IntrTcuArgs {
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
   case TcuType::WMMA: os << "WMMA"; break;
+  case TcuType::UMMA: os << "UMMA"; break;
   default:
     assert(false);
   }

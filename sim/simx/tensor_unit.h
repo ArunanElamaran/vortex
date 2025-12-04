@@ -63,11 +63,27 @@ public:
 					  std::vector<reg_data_t>& rd_data,
 					  ExeTraceData* trace_data);
 
+	// Accumulator lives in TMEM.
+	// rs1/rs2 hold descriptors for A/B (TMEM/SMEM), result is written
+	// to TMEM at tmem_base and therefore does not return rd_data.
+	void umma(uint32_t wid,
+				uint32_t fmt_s,
+				uint32_t fmt_d,
+				uint32_t step_m,
+				uint32_t step_n,
+				uint32_t tmem_base, // base TMEM address for accumulator tile
+				const std::vector<reg_data_t>& rs1_data,
+				const std::vector<reg_data_t>& rs2_data,
+				ExeTraceData* trace_data);
+
 	const PerfStats& perf_stats() const;
 
 private:
 	class Impl;
 	Impl* impl_;
+
+	uint32_t tmem_ld32(uint64_t addr);        		 // load 32-bit accumulator from TMEM
+	void     tmem_st32(uint64_t addr, uint32_t value); // store 32-bit accumulator to TMEM
 };
 
 } // namespace vortex
