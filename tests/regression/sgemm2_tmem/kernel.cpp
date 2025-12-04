@@ -7,8 +7,14 @@ void kernel_body(kernel_arg_t *arg) {
   auto B_ptr = reinterpret_cast<TYPE*>(arg->B_addr);
   auto C_ptr = reinterpret_cast<TYPE*>(arg->C_addr);
 
+  // TODO: CHANGE BELOW TO USE BOTH TENSOR MEM AND LOCAL MEM
   // Allocate local memory for the tile of matrix A & B
 	auto local_ptr = __local_mem(2 * blockDim.x * blockDim.y * sizeof(TYPE));
+  auto local_A = (TYPE*)local_ptr;
+  auto local_B = (TYPE*)local_ptr + blockDim.x * blockDim.y;
+
+  // Allocate tensor memory for the tile of matrix A & B <-- TODO: CHANGE TO JUST ONE OF THEM OR SMTH
+  auto local_ptr = __local_mem(2 * blockDim.x * blockDim.y * sizeof(TYPE));
   auto local_A = (TYPE*)local_ptr;
   auto local_B = (TYPE*)local_ptr + blockDim.x * blockDim.y;
 
