@@ -1140,6 +1140,40 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
           }
         }
       } break;
+      case 1: { // UMMA
+        namespace vt = vortex::tensor;
+        using cfg = vt::wmma_config_t<NUM_THREADS>;
+        uint32_t ra_base = 0;
+        uint32_t rb_base = (cfg::NRB == 4) ? 28 : 10;
+        uint32_t rc_base = (cfg::NRB == 4) ? 10 : 24;
+        uint32_t fmt_d = rd;
+        uint32_t fmt_s = rs1;
+        uint32_t steps = 0;
+        uint32_t steps_count = cfg::m_steps * cfg::n_steps * cfg::k_steps;
+        uint32_t steps_shift = 32 - log2ceil(steps_count);
+        uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
+        uint32_t uuid_lo = uuid & 0xffffffff;
+        for (uint32_t k = 0; k < cfg::k_steps; ++k) {
+          for (uint32_t m = 0; m < cfg::m_steps; ++m) {
+            for (uint32_t n = 0; n < cfg::n_steps; ++n) {
+              uint32_t rs1 = ra_base + (m / cfg::a_sub_blocks) * cfg::k_steps + k;
+              uint32_t rs2 = rb_base + (k * cfg::n_steps + n) / cfg::b_sub_blocks;
+              uint32_t rs3 = rc_base + m * cfg::n_steps + n;
+              uint32_t uuid_lo_x = (steps << steps_shift) | uuid_lo;
+              uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
+              ++steps;
+              auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
+              instr->setOpType(TcuType::WMMA);
+              instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, m, n});
+              instr->setDestReg(rs3, RegType::Float);
+              instr->setSrcReg(0, rs1, RegType::Float);
+              instr->setSrcReg(1, rs2, RegType::Float);
+              instr->setSrcReg(2, rs3, RegType::Float);
+              ibuffer.push_back(instr);
+            }
+          }
+        }
+      } break;
       default:
         std::abort();
       }
