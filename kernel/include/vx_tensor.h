@@ -701,7 +701,7 @@ public:
 
     // TODO: replace RISCV_CUSTOM1 and operand pattern with actual UMMA encoding.
     __asm__ volatile (
-      ".insn r %[insn], 0, 3, x%[rd], x%[rs1], x%[rs2]\n"
+      ".insn r %[insn], 1, 2, x%[rd], x%[rs1], x%[rs2]\n"
       :
       : [insn]"i"(RISCV_CUSTOM1),
         [rd]"i"(12),   // rc in x12

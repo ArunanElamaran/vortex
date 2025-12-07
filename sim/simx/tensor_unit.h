@@ -80,8 +80,8 @@ private:
 	class Impl;
 	Impl* impl_;
 
-	void mem_load(void* data, uint64_t addr);
-	void mem_store(const void* data, uint64_t addr);
+	template <typename T> void mem_load(const T* base, uint32_t row, uint32_t col, uint32_t ld, T* data);
+	template <typename T> void mem_store(T* base, uint32_t row, uint32_t col, uint32_t ld, T data);
 };
 
 } // namespace vortex

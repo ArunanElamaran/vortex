@@ -3,51 +3,50 @@
 #include <vx_tensor.h>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
+using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
 void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
   auto pB = reinterpret_cast<ctx::input_t *>(arg->B_addr);
   auto pC = reinterpret_cast<ctx::output_t *>(arg->C_addr);
 
+  // Allocate tensor memory for the tile of matrix A & C
+	auto tensor_ptr = __tensor_mem((ctx::tileM*ctx::tileK + ctx::tileM*ctx::tileN) * sizeof(TYPE));
+  auto tensor_A = (TYPE*)tensor_ptr;
+  auto tensor_C = (TYPE*)tensor_ptr + blockDim.x * blockDim.y;
+
+  // Allocate local memory for the tile of matrix B
+	auto local_ptr = __local_mem(ctx::tileN*ctx::tileK * sizeof(TYPE));
+  auto local_B = (TYPE*)local_ptr;
+
   uint32_t M = arg->M;
   uint32_t N = arg->N;
   uint32_t K = arg->K;
-
-  ctx::fragment_a   fragA;
-  ctx::fragment_b   fragB;
-  ctx::fragment_acc fragC;
 
   // calculate tile row & column based on block index
   uint32_t tile_row = blockIdx.y * ctx::tileM;
   uint32_t tile_col = blockIdx.x * ctx::tileN;
 
-  // Initialize accumulator tile to zero
-  ctx::fill_fragment(fragC, 0);
+  for (int k = 0; k < K; k += ctx::tileK) {
+    const auto* A_tile_global = pA + tile_row * K + k;
+    const auto* B_tile_global = pB + k * N      + tile_col;
+    auto*       C_tile_global = pC + tile_row * N + tile_col;
 
-  for (int i = 0; i < K; i += ctx::tileK) {
-    auto pTileA = pA + tile_row * K + i;
+    // 1) Stage tiles into TMEM cooperatively
+    ctx::load_tile_sync<row_major, tileA>(A_tile_global, A_tmem, K);
+    ctx::load_tile_sync<row_major, tileB>(B_tile_global, B_tmem, N);
+    ctx::load_tile_sync<row_major, tileC>(C_tile_global, C_tmem, N);
 
-    // Load A tile
-    ctx::load_matrix_sync(fragA, pTileA, K);
-
-    // Load B tile
-    if constexpr (vt::ITYPE::bits < 8) {
-      // For sub-byte matrix B must be in col-major format
-      auto pTileB = pB + tile_col * K + i;
-      ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K);
-    } else {
-      auto pTileB = pB + i * N + tile_col;
-      ctx::load_matrix_sync(fragB, pTileB, N);
-    }
-
-    // Matrix multiply-accumulate: c += a * b
-    ctx::mma_sync(fragC, fragA, fragB, fragC);
+    // 2) Run UMMA on TMEM tiles
+    ctx::umma_sync(tensor_C, tensor_A, local_B,
+                    ctx::tileK, // lda_tile
+                    ctx::tileN, // ldb_tile
+                    ctx::tileN  // ldc_tile
+                    );
   }
 
   // Store the computed C tile
-  auto pTileC = pC + tile_row * N + tile_col;
-  ctx::store_matrix_sync(pTileC, fragC, N);
+  ctx::store_tile_sync<row_major, tileC>(C_tile_global, C_tmem, N);
 }
 
 int main() {

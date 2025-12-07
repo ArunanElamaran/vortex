@@ -296,6 +296,18 @@ public:
     }
   }
 
+  template <typename T>
+  void mem_load(const T* base, uint32_t row, uint32_t col, uint32_t ld, T* data)
+  {
+    
+  }
+
+  template <typename T>
+  void mem_store(T* base, uint32_t row, uint32_t col, uint32_t ld, T data)
+  {
+    
+  }
+
   void umma(uint32_t wid,
             uint32_t fmt_s,
             uint32_t fmt_d,
@@ -433,12 +445,15 @@ void TensorUnit::umma(uint32_t wid,
   impl_->umma(wid, fmt_s, fmt_d, a_base, b_base, c_base, lda, ldb, ldc, trace_data);
 }
 
-void TensorUnit::mem_load(void* data, uint64_t addr)
+
+template <typename T>
+void TensorUnit::mem_load(const T* base, uint32_t row, uint32_t col, uint32_t ld, T* data)
 {
-  impl_->mem_load(data, addr);
+  impl_->mem_load(base, row, col, ld, data);
 }
 
-void TensorUnit::mem_store(const void* data, uint64_t addr)
+template <typename T>
+void TensorUnit::mem_store(T* base, uint32_t row, uint32_t col, uint32_t ld, T data)
 {
-  impl_->mem_store(data, addr);
+  impl_->mem_store(base, row, col, ld, value, data);
 }
