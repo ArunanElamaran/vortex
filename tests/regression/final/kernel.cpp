@@ -3,7 +3,9 @@
 #include <vx_tensor.h>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
+
+// Use UMMA context - registers hold addresses to tensor memory
+using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
 void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
@@ -14,58 +16,67 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   uint32_t N = arg->N;
   uint32_t K = arg->K;
 
-  ctx::fragment_a   fragA;
-  ctx::fragment_b   fragB;
-  ctx::fragment_acc fragC;
+  // Fragments simply contain tensor memory addresses
+  ctx::fragment_a   tmemA;
+  ctx::fragment_b   tmemB;
+  ctx::fragment_acc tmemC;
 
   // calculate tile row & column based on block index
   uint32_t tile_row = blockIdx.y * ctx::tileM;
   uint32_t tile_col = blockIdx.x * ctx::tileN;
 
-  // Calculate unique accumulator address in tensor memory for this block
-  // Each block gets its own space in tensor memory
+  // Calculate unique tensor memory addresses for this block's tiles
   uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
-  uint32_t accum_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
-  auto pAccum = reinterpret_cast<ctx::output_t*>(TMEM_ACCUM_BASE + block_id * accum_size);
-
-  // Initialize accumulator tile to zero
-  ctx::fill_fragment(fragC, 0);
   
-  // Store initial zero accumulator to tensor memory
-  ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
+  // Layout in tensor memory:
+  // - A tiles: starts at TMEM_BASE_ADDR
+  // - B tiles: after A tiles
+  // - C/D accumulators: after B tiles
+  uint32_t a_tile_size = sizeof(ctx::input_t) * ctx::tileM * ctx::tileK;
+  uint32_t b_tile_size = sizeof(ctx::input_t) * ctx::tileK * ctx::tileN;
+  uint32_t c_tile_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
+  
+  // Each block gets its own region in tensor memory
+  uint64_t block_tmem_base = TMEM_ACCUM_BASE + block_id * (a_tile_size + b_tile_size + c_tile_size);
+  
+  // Set fragment addresses to point to tensor memory locations
+  ctx::set_fragment_addr(tmemA, reinterpret_cast<void*>(block_tmem_base));
+  ctx::set_fragment_addr(tmemB, reinterpret_cast<void*>(block_tmem_base + a_tile_size));
+  ctx::set_fragment_addr(tmemC, reinterpret_cast<void*>(block_tmem_base + a_tile_size + b_tile_size));
 
-  for (int i = 0; i < K; i += ctx::tileK) {
-    // Load accumulator from tensor memory at the start of each iteration
-    ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
-    
+  // DEBUG: Print fragment addresses
+  printf("Block (%u,%u) TMEM addresses: A=0x%lx B=0x%lx C=0x%lx\n",
+         blockIdx.x, blockIdx.y,
+         reinterpret_cast<uint64_t>(tmemA.addr),
+         reinterpret_cast<uint64_t>(tmemB.addr),
+         reinterpret_cast<uint64_t>(tmemC.addr));
+
+  // Initialize accumulator in tensor memory to zero
+  ctx::fill_fragment(tmemC, 0);
+
+  for (uint32_t i = 0; i < K; i += ctx::tileK) {
     auto pTileA = pA + tile_row * K + i;
 
-    // Load A tile
-    ctx::load_matrix_sync(fragA, pTileA, K);
+    // Load A tile from global memory to tensor memory
+    ctx::load_matrix_sync(tmemA, pTileA, K);
 
     // Load B tile
     if constexpr (vt::ITYPE::bits < 8) {
       // For sub-byte matrix B must be in col-major format
       auto pTileB = pB + tile_col * K + i;
-      ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K);
+      ctx::load_matrix_sync<vt::col_major>(tmemB, pTileB, K);
     } else {
       auto pTileB = pB + i * N + tile_col;
-      ctx::load_matrix_sync(fragB, pTileB, N);
+      ctx::load_matrix_sync(tmemB, pTileB, N);
     }
 
-    // Matrix multiply-accumulate: c += a * b
-    ctx::mma_sync(fragC, fragA, fragB, fragC);
-    
-    // Store accumulator back to tensor memory after each iteration
-    ctx::store_matrix_sync(pAccum, fragC, ctx::tileN);
+    // MMA; All data stays in tensor memory, only addresses in registers
+    ctx::mma_sync(tmemC, tmemA, tmemB, tmemC);
   }
 
-  // Load final accumulator from tensor memory
-  ctx::load_matrix_sync(fragC, pAccum, ctx::tileN);
-  
-  // Store the computed C tile to global memory
+  // Store the computed C tile from tensor memory to global memory
   auto pTileC = pC + tile_row * N + tile_col;
-  ctx::store_matrix_sync(pTileC, fragC, N);
+  ctx::store_matrix_sync(pTileC, tmemC, N);
 }
 
 int main() {

@@ -643,6 +643,7 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
 
 enum class TcuType {
   WMMA,
+  UMMA,
 };
 
 struct IntrTcuArgs {
@@ -655,6 +656,7 @@ struct IntrTcuArgs {
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
   case TcuType::WMMA: os << "WMMA"; break;
+  case TcuType::UMMA: os << "UMMA"; break;
   default:
     assert(false);
   }
@@ -722,7 +724,8 @@ inline AddrType get_addr_type(uint64_t addr) {
     }
   }
   if (EXT_TCU_ENABLED) {
-    if (addr >= TMEM_BASE_ADDR && addr < TMEM_END_ADDR) {
+    // Use offset comparison to avoid 32-bit overflow in TMEM_END_ADDR calculation
+    if (addr >= TMEM_BASE_ADDR && (addr - TMEM_BASE_ADDR) < TMEM_SIZE) {
       return AddrType::Tensor;
     }
   }

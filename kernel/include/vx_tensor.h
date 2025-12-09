@@ -405,5 +405,170 @@ public:
   }
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// UMMA - Unified MMA with Tensor Memory
+// Registers contain addresses pointing to data in tensor memory
+///////////////////////////////////////////////////////////////////////////////
+
+template <uint32_t NT, // number of threads per warp
+          typename It, // input type (A,B)
+          typename Ot> // output type (C,D)
+struct umma_context {
+private:
+  using cfg = wmma_config_t<NT, It, Ot>;  // Pass input/output types for correct i_ratio calculation
+
+  enum frag_use_t { matrix_a, matrix_b, accumulator };
+
+public:
+  using input_t  = typename It::dtype;
+  using output_t = typename Ot::dtype;
+
+  static constexpr uint32_t tileM = cfg::tileM;
+  static constexpr uint32_t tileN = cfg::tileN;
+  static constexpr uint32_t tileK = cfg::tileK;  // Already adjusted for input type size in wmma_config_t
+
+  // Fragment that holds an address to tensor memory instead of actual data
+  template <frag_use_t Use>
+  struct fragment_addr_t {
+    static constexpr frag_use_t use = Use;
+    uintptr_t addr;  // Address in tensor memory (32-bit on RV32, 64-bit on RV64)
+  };
+
+  using fragment_a   = fragment_addr_t<matrix_a>;
+  using fragment_b   = fragment_addr_t<matrix_b>;
+  using fragment_acc = fragment_addr_t<accumulator>;
+
+  // Set fragment address to point to tensor memory location
+  template <typename Frag>
+  static __attribute__((always_inline)) void set_fragment_addr(Frag &frag, void* ptr) {
+    frag.addr = reinterpret_cast<uintptr_t>(ptr);
+  }
+
+  // Initialize accumulator in tensor memory to zero
+  // This writes zeros directly to tensor memory at the given address
+  static __attribute__((always_inline)) void fill_fragment(fragment_acc &frag, output_t value) {
+    auto ptr = reinterpret_cast<volatile output_t*>(frag.addr);
+    // Each thread writes its portion
+    uint32_t lane = vx_thread_id();
+    uint32_t elements_per_thread = (tileM * tileN) / NT; // MxN bc this is for C/D accumulator arrays
+    for (uint32_t i = 0; i < elements_per_thread; ++i) {
+      ptr[lane * elements_per_thread + i] = value;
+    }
+  }
+
+  // Load matrix data from global memory into tensor memory
+  // Unlike WMMA which loads into registers with complex thread-to-register mapping,
+  // UMMA loads into tensor memory in simple row-major contiguous format.
+  // The tensor unit reads from tensor memory directly, so we just need the data
+  // laid out contiguously - no special register mapping required.
+  template <mem_layout src_layout = row_major, typename Frag>
+  static __attribute__((always_inline)) void load_matrix_sync(Frag &frag, const void *src, size_t ldm) {
+    auto dst_ptr = reinterpret_cast<volatile input_t*>(frag.addr);
+    auto src_ptr = reinterpret_cast<const input_t*>(src);
+    
+    uint32_t lane = vx_thread_id();
+    
+    // If loading Matrix A (M x K)
+    if constexpr (Frag::use == matrix_a) {
+      uint32_t total_elements = tileM * tileK;
+      uint32_t elements_per_thread = total_elements / NT;
+      
+      for (uint32_t i = 0; i < elements_per_thread; ++i) {
+        uint32_t idx = lane * elements_per_thread + i;
+        uint32_t row = idx / tileK;
+        uint32_t col = idx % tileK;
+        if constexpr (src_layout == row_major) {
+          dst_ptr[idx] = src_ptr[row * ldm + col];
+        } else {
+          dst_ptr[idx] = src_ptr[col * ldm + row];
+        }
+      }
+    } else if constexpr (Frag::use == matrix_b) { // If loading Matrix B (K x N)
+      uint32_t total_elements = tileK * tileN;
+      uint32_t elements_per_thread = total_elements / NT;
+      
+      for (uint32_t i = 0; i < elements_per_thread; ++i) {
+        uint32_t idx = lane * elements_per_thread + i;
+        uint32_t row = idx / tileN;
+        uint32_t col = idx % tileN;
+        if constexpr (src_layout == row_major) {
+          dst_ptr[idx] = src_ptr[row * ldm + col];
+        } else {
+          dst_ptr[idx] = src_ptr[col * ldm + row];
+        }
+      }
+    }
+  }
+
+  // Store accumulator from tensor memory to global memory
+  template <mem_layout dst_layout = row_major>
+  static __attribute__((always_inline)) void store_matrix_sync(void *dst, const fragment_acc &frag, size_t ldm) {
+    auto src = reinterpret_cast<const volatile output_t*>(frag.addr);
+    auto dst_ptr = reinterpret_cast<output_t*>(dst);
+    
+    uint32_t lane = vx_thread_id();
+    uint32_t total_elements = tileM * tileN;
+    uint32_t elements_per_thread = total_elements / NT;
+    
+    for (uint32_t i = 0; i < elements_per_thread; ++i) {
+      uint32_t idx = lane * elements_per_thread + i;
+      uint32_t row = idx / tileN;
+      uint32_t col = idx % tileN;
+      if constexpr (dst_layout == row_major) {
+        dst_ptr[row * ldm + col] = src[idx];
+      } else {
+        dst_ptr[col * ldm + row] = src[idx];
+      }
+    }
+  }
+
+  // UMMA: Matrix multiply-accumulate using tensor memory
+  // All data is in tensor memory, registers only hold addresses
+  static __attribute__((always_inline)) void mma_sync(
+      fragment_acc &fragD,
+      const fragment_a &fragA,
+      const fragment_b &fragB,
+      const fragment_acc &fragC) {
+    
+    // Pass addresses in fixed integer registers (Register File): a0=A, a1=B, a2=C
+    register uintptr_t addr_a __asm__("a0") = static_cast<uintptr_t>(fragA.addr);
+    register uintptr_t addr_b __asm__("a1") = static_cast<uintptr_t>(fragB.addr);
+    register uintptr_t addr_c __asm__("a2") = static_cast<uintptr_t>(fragC.addr);
+    register uintptr_t addr_d __asm__("a0");  // Output address (not used, result stays in tensor memory)
+
+    // UMMA instruction encoding:
+    // - opcode = RISCV_CUSTOM0 (0x0b)
+    // - funct3 = 1 (WMMA uses funct3=0)
+    // - funct7 = 2
+    // - rd field = output format ID (Ot::id)
+    // - rs1 field = input format ID (It::id)
+    // - rs2 field = 0 (unused)
+    // - Addresses are in fixed registers a0, a1, a2 by convention (Register file)
+    
+    // DEBUG: Use compile-time format IDs as literal values
+    static_assert(Ot::id >= 0 && Ot::id < 32, "Output format ID must fit in 5 bits");
+    static_assert(It::id >= 0 && It::id < 32, "Input format ID must fit in 5 bits");
+    
+    // Build instruction word manually to ensure correct encoding
+    // R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
+    constexpr uint32_t opcode = RISCV_CUSTOM0;
+    constexpr uint32_t funct3 = 1;
+    constexpr uint32_t funct7 = 2;
+    constexpr uint32_t rs2_val = 0;
+    constexpr uint32_t insn_word = (funct7 << 25) | (rs2_val << 20) | (It::id << 15) | 
+                                   (funct3 << 12) | (Ot::id << 7) | opcode;
+    
+    __asm__ volatile (
+      ".word %[insn]"
+      : "=r"(addr_d)
+      : [insn]"i"(insn_word),
+        "r"(addr_a), "r"(addr_b), "r"(addr_c)
+    );
+
+    // Result is written to tensor memory at addr_c location
+    fragD.addr = addr_c;
+  }
+};
+
 } // namespace tensor
 } // namespace vortex

@@ -1140,6 +1140,31 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
           }
         }
       } break;
+      case 1: { // UMMA - Unified MMA with tensor memory addresses
+        // For UMMA:
+        // - rd field: output format ID (fmt_d)
+        // - rs1 field: input format ID (fmt_s)
+        // - Addresses come from fixed integer registers:
+        //   a0 = A tile address, a1 = B tile address, a2 = C/D tile address
+        // Unlike WMMA, UMMA processes the entire tile at once, so we generate
+        // only ONE instruction (no micro-stepping through k/m/n).
+        uint32_t fmt_d = rd;
+        uint32_t fmt_s = rs1;
+        // Fixed register indices for addresses (a0=10, a1=11, a2=12)
+        constexpr uint32_t reg_addr_a = 10;  // a0
+        constexpr uint32_t reg_addr_b = 11;  // a1
+        constexpr uint32_t reg_addr_c = 12;  // a2
+        
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::UMMA);
+        instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, 0, 0});  // step_m=0, step_n=0 (only step)
+        // Use fixed integer registers for addresses
+        instr->setDestReg(reg_addr_c, RegType::Integer);  // D address (same as C)
+        instr->setSrcReg(0, reg_addr_a, RegType::Integer);  // A address
+        instr->setSrcReg(1, reg_addr_b, RegType::Integer);  // B address
+        instr->setSrcReg(2, reg_addr_c, RegType::Integer);  // C address
+        ibuffer.push_back(instr);
+      } break;
       default:
         std::abort();
       }

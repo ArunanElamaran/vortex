@@ -16,6 +16,7 @@
 #include "tensor_cfg.h"
 #include <rvfloats.h>
 #include "core.h"
+#include "tensor_mem.h"
 
 using namespace vortex;
 
@@ -246,6 +247,9 @@ public:
       case TcuType::WMMA:
         delay = 4;
         break;
+      case TcuType::UMMA:
+        delay = 8; // Higher latency due to tensor memory access
+        break;
       default:
         std::abort();
       }
@@ -296,6 +300,108 @@ public:
     }
   }
 
+  // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
+  // Registers contain addresses pointing to data in tensor memory
+  // Data is laid out linearly in tensor memory (not in micro-tile format)
+  void umma(uint32_t wid,
+            uint32_t fmt_s,
+            uint32_t fmt_d,
+            uint32_t step_m,
+            uint32_t step_n,
+            const std::vector<reg_data_t>& rs1_data,
+            const std::vector<reg_data_t>& rs2_data,
+            const std::vector<reg_data_t>& rs3_data,
+            std::vector<reg_data_t>& rd_data,
+            ExeTraceData* trace_data) {
+    __unused(wid);
+    __unused(trace_data);
+    __unused(step_m);  // Always 0 - UMMA generates only one instruction
+    __unused(step_n);  // Always 0 - UMMA generates only one instruction
+
+    auto tensor_mem = core_->tensor_mem();
+
+    // Get base addresses from registers (32-bit on RV32)
+    uint64_t addr_a_base = rs1_data[0].u32;
+    uint64_t addr_b_base = rs2_data[0].u32;
+    uint64_t addr_c_base = rs3_data[0].u32;
+
+    // Calculate tile sizes based on actual tile dimensions and data types
+    // Input element size in bytes
+    uint32_t i_size = (fmt_s == vt::int8::id || fmt_s == vt::uint8::id) ? 1 : 
+                      (fmt_s == vt::int4::id || fmt_s == vt::uint4::id) ? 1 :  // 4-bit uses byte addressing
+                      (fmt_s == vt::fp16::id || fmt_s == vt::bf16::id) ? 2 : 4;
+    // Output element size in bytes  
+    uint32_t o_size = (fmt_d == vt::int32::id || fmt_d == vt::fp32::id) ? 4 :
+                      (fmt_d == vt::fp16::id || fmt_d == vt::bf16::id) ? 2 : 4;
+    uint32_t i_ratio = 4 / i_size;  // number of input elements per 4 bytes
+    
+    // Actual tile dimensions (after applying i_ratio for tileK)
+    uint32_t tileM = cfg::xtileM;
+    uint32_t tileN = cfg::xtileN;
+    uint32_t tileK = cfg::xtileK * i_ratio;
+    
+    uint32_t a_tile_bytes = tileM * tileK * i_size;
+    uint32_t b_tile_bytes = tileK * tileN * i_size;
+    uint32_t c_tile_bytes = tileM * tileN * o_size;
+
+    // Allocate buffers for tile data
+    std::vector<uint8_t> a_bytes(a_tile_bytes);
+    std::vector<uint8_t> b_bytes(b_tile_bytes);
+    std::vector<uint8_t> c_bytes(c_tile_bytes);
+    std::vector<uint8_t> d_bytes(c_tile_bytes);
+
+    // Load tiles from tensor memory
+    tensor_mem->read(a_bytes.data(), addr_a_base, a_tile_bytes);
+    tensor_mem->read(b_bytes.data(), addr_b_base, b_tile_bytes);
+    tensor_mem->read(c_bytes.data(), addr_c_base, c_tile_bytes);
+
+    DTH(3, "UMMA: wid=" << wid << ", step_m=" << step_m << ", step_n=" << step_n);
+    DTN(3, ", addr_a=0x" << std::hex << addr_a_base);
+    DTN(3, ", addr_b=0x" << addr_b_base);
+    DTN(3, ", addr_c=0x" << addr_c_base);
+    DTN(3, ", tileM=" << std::dec << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
+
+    // Perform matrix multiply-accumulate
+    // C[m,n] = sum_k(A[m,k] * B[k,n]) + C[m,n]
+    for (uint32_t m = 0; m < tileM; ++m) {
+      for (uint32_t n = 0; n < tileN; ++n) {
+        int32_t acc = 0;
+        
+        // Read C accumulator value
+        if (fmt_d == vt::int32::id) {
+          acc = *reinterpret_cast<int32_t*>(&c_bytes[(m * tileN + n) * o_size]);
+        } else if (fmt_d == vt::fp32::id) {
+          // For float, we'd use float accumulator - simplified for now
+          acc = *reinterpret_cast<int32_t*>(&c_bytes[(m * tileN + n) * o_size]);
+        }
+        
+        // Dot product along K dimension
+        for (uint32_t k = 0; k < tileK; ++k) {
+          int32_t a_val = 0, b_val = 0;
+          
+          if (fmt_s == vt::int8::id) {
+            a_val = static_cast<int32_t>(*reinterpret_cast<int8_t*>(&a_bytes[m * tileK + k]));
+            b_val = static_cast<int32_t>(*reinterpret_cast<int8_t*>(&b_bytes[k * tileN + n]));
+          } else if (fmt_s == vt::uint8::id) {
+            a_val = static_cast<int32_t>(*reinterpret_cast<uint8_t*>(&a_bytes[m * tileK + k]));
+            b_val = static_cast<int32_t>(*reinterpret_cast<uint8_t*>(&b_bytes[k * tileN + n]));
+          }
+          
+          acc += a_val * b_val;
+        }
+        
+        // Store result
+        *reinterpret_cast<int32_t*>(&d_bytes[(m * tileN + n) * o_size]) = acc;
+      }
+    }
+
+    // Store result D back to tensor memory
+    tensor_mem->write(d_bytes.data(), addr_c_base, c_tile_bytes);
+
+    // Return the C address in rd_data (32-bit on RV32)
+    rd_data[0].u32 = static_cast<uint32_t>(addr_c_base);
+  }
+
   const PerfStats& perf_stats() const {
     return perf_stats_;
   }
@@ -314,6 +420,9 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
   switch (tcu_type) {
   case TcuType::WMMA:
     return {"WMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
+             + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
+  case TcuType::UMMA:
+    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
              + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
   default:
     std::abort();
@@ -356,4 +465,17 @@ void TensorUnit::wmma(uint32_t wid,
                       std::vector<reg_data_t>& rd_data,
                       ExeTraceData* trace_data) {
   impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+}
+
+void TensorUnit::umma(uint32_t wid,
+                      uint32_t fmt_s,
+                      uint32_t fmt_d,
+                      uint32_t step_m,
+                      uint32_t step_n,
+                      const std::vector<reg_data_t>& rs1_data,
+                      const std::vector<reg_data_t>& rs2_data,
+                      const std::vector<reg_data_t>& rs3_data,
+                      std::vector<reg_data_t>& rd_data,
+                      ExeTraceData* trace_data) {
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
 }
