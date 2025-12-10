@@ -345,9 +345,9 @@ public:
     // TODO: Add support for other format combinations using fmt_s/fmt_d
     if (fmt_s == vt::fp16::id && fmt_d == vt::fp32::id) {
       // Use the correct config for fp16 input, fp32 output
-      constexpr uint32_t tileM = umma_cfg_fp16_fp32::tileM;  // 8
-      constexpr uint32_t tileN = umma_cfg_fp16_fp32::tileN;  // 4
-      constexpr uint32_t tileK = umma_cfg_fp16_fp32::tileK;  // 8 (= xtileK * i_ratio = 4 * 2)
+      constexpr uint32_t tileM = cfg_umma::tileM;
+      constexpr uint32_t tileN = cfg_umma::tileN;
+      constexpr uint32_t tileK = cfg_umma::tileK;
 
       DTN(3, ", tileM=" << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
 
@@ -456,27 +456,14 @@ void TensorUnit::wmma(uint32_t wid,
 }
 
 void TensorUnit::umma(uint32_t wid,
-                      uint32_t fmt_s,
-                      uint32_t fmt_d,
-                      uint32_t a_base,
-                      uint32_t b_base,
-                      uint32_t c_base,
-                      uint32_t lda,
-                      uint32_t ldb,
-                      uint32_t ldc,
-                      ExeTraceData* trace_data) {
-  impl_->umma(wid, fmt_s, fmt_d, a_base, b_base, c_base, lda, ldb, ldc, trace_data);
-}
-
-
-template <typename T>
-void TensorUnit::mem_load(const T* base, uint32_t row, uint32_t col, uint32_t ld, T* data)
-{
-  impl_->mem_load(base, row, col, ld, data);
-}
-
-template <typename T>
-void TensorUnit::mem_store(T* base, uint32_t row, uint32_t col, uint32_t ld, T data)
-{
-  impl_->mem_store(base, row, col, ld, value, data);
+                          uint32_t fmt_s,
+                          uint32_t fmt_d,
+                          uint32_t step_m,
+                          uint32_t step_n,
+                          const std::vector<reg_data_t>& rs1_data,
+                          const std::vector<reg_data_t>& rs2_data,
+                          const std::vector<reg_data_t>& rs3_data,
+                          std::vector<reg_data_t>& rd_data,
+                          ExeTraceData* trace_data) {
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
 }
