@@ -7,6 +7,10 @@
 #define NUM_THREADS 4
 #endif
 
+#ifndef TYPE
+#define TYPE float
+#endif
+
 #ifndef ITYPE
 #define ITYPE fp16
 #endif

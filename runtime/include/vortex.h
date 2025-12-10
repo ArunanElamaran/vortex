@@ -135,7 +135,7 @@ int vx_upload_bytes(vx_device_h hdevice, const void* content, uint64_t size, vx_
 int vx_upload_file(vx_device_h hdevice, const char* filename, vx_buffer_h* hbuffer);
 
 // calculate cooperative threads array occupancy
-int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem, uint32_t* max_tensormem);
+int vx_check_occupancy(vx_device_h hdevice, uint32_t group_size, uint32_t* max_localmem);
 
 // performance counters
 int vx_dump_perf(vx_device_h hdevice, FILE* stream);
