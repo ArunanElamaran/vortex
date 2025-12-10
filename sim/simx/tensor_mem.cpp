@@ -16,10 +16,11 @@ protected:
 	mutable PerfStats perf_stats_;
 
 	uint64_t to_local_addr(uint64_t addr) {
-		// assuming addr is in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
-		// Return the byte offset within tensor memory, wrapped to capacity
+		// Convert global TMEM address to local byte offset within the RAM
+		// Note: addr is expected to be in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
 		uint64_t local = addr - TMEM_BASE_ADDR;
-		return local % config_.capacity;
+		// Ensure the local address is within capacity bounds
+		return local & (config_.capacity - 1);  // Assumes capacity is power of 2
 	}
 
 public:
@@ -54,13 +55,13 @@ public:
 
 	void read(void* data, uint64_t addr, uint32_t size) {
 		auto l_addr = to_local_addr(addr);
-		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+		DPH(3, "Tensor Mem Read: addr=0x" << std::hex << l_addr << std::dec << std::endl);
 		ram_.read(data, l_addr, size);
 	}
 
 	void write(const void* data, uint64_t addr, uint32_t size) {
 		auto l_addr = to_local_addr(addr);
-		DPH(3, "Tensor Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+		DPH(3, "Tensor Mem Write: addr=0x" << std::hex << l_addr << std::dec << std::endl);
 		ram_.write(data, l_addr, size);
 	}
 

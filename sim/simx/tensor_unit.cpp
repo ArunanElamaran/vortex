@@ -389,8 +389,11 @@ public:
       std::abort();
     }
 
-    // Return the C/D address
-    rd_data[0].u32 = static_cast<uint32_t>(addr_c);
+    // Return the C/D address to ALL threads
+    // All threads in the warp execute the UMMA instruction together
+    for (size_t t = 0; t < rd_data.size(); ++t) {
+      rd_data[t].u32 = static_cast<uint32_t>(addr_c);
+    }
   }
 
   const PerfStats& perf_stats() const {
