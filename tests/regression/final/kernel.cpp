@@ -6,18 +6,24 @@ namespace vt = vortex::tensor;
 using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
 void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
-  auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
-  auto pB = reinterpret_cast<ctx::input_t *>(arg->B_addr);
+  // Global memory addresses of data
+  auto pA = reinterpret_cast<const ctx::input_t *>(arg->A_addr);
+  auto pB = reinterpret_cast<const ctx::input_t *>(arg->B_addr);
   auto pC = reinterpret_cast<ctx::output_t *>(arg->C_addr);
 
+  // Calculate tile sizes
+  uint32_t a_tile_size = sizeof(ctx::input_t) * ctx::tileM * ctx::tileK;
+  uint32_t b_tile_size = sizeof(ctx::input_t) * ctx::tileK * ctx::tileN;
+  uint32_t c_tile_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
+
   // Allocate tensor memory for the tile of matrix A & C
-	auto tensor_ptr = __tensor_mem((ctx::tileM*ctx::tileK + ctx::tileM*ctx::tileN) * sizeof(TYPE));
-  auto tensor_A = (TYPE*)tensor_ptr;
-  auto tensor_C = (TYPE*)tensor_ptr + blockDim.x * blockDim.y;
+	auto tensor_ptr = __tensor_mem(a_tile_size+c_tile_size);
+  auto tensor_A = reinterpret_cast<ctx::input_t *>(tensor_ptr);;
+  auto tensor_C = reinterpret_cast<ctx::output_t *>(reinterpret_cast<uint8_t*>(tensor_ptr) + a_tile_size);
 
   // Allocate local memory for the tile of matrix B
-	auto local_ptr = __local_mem(ctx::tileN*ctx::tileK * sizeof(TYPE));
-  auto local_B = (TYPE*)local_ptr;
+	auto local_ptr = __local_mem(b_tile_size);
+  auto local_B = reinterpret_cast<ctx::input_t *>(local_ptr);
 
   uint32_t M = arg->M;
   uint32_t N = arg->N;
@@ -27,7 +33,7 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   uint32_t tile_row = blockIdx.y * ctx::tileM;
   uint32_t tile_col = blockIdx.x * ctx::tileN;
 
-  for (int k = 0; k < K; k += ctx::tileK) {
+  for (uint32_t k = 0; k < K; k += ctx::tileK) {
     const auto* A_tile_global = pA + tile_row * K + k;
     const auto* B_tile_global = pB + k * N      + tile_col;
     auto*       C_tile_global = pC + tile_row * N + tile_col;
@@ -42,6 +48,7 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
 
     // 3) Store result back to global
     ctx::store_tile_sync_C(C_tile_global, tensor_C, N);
+  }
 }
 
 int main() {

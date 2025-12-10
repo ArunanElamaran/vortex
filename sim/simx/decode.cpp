@@ -1141,22 +1141,28 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         }
       } break;
       case 1: { // UMMA
+        // For UMMA:
+        // - rd field: output format ID (fmt_d)
+        // - rs1 field: input format ID (fmt_s)
+        // - Addresses come from fixed integer registers:
+        //   a0 = A tile address, a1 = B tile address, a2 = C/D tile address
+        // Unlike WMMA, UMMA processes the entire tile at once, so we generate
+        // only ONE instruction (no micro-stepping through k/m/n).
+        uint32_t fmt_d = rd;
+        uint32_t fmt_s = rs1;
+        // Fixed register indices for addresses (a0=10, a1=11, a2=12)
+        constexpr uint32_t reg_addr_a = 10;  // a0
+        constexpr uint32_t reg_addr_b = 11;  // a1
+        constexpr uint32_t reg_addr_c = 12;  // a2
+        
         auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
-        // parse rd into fmt_s, fmt_d, layout, etc.
-        IntrTcuArgs tcuArgs{};
-        tcuArgs.fmt_s   = rd;
-        tcuArgs.fmt_d   = rs1;
-        tcuArgs.step_m  = 0; // use for sub-tiling if needed
-        tcuArgs.step_n  = 0;
-        // (if extend IntrTcuArgs, also fill base addresses/strides here)
         instr->setOpType(TcuType::UMMA);
-        instr->setArgs(tcuArgs);
-
-        // Instead of assigning FP regs, you mark as integer address regs:
+        instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, 0, 0});  // step_m=0, step_n=0 (only step)
+        // Use fixed integer registers for addresses
         instr->setDestReg(reg_addr_c, RegType::Integer);  // D address (same as C)
-        instr->setSrcReg(0, rs1, RegType::Integer); // A base
-        instr->setSrcReg(1, rs2, RegType::Integer); // B base
-        instr->setSrcReg(2, rs3, RegType::Integer); // C/D base
+        instr->setSrcReg(0, reg_addr_a, RegType::Integer);  // A address
+        instr->setSrcReg(1, reg_addr_b, RegType::Integer);  // B address
+        instr->setSrcReg(2, reg_addr_c, RegType::Integer);  // C address
         ibuffer.push_back(instr);
       } break;
       default:
