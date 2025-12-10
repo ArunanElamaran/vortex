@@ -164,6 +164,119 @@ struct FEDP<vt::uint4, vt::int32>{
 
 using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
 
+// Get type size in bytes from format ID
+static uint32_t get_type_bytes(uint32_t fmt) {
+  switch (fmt) {
+  case vt::fp32::id:  return sizeof(float);
+  case vt::fp16::id:  return sizeof(uint16_t);
+  case vt::bf16::id:  return sizeof(uint16_t);
+  case vt::tf32::id:  return sizeof(uint32_t);
+  case vt::int32::id: return sizeof(int32_t);
+  case vt::int8::id:  return sizeof(int8_t);
+  case vt::uint8::id: return sizeof(uint8_t);
+  case vt::int4::id:  return 1;  // 4-bit packed, but minimum addressable is 1 byte
+  case vt::uint4::id: return 1;
+  default:
+    std::cout << "Error: unknown format type: " << fmt << std::endl;
+    std::abort();
+  }
+}
+
+// Template to execute UMMA for specific input/output types
+template <typename It, typename Ot>
+static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
+                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
+                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
+  using itype = typename It::dtype;
+  using otype = typename Ot::dtype;
+
+  uint32_t a_bytes = tileM * tileK * sizeof(itype);
+  uint32_t b_bytes = tileK * tileN * sizeof(itype);
+  uint32_t c_bytes = tileM * tileN * sizeof(otype);
+
+  std::vector<itype> a_tile(tileM * tileK);
+  std::vector<itype> b_tile(tileK * tileN);
+  std::vector<otype> c_tile(tileM * tileN);
+  std::vector<otype> d_tile(tileM * tileN);
+
+  tensor_mem->read(a_tile.data(), addr_a, a_bytes);
+  tensor_mem->read(b_tile.data(), addr_b, b_bytes);
+  tensor_mem->read(c_tile.data(), addr_c, c_bytes);
+
+  // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
+  for (uint32_t m = 0; m < tileM; ++m) {
+    for (uint32_t n = 0; n < tileN; ++n) {
+      uint32_t c_idx = m * tileN + n;
+      otype acc = c_tile[c_idx];
+
+      for (uint32_t k = 0; k < tileK; ++k) {
+        uint32_t a_idx = m * tileK + k;
+        uint32_t b_idx = k * tileN + n;
+        acc = FMA<It, Ot>::eval(a_tile[a_idx], b_tile[b_idx], acc);
+      }
+
+      d_tile[c_idx] = acc;
+    }
+  }
+
+  tensor_mem->write(d_tile.data(), addr_c, c_bytes);
+}
+
+// Function pointer type for UMMA executor
+using PFN_UMMA = void (*)(const std::shared_ptr<TensorMem>&, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
+
+// Select the appropriate UMMA executor based on format types
+static PFN_UMMA select_UMMA(uint32_t IT, uint32_t OT) {
+  switch (OT) {
+  case vt::fp32::id:
+    switch (IT) {
+    case vt::fp16::id:
+      return execute_umma<vt::fp16, vt::fp32>;
+    case vt::bf16::id:
+      return execute_umma<vt::bf16, vt::fp32>;
+    case vt::tf32::id:
+      return execute_umma<vt::tf32, vt::fp32>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::fp16::id:
+    switch (IT) {
+    case vt::fp16::id:
+      return execute_umma<vt::fp16, vt::fp16>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::bf16::id:
+    switch (IT) {
+    case vt::bf16::id:
+      return execute_umma<vt::bf16, vt::bf16>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::int32::id:
+    switch (IT) {
+    case vt::int8::id:
+      return execute_umma<vt::int8, vt::int32>;
+    case vt::uint8::id:
+      return execute_umma<vt::uint8, vt::int32>;
+    // Note: int4/uint4 would need special handling for packed 4-bit values
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  default:
+    std::cout << "UMMA: unsupported output type: " << OT << std::endl;
+    std::abort();
+  }
+}
+
 static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
   switch (OT) {
   case vt::fp32::id:
@@ -341,53 +454,23 @@ public:
     DTN(3, ", addr_b=0x" << addr_b);
     DTN(3, ", addr_c=0x" << addr_c << std::dec << std::endl);
 
-    // Use FMA function based on format types
-    // For now, handle fp16->fp32 case (most common)
-    // TODO: Add support for other format combinations using fmt_s/fmt_d
-    if (fmt_s == vt::fp16::id && fmt_d == vt::fp32::id) {
-      // Use the correct config for fp16 input, fp32 output
-      constexpr uint32_t tileM = umma_cfg_fp16_fp32::tileM;  // 8
-      constexpr uint32_t tileN = umma_cfg_fp16_fp32::tileN;  // 4
-      constexpr uint32_t tileK = umma_cfg_fp16_fp32::tileK;  // 8 (= xtileK * i_ratio = 4 * 2)
+    // Calculate tile dimensions based on format types
+    // Base tile dimensions (for 32-bit types)
+    constexpr uint32_t xtileM = cfg::xtileM;  // 8
+    constexpr uint32_t xtileN = cfg::xtileN;  // 4
+    constexpr uint32_t xtileK = cfg::xtileK;  // 4
 
-      DTN(3, ", tileM=" << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
+    // Adjust K dimension based on input type size
+    // i_ratio = 4 bytes / input_type_bytes (e.g., 2 for fp16, 4 for int8)
+    uint32_t input_bytes = get_type_bytes(fmt_s);
+    uint32_t i_ratio = 4 / input_bytes;
+    uint32_t tileK = xtileK * i_ratio;
 
-      // fp16 input, fp32 output
-      constexpr uint32_t a_bytes = tileM * tileK * sizeof(uint16_t);
-      constexpr uint32_t b_bytes = tileK * tileN * sizeof(uint16_t);
-      constexpr uint32_t c_bytes = tileM * tileN * sizeof(float);
+    DTN(3, ", tileM=" << xtileM << ", tileN=" << xtileN << ", tileK=" << tileK << std::endl);
 
-      std::vector<uint16_t> a_tile(tileM * tileK);
-      std::vector<uint16_t> b_tile(tileK * tileN);
-      std::vector<float> c_tile(tileM * tileN);
-      std::vector<float> d_tile(tileM * tileN);
-
-      tensor_mem->read(a_tile.data(), addr_a, a_bytes);
-      tensor_mem->read(b_tile.data(), addr_b, b_bytes);
-      tensor_mem->read(c_tile.data(), addr_c, c_bytes);
-
-      // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
-      for (uint32_t m = 0; m < tileM; ++m) {
-        for (uint32_t n = 0; n < tileN; ++n) {
-          uint32_t c_idx = m * tileN + n;
-          float acc = c_tile[c_idx];
-          
-          for (uint32_t k = 0; k < tileK; ++k) {
-            uint32_t a_idx = m * tileK + k;
-            uint32_t b_idx = k * tileN + n;
-            // Use FMA template for proper fp16->fp32 conversion
-            acc = FMA<vt::fp16, vt::fp32>::eval(a_tile[a_idx], b_tile[b_idx], acc);
-          }
-          
-          d_tile[c_idx] = acc;
-        }
-      }
-
-      tensor_mem->write(d_tile.data(), addr_c, c_bytes);
-    } else {
-      std::cout << "UMMA: Unsupported format combination fmt_s=" << fmt_s << " fmt_d=" << fmt_d << std::endl;
-      std::abort();
-    }
+    // Get the appropriate UMMA executor for this format combination
+    auto umma_fn = select_UMMA(fmt_s, fmt_d);
+    umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
 
     // Return the C/D address to ALL threads
     // All threads in the warp execute the UMMA instruction together
