@@ -17,9 +17,9 @@ protected:
 
 	uint64_t to_local_addr(uint64_t addr) {
 		// assuming addr is in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
-		// TODO: CHECK IF BELOW IS APPROPRIATE CHANGE
+		// Return the byte offset within tensor memory, wrapped to capacity
 		uint64_t local = addr - TMEM_BASE_ADDR;
-		return bit_getw(local, 0, line_bits_ - 1);
+		return local % config_.capacity;
 	}
 
 public:

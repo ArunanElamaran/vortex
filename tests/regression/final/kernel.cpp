@@ -80,13 +80,6 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   ctx::set_fragment_addr(tmemB, reinterpret_cast<void*>(block_tmem_base + a_tile_size));
   ctx::set_fragment_addr(tmemC, reinterpret_cast<void*>(block_tmem_base + a_tile_size + b_tile_size));
 
-  // DEBUG: Print fragment addresses
-  vx_printf("Block (%u,%u) TMEM addresses: A=0x%u B=0x%u C=0x%u\n",
-         blockIdx.x, blockIdx.y,
-         reinterpret_cast<uintptr_t>(tmemA.addr),
-         reinterpret_cast<uintptr_t>(tmemB.addr),
-         reinterpret_cast<uintptr_t>(tmemC.addr));
-
   // Initialize accumulator in tensor memory to zero
   ctx::fill_fragment(tmemC, 0);
 

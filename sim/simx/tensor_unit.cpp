@@ -366,21 +366,6 @@ public:
       tensor_mem->read(b_tile.data(), addr_b, b_bytes);
       tensor_mem->read(c_tile.data(), addr_c, c_bytes);
 
-      // Debug: compute one element manually to verify
-      {
-        float manual_acc = c_tile[0];  // C[0][0]
-        float manual_sum = 0;
-        for (uint32_t k = 0; k < tileK; ++k) {
-          float a_f = bit_cast<float>(rv_htof_s(a_tile[k], 0, nullptr));  // A[0][k]
-          float b_f = bit_cast<float>(rv_htof_s(b_tile[k * tileN], 0, nullptr));  // B[k][0]
-          manual_sum += a_f * b_f;
-        }
-        manual_acc += manual_sum;
-        std::cout << "UMMA DEBUG: tileM=" << tileM << " tileN=" << tileN << " tileK=" << tileK 
-                  << " C[0,0]_before=" << c_tile[0] 
-                  << " manual_C[0,0]=" << manual_acc << std::endl;
-      }
-
       // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
       for (uint32_t m = 0; m < tileM; ++m) {
         for (uint32_t n = 0; n < tileN; ++n) {
@@ -397,9 +382,6 @@ public:
           d_tile[c_idx] = acc;
         }
       }
-
-      // Debug: print computed result
-      std::cout << "UMMA RESULT: D[0,0]=" << d_tile[0] << " D[0,1]=" << d_tile[1] << std::endl;
 
       tensor_mem->write(d_tile.data(), addr_c, c_bytes);
     } else {
