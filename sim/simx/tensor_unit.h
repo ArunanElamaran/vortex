@@ -63,6 +63,22 @@ public:
 					  std::vector<reg_data_t>& rd_data,
 					  ExeTraceData* trace_data);
 
+	// UMMA: Registers contain addresses to tensor memory, not actual data
+	// rs1_data: addresses for matrix A tiles in tensor memory
+	// rs2_data: addresses for matrix B tiles in tensor memory
+	// rs3_data: addresses for accumulator C tiles in tensor memory
+	// rd_data: addresses for output D tiles in tensor memory (can be same as C)
+	void umma(uint32_t wid,
+				    uint32_t fmt_s,
+						uint32_t fmt_d,
+				    uint32_t step_m,
+						uint32_t step_n,
+	          const std::vector<reg_data_t>& rs1_data,
+					  const std::vector<reg_data_t>& rs2_data,
+					  const std::vector<reg_data_t>& rs3_data,
+					  std::vector<reg_data_t>& rd_data,
+					  ExeTraceData* trace_data);
+
 	const PerfStats& perf_stats() const;
 
 private:

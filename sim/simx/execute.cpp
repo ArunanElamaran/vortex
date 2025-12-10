@@ -1479,6 +1479,15 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
         rd_write = true;
       } break;
+      case TcuType::UMMA: {
+        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+        trace->data = trace_data;
+        assert(warp.tmask.count() == num_threads);
+        // For UMMA, registers contain addresses to tensor memory
+        // TODO: Print rs1_data, rs2_data, rs3_data as addresses for DEBUG
+        tensor_unit_->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        rd_write = true;
+      } break;
       default:
         std::abort();
       }

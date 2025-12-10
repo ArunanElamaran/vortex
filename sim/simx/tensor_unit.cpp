@@ -16,11 +16,14 @@
 #include "tensor_cfg.h"
 #include <rvfloats.h>
 #include "core.h"
+#include "tensor_mem.h"
 
 using namespace vortex;
 
 namespace vt = vortex::tensor;
 using cfg = vt::wmma_config_t<NUM_THREADS>;
+// UMMA config for fp16 input, fp32 output
+using umma_cfg_fp16_fp32 = vt::umma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
 
 inline uint64_t nan_box(uint32_t value) {
   return value | 0xffffffff00000000;
@@ -161,6 +164,119 @@ struct FEDP<vt::uint4, vt::int32>{
 
 using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
 
+// Get type size in bytes from format ID
+static uint32_t get_type_bytes(uint32_t fmt) {
+  switch (fmt) {
+  case vt::fp32::id:  return sizeof(float);
+  case vt::fp16::id:  return sizeof(uint16_t);
+  case vt::bf16::id:  return sizeof(uint16_t);
+  case vt::tf32::id:  return sizeof(uint32_t);
+  case vt::int32::id: return sizeof(int32_t);
+  case vt::int8::id:  return sizeof(int8_t);
+  case vt::uint8::id: return sizeof(uint8_t);
+  case vt::int4::id:  return 1;  // 4-bit packed, but minimum addressable is 1 byte
+  case vt::uint4::id: return 1;
+  default:
+    std::cout << "Error: unknown format type: " << fmt << std::endl;
+    std::abort();
+  }
+}
+
+// Template to execute UMMA for specific input/output types
+template <typename It, typename Ot>
+static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
+                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
+                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
+  using itype = typename It::dtype;
+  using otype = typename Ot::dtype;
+
+  uint32_t a_bytes = tileM * tileK * sizeof(itype);
+  uint32_t b_bytes = tileK * tileN * sizeof(itype);
+  uint32_t c_bytes = tileM * tileN * sizeof(otype);
+
+  std::vector<itype> a_tile(tileM * tileK);
+  std::vector<itype> b_tile(tileK * tileN);
+  std::vector<otype> c_tile(tileM * tileN);
+  std::vector<otype> d_tile(tileM * tileN);
+
+  tensor_mem->read(a_tile.data(), addr_a, a_bytes);
+  tensor_mem->read(b_tile.data(), addr_b, b_bytes);
+  tensor_mem->read(c_tile.data(), addr_c, c_bytes);
+
+  // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
+  for (uint32_t m = 0; m < tileM; ++m) {
+    for (uint32_t n = 0; n < tileN; ++n) {
+      uint32_t c_idx = m * tileN + n;
+      otype acc = c_tile[c_idx];
+
+      for (uint32_t k = 0; k < tileK; ++k) {
+        uint32_t a_idx = m * tileK + k;
+        uint32_t b_idx = k * tileN + n;
+        acc = FMA<It, Ot>::eval(a_tile[a_idx], b_tile[b_idx], acc);
+      }
+
+      d_tile[c_idx] = acc;
+    }
+  }
+
+  tensor_mem->write(d_tile.data(), addr_c, c_bytes);
+}
+
+// Function pointer type for UMMA executor
+using PFN_UMMA = void (*)(const std::shared_ptr<TensorMem>&, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
+
+// Select the appropriate UMMA executor based on format types
+static PFN_UMMA select_UMMA(uint32_t IT, uint32_t OT) {
+  switch (OT) {
+  case vt::fp32::id:
+    switch (IT) {
+    case vt::fp16::id:
+      return execute_umma<vt::fp16, vt::fp32>;
+    case vt::bf16::id:
+      return execute_umma<vt::bf16, vt::fp32>;
+    case vt::tf32::id:
+      return execute_umma<vt::tf32, vt::fp32>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::fp16::id:
+    switch (IT) {
+    case vt::fp16::id:
+      return execute_umma<vt::fp16, vt::fp16>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::bf16::id:
+    switch (IT) {
+    case vt::bf16::id:
+      return execute_umma<vt::bf16, vt::bf16>;
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::int32::id:
+    switch (IT) {
+    case vt::int8::id:
+      return execute_umma<vt::int8, vt::int32>;
+    case vt::uint8::id:
+      return execute_umma<vt::uint8, vt::int32>;
+    // Note: int4/uint4 would need special handling for packed 4-bit values
+    default:
+      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
+      std::abort();
+    }
+    break;
+  default:
+    std::cout << "UMMA: unsupported output type: " << OT << std::endl;
+    std::abort();
+  }
+}
+
 static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
   switch (OT) {
   case vt::fp32::id:
@@ -246,6 +362,9 @@ public:
       case TcuType::WMMA:
         delay = 4;
         break;
+      case TcuType::UMMA:
+        delay = 8; // Higher latency due to tensor memory access
+        break;
       default:
         std::abort();
       }
@@ -296,6 +415,70 @@ public:
     }
   }
 
+  // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
+  // Registers contain addresses pointing to data in tensor memory
+  // Unlike WMMA (which processes one micro-tile per instruction), UMMA processes
+  // the entire tile in one instruction by loading from tensor memory.
+  //
+  // Tensor memory layout (from kernel):
+  // - A: tileM x tileK elements in input_t, row-major
+  // - B: tileK x tileN elements in input_t, row-major
+  // - C: tileM x tileN elements in output_t, row-major
+  //
+  // Where tileK = xtileK * i_ratio (i_ratio = 32bits / input_bits)
+  void umma(uint32_t wid,
+            uint32_t fmt_s,
+            uint32_t fmt_d,
+            uint32_t step_m,
+            uint32_t step_n,
+            const std::vector<reg_data_t>& rs1_data,
+            const std::vector<reg_data_t>& rs2_data,
+            const std::vector<reg_data_t>& rs3_data,
+            std::vector<reg_data_t>& rd_data,
+            ExeTraceData* trace_data) {
+    __unused(wid);
+    __unused(trace_data);
+    __unused(step_m);  // Always 0 - UMMA generates only one instruction
+    __unused(step_n);  // Always 0 - UMMA generates only one instruction
+
+    auto tensor_mem = core_->tensor_mem();
+
+    // Get base addresses from registers
+    uint64_t addr_a = rs1_data[0].u32;
+    uint64_t addr_b = rs2_data[0].u32;
+    uint64_t addr_c = rs3_data[0].u32;
+
+    DTH(3, "UMMA: wid=" << wid);
+    DTN(3, ", fmt_s=" << fmt_s << ", fmt_d=" << fmt_d);
+    DTN(3, ", addr_a=0x" << std::hex << addr_a);
+    DTN(3, ", addr_b=0x" << addr_b);
+    DTN(3, ", addr_c=0x" << addr_c << std::dec << std::endl);
+
+    // Calculate tile dimensions based on format types
+    // Base tile dimensions (for 32-bit types)
+    constexpr uint32_t xtileM = cfg::xtileM;  // 8
+    constexpr uint32_t xtileN = cfg::xtileN;  // 4
+    constexpr uint32_t xtileK = cfg::xtileK;  // 4
+
+    // Adjust K dimension based on input type size
+    // i_ratio = 4 bytes / input_type_bytes (e.g., 2 for fp16, 4 for int8)
+    uint32_t input_bytes = get_type_bytes(fmt_s);
+    uint32_t i_ratio = 4 / input_bytes;
+    uint32_t tileK = xtileK * i_ratio;
+
+    DTN(3, ", tileM=" << xtileM << ", tileN=" << xtileN << ", tileK=" << tileK << std::endl);
+
+    // Get the appropriate UMMA executor for this format combination
+    auto umma_fn = select_UMMA(fmt_s, fmt_d);
+    umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
+
+    // Return the C/D address to ALL threads
+    // All threads in the warp execute the UMMA instruction together
+    for (size_t t = 0; t < rd_data.size(); ++t) {
+      rd_data[t].u32 = static_cast<uint32_t>(addr_c);
+    }
+  }
+
   const PerfStats& perf_stats() const {
     return perf_stats_;
   }
@@ -314,6 +497,9 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
   switch (tcu_type) {
   case TcuType::WMMA:
     return {"WMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
+             + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
+  case TcuType::UMMA:
+    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
              + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
   default:
     std::abort();
@@ -356,4 +542,17 @@ void TensorUnit::wmma(uint32_t wid,
                       std::vector<reg_data_t>& rd_data,
                       ExeTraceData* trace_data) {
   impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+}
+
+void TensorUnit::umma(uint32_t wid,
+                      uint32_t fmt_s,
+                      uint32_t fmt_d,
+                      uint32_t step_m,
+                      uint32_t step_n,
+                      const std::vector<reg_data_t>& rs1_data,
+                      const std::vector<reg_data_t>& rs2_data,
+                      const std::vector<reg_data_t>& rs3_data,
+                      std::vector<reg_data_t>& rd_data,
+                      ExeTraceData* trace_data) {
+  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
 }
