@@ -410,9 +410,7 @@ template <uint32_t NT, // number of threads per warp
           typename Ot> // output type (C,D)
 struct umma_context {
 private:
-  using cfg = wmma_config_t<NT>;
-
-  enum tile_use_t { matrix_a, matrix_b, accumulator };
+  using cfg = umma_config_t<NT, It, Ot>;
 
 public:
   using input_t  = typename It::dtype;
@@ -421,6 +419,8 @@ public:
   static constexpr uint32_t tileM = cfg::tileM;
   static constexpr uint32_t tileN = cfg::tileN;
   static constexpr uint32_t tileK = cfg::tileK;
+
+  enum tile_use_t { matrix_a, matrix_b, accumulator };
 
   // Simple tag types so we can use the same pattern as wmma_context
   template <tile_use_t U, typename T>
@@ -433,287 +433,207 @@ public:
   using tile_b   = tile_t<matrix_b, input_t>;
   using tile_acc = tile_t<accumulator, output_t>;
 
-  // ============================================================
-  // Cooperative GLOBAL → TMEM/SMEM tile load
-  // ============================================================
+  // -------------------------------------------------------------------------
+  // Helpers: logical tile sizes for each role (A/B/C) in row-major layout
+  // -------------------------------------------------------------------------
+  template <tile_use_t Use>
+  struct tile_dims;
+
+  template <>
+  struct tile_dims<matrix_a> {
+    static constexpr uint32_t M = cfg::tileM;
+    static constexpr uint32_t N = cfg::tileK;
+  };
+
+  template <>
+  struct tile_dims<matrix_b> {
+    static constexpr uint32_t M = cfg::tileK;
+    static constexpr uint32_t N = cfg::tileN;
+  };
+
+  template <>
+  struct tile_dims<accumulator> {
+    static constexpr uint32_t M = cfg::tileM;
+    static constexpr uint32_t N = cfg::tileN;
+  };
+
+  // =======================================================================
+  // Cooperative GLOBAL → LOCAL tile load
+  // =======================================================================
   //
-  //  - Frag is one of tile_a, tile_b, tile_acc
-  //  - global_src: pointer to top-left of this tile in GLOBAL memory
-  //  - tmem_dst:   pointer to top-left of this tile in TMEM/SMEM
-  //  - ldm:        leading dimension of the matrix in GLOBAL memory
+  //  - U selects which matrix (A, B, C) is being loaded.
+  //  - global_src is a pointer to global memory, with leading dimension ldg.
+  //  - local_dst is a pointer to "local" memory (TMEM/SMEM),
+  //    where the tile is always stored in row-major, tightly packed.
   //
-  // TMEM layout is always tight row-major:
-  //   A: [tileM x tileK]  -> tmem[row * tileK + col]
-  //   B: [tileK x tileN]  -> tmem[row * tileN + col]
-  //   C: [tileM x tileN]  -> tmem[row * tileN + col]
+  //  Each warp lane copies a strided subset of the tile.
   //
-  template <mem_layout src_layout = row_major, typename Frag>
+  template <tile_use_t U, mem_layout src_layout = row_major>
   static __attribute__((always_inline))
-  void load_tile_sync(const void* global_src, void* tmem_dst, size_t ldm) {
+  void load_tile_sync(typename tile_t<U, typename std::conditional_t<
+                                       (U == accumulator), output_t, input_t>>::Type *local_dst,
+                      const typename tile_t<U, typename std::conditional_t<
+                                       (U == accumulator), output_t, input_t>>::Type *global_src,
+                      size_t ldg)
+  {
+    constexpr uint32_t M = tile_dims<U>::M;
+    constexpr uint32_t N = tile_dims<U>::N;
+
     uint32_t lane = vx_thread_id();
 
-    if constexpr (Frag::Use == matrix_a) {
-      //---------------------------------------------------------
-      // Load A tile: size tileM x tileK into TMEM
-      //---------------------------------------------------------
-      const input_t* g_src = reinterpret_cast<const input_t*>(global_src);
-      input_t*       t_dst = reinterpret_cast<input_t*>(tmem_dst);
+    // Cooperative copy over the full M x N tile.
+    for (uint32_t idx = lane; idx < M * N; idx += NT) {
+      uint32_t row = idx / N;
+      uint32_t col = idx % N;
 
-      // Same per-lane block mapping as WMMA A fragment
-      uint32_t block_idx   = (cfg::a_block_size == NT) ? 0 : (lane / cfg::a_block_size);
-      uint32_t lane_in_blk = (cfg::a_block_size == NT) ? lane : (lane % cfg::a_block_size);
-
-      uint32_t block_row = (lane_in_blk / cfg::tcK) + (block_idx * cfg::tcM);
-      uint32_t block_col = (lane_in_blk % cfg::tcK); // assume i_ratio == 1 for UMMA
-
-      uint32_t m_stride  = cfg::a_sub_blocks * cfg::tcM;
-      uint32_t k_stride  = cfg::tcK;
-
-      // GLOBAL base for this lane's chunk
-      uint32_t base_row = block_row;
-      uint32_t base_col = block_col;
+      uint32_t src_row = row;
+      uint32_t src_col = col;
 
       if constexpr (src_layout == col_major) {
-        std::swap(base_row, base_col);
+        std::swap(src_row, src_col);
       }
 
-      const input_t* global_base = g_src + base_row * ldm + base_col;
+      auto *src_ptr = global_src + src_row * ldg + src_col;
 
-      // TMEM base for this lane's chunk (tileM x tileK row-major)
-      input_t* tmem_base = t_dst + block_row * tileK + block_col;
+      // Local tile is always row-major, tightly packed.
+      auto *dst_ptr = local_dst + row * N + col;
 
-      // Walk slots like WMMA fragA, but copy global → TMEM
-      detail::unroll_for<cfg::NRA>([&](auto r) {
-        uint32_t block_m  = r / cfg::k_steps;
-        uint32_t block_k  = r % cfg::k_steps;
-
-        uint32_t elem_row = block_m * m_stride;
-        uint32_t elem_col = block_k * k_stride;
-
-        uint32_t g_row = elem_row;
-        uint32_t g_col = elem_col;
-
-        if constexpr (src_layout == col_major) {
-          std::swap(g_row, g_col);
-        }
-
-        const input_t* gptr = global_base + g_row * ldm + g_col;
-        input_t*       tptr = tmem_base   + elem_row * tileK + elem_col;
-
-        assert(reinterpret_cast<uintptr_t>(gptr) % alignof(vreg_t) == 0);
-        assert(reinterpret_cast<uintptr_t>(tptr) % alignof(vreg_t) == 0);
-        *reinterpret_cast<vreg_t*>(tptr) = *reinterpret_cast<const vreg_t*>(gptr);
-      });
-
-    } else if constexpr (Frag::Use == matrix_b) {
-      //---------------------------------------------------------
-      // Load B tile: size tileK x tileN into TMEM
-      //---------------------------------------------------------
-      const input_t* g_src = reinterpret_cast<const input_t*>(global_src);
-      input_t*       t_dst = reinterpret_cast<input_t*>(tmem_dst);
-
-      // Same per-lane block mapping as WMMA B fragment
-      uint32_t block_idx   = (cfg::b_block_size == NT) ? 0 : (lane / cfg::b_block_size);
-      uint32_t lane_in_blk = (cfg::b_block_size == NT) ? lane : (lane % cfg::b_block_size);
-
-      uint32_t block_col = (lane_in_blk / cfg::tcK) + (block_idx * cfg::tcN);
-      uint32_t block_row = (lane_in_blk % cfg::tcK); // assume i_ratio == 1
-
-      uint32_t n_stride  = cfg::b_sub_blocks * cfg::tcN;
-      uint32_t k_stride  = cfg::tcK;
-
-      uint32_t base_row = block_row;
-      uint32_t base_col = block_col;
-
-      if constexpr (src_layout == col_major) {
-        std::swap(base_row, base_col);
-      }
-
-      const input_t* global_base = g_src + base_row * ldm + base_col;
-
-      // TMEM tile for B is [tileK x tileN] row-major
-      input_t* tmem_base = t_dst + block_row * tileN + block_col;
-
-      detail::unroll_for<cfg::NRB>([&](auto r) {
-        uint32_t block_k  = r / cfg::b_sub_steps;
-        uint32_t block_n  = r % cfg::b_sub_steps;
-
-        uint32_t elem_row = block_k * k_stride;
-        uint32_t elem_col = block_n * n_stride;
-
-        uint32_t g_row = elem_row;
-        uint32_t g_col = elem_col;
-
-        if constexpr (src_layout == col_major) {
-          std::swap(g_row, g_col);
-        }
-
-        const input_t* gptr = global_base + g_row * ldm + g_col;
-        input_t*       tptr = tmem_base   + elem_row * tileN + elem_col;
-
-        assert(reinterpret_cast<uintptr_t>(gptr) % alignof(vreg_t) == 0);
-        assert(reinterpret_cast<uintptr_t>(tptr) % alignof(vreg_t) == 0);
-        *reinterpret_cast<vreg_t*>(tptr) = *reinterpret_cast<const vreg_t*>(gptr);
-      });
-
-    } else {
-      //---------------------------------------------------------
-      // Load C tile: size tileM x tileN into TMEM (accumulator)
-      //---------------------------------------------------------
-      const output_t* g_src = reinterpret_cast<const output_t*>(global_src);
-      output_t*       t_dst = reinterpret_cast<output_t*>(tmem_dst);
-
-      // Same mapping as WMMA accumulator fragment
-      uint32_t block_row = lane / cfg::tcN;
-      uint32_t block_col = lane % cfg::tcN;
-
-      uint32_t m_stride = cfg::tcM;
-      uint32_t n_stride = cfg::tcN;
-
-      uint32_t base_row = block_row;
-      uint32_t base_col = block_col;
-
-      if constexpr (src_layout == col_major) {
-        std::swap(base_row, base_col);
-      }
-
-      const output_t* global_base = g_src + base_row * ldm + base_col;
-      output_t*       tmem_base   = t_dst + block_row * tileN + block_col;
-
-      detail::unroll_for<cfg::NRC>([&](auto r) {
-        uint32_t block_m  = r / cfg::n_steps;
-        uint32_t block_n  = r % cfg::n_steps;
-
-        uint32_t elem_row = block_m * m_stride;
-        uint32_t elem_col = block_n * n_stride;
-
-        uint32_t g_row = elem_row;
-        uint32_t g_col = elem_col;
-
-        if constexpr (src_layout == col_major) {
-          std::swap(g_row, g_col);
-        }
-
-        const output_t* gptr = global_base + g_row * ldm + g_col;
-        output_t*       tptr = tmem_base   + elem_row * tileN + elem_col;
-
-        assert(reinterpret_cast<uintptr_t>(gptr) % alignof(vreg_t) == 0);
-        assert(reinterpret_cast<uintptr_t>(tptr) % alignof(vreg_t) == 0);
-        *reinterpret_cast<vreg_t*>(tptr) = *reinterpret_cast<const vreg_t*>(gptr);
-      });
+      *dst_ptr = *src_ptr;
     }
   }
 
-  // ============================================================
-  // Cooperative TMEM/SMEM → GLOBAL tile store (C only)
-  // ============================================================
-  template <mem_layout dst_layout = row_major, typename Frag>
+  // Convenience wrappers:
   static __attribute__((always_inline))
-  void store_tile_sync(void* global_dst, const void* tmem_src, size_t ldm) {
-    static_assert(Frag::Use == accumulator,
-                  "store_tile_sync is only valid for accumulator (C) tiles");
+  void load_tile_sync_A(input_t *local_dst,
+                        const input_t *global_src,
+                        size_t lda,
+                        mem_layout layout = row_major)
+  {
+    if (layout == row_major) {
+      load_tile_sync<matrix_a, row_major>(local_dst, global_src, lda);
+    } else {
+      load_tile_sync<matrix_a, col_major>(local_dst, global_src, lda);
+    }
+  }
+
+  static __attribute__((always_inline))
+  void load_tile_sync_B(input_t *local_dst,
+                        const input_t *global_src,
+                        size_t ldb,
+                        mem_layout layout = col_major)
+  {
+    if (layout == row_major) {
+      load_tile_sync<matrix_b, row_major>(local_dst, global_src, ldb);
+    } else {
+      load_tile_sync<matrix_b, col_major>(local_dst, global_src, ldb);
+    }
+  }
+
+  static __attribute__((always_inline))
+  void load_tile_sync_C(output_t *local_dst,
+                        const output_t *global_src,
+                        size_t ldc,
+                        mem_layout layout = row_major)
+  {
+    if (layout == row_major) {
+      load_tile_sync<accumulator, row_major>(local_dst, global_src, ldc);
+    } else {
+      load_tile_sync<accumulator, col_major>(local_dst, global_src, ldc);
+    }
+  }
+
+  // =======================================================================
+  // Cooperative LOCAL → GLOBAL tile store
+  // =======================================================================
+  //
+  //  - U is almost always accumulator (C/D), but kept generic.
+  //  - local_src is row-major, tightly packed M x N tile.
+  //  - global_dst has leading dimension ldg in the chosen layout.
+  //
+  template <tile_use_t U, mem_layout dst_layout = row_major>
+  static __attribute__((always_inline))
+  void store_tile_sync(typename tile_t<U, typename std::conditional_t<
+                                        (U == accumulator), output_t, input_t>>::Type *global_dst,
+                       const typename tile_t<U, typename std::conditional_t<
+                                        (U == accumulator), output_t, input_t>>::Type *local_src,
+                       size_t ldg)
+  {
+    constexpr uint32_t M = tile_dims<U>::M;
+    constexpr uint32_t N = tile_dims<U>::N;
 
     uint32_t lane = vx_thread_id();
 
-    output_t*       g_dst = reinterpret_cast<output_t*>(global_dst);
-    const output_t* t_src = reinterpret_cast<const output_t*>(tmem_src);
+    for (uint32_t idx = lane; idx < M * N; idx += NT) {
+      uint32_t row = idx / N;
+      uint32_t col = idx % N;
 
-    // Same mapping as load C path
-    uint32_t block_row = lane / cfg::tcN;
-    uint32_t block_col = lane % cfg::tcN;
-
-    uint32_t m_stride = cfg::tcM;
-    uint32_t n_stride = cfg::tcN;
-
-    uint32_t base_row = block_row;
-    uint32_t base_col = block_col;
-
-    if constexpr (dst_layout == col_major) {
-      std::swap(base_row, base_col);
-    }
-
-    output_t*       global_base = g_dst + base_row * ldm + base_col;
-    const output_t* tmem_base   = t_src + block_row * tileN + block_col;
-
-    detail::unroll_for<cfg::NRC>([&](auto r) {
-      uint32_t block_m  = r / cfg::n_steps;
-      uint32_t block_n  = r % cfg::n_steps;
-
-      uint32_t elem_row = block_m * m_stride;
-      uint32_t elem_col = block_n * n_stride;
-
-      uint32_t g_row = elem_row;
-      uint32_t g_col = elem_col;
+      uint32_t dst_row = row;
+      uint32_t dst_col = col;
 
       if constexpr (dst_layout == col_major) {
-        std::swap(g_row, g_col);
+        std::swap(dst_row, dst_col);
       }
 
-      const output_t* tptr = tmem_base   + elem_row * tileN + elem_col;
-      output_t*       gptr = global_base + g_row * ldm + g_col;
+      auto *src_ptr = local_src + row * N + col;
+      auto *dst_ptr = global_dst + dst_row * ldg + dst_col;
 
-      assert(reinterpret_cast<uintptr_t>(gptr) % alignof(vreg_t) == 0);
-      assert(reinterpret_cast<uintptr_t>(tptr) % alignof(vreg_t) == 0);
-      *reinterpret_cast<const vreg_t*>(gptr) = *reinterpret_cast<vreg_t*>(tptr);
-    });
+      *dst_ptr = *src_ptr;
+    }
   }
 
-  // ============================================================
-  // UMMA compute: C_tmem = A_tmem * B_tmem + C_tmem
-  // ============================================================
-  //
-  // All three pointers are TMEM/SMEM addresses to the tile buffers:
-  //   A_tmem: [tileM x tileK] row-major
-  //   B_tmem: [tileK x tileN] row-major
-  //   C_tmem: [tileM x tileN] row-major
-  //
+  // Convenience wrapper for the usual "store C tile" case:
   static __attribute__((always_inline))
-  void umma_sync(output_t*       C_tmem,
-                 const input_t*  A_tmem,
-                 const input_t*  B_tmem,
-                 uint32_t        lda_tile, // usually tileK
-                 uint32_t        ldb_tile, // usually tileN
-                 uint32_t        ldc_tile  // usually tileN
-                 )
+  void store_tile_sync_C(output_t *global_dst,
+                         const output_t *local_src,
+                         size_t ldc,
+                         mem_layout layout = row_major)
   {
-    // All threads in the warp call this with the same TMEM pointers.
-    // Bind them to integer registers as required by UMMA ISA encoding.
+    if (layout == row_major) {
+      store_tile_sync<accumulator, row_major>(global_dst, local_src, ldc);
+    } else {
+      store_tile_sync<accumulator, col_major>(global_dst, local_src, ldc);
+    }
+  }
 
-    register const void* ra __asm__("x10") = static_cast<const void*>(A_tmem);
-    register const void* rb __asm__("x11") = static_cast<const void*>(B_tmem);
-    register       void* rc __asm__("x12") = static_cast<void*>(C_tmem);
+  // =======================================================================
+  // UMMA: tile-level MMA on LOCAL memory tiles
+  // =======================================================================
+  //
+  //  - C_localmem: pointer to tileM x tileN tile in local memory (row-major)
+  //  - A_localmem: pointer to tileM x tileK tile in local memory (row-major)
+  //  - B_localmem: pointer to tileK x tileN tile in local memory (row-major)
 
-    register uint32_t rlda __asm__("x13") = lda_tile;
-    register uint32_t rldb __asm__("x14") = ldb_tile;
-    register uint32_t rldc __asm__("x15") = ldc_tile;
+  static __attribute__((always_inline))
+  void umma_sync(output_t      *C_localmem,
+                 const input_t *A_localmem,
+                 const input_t *B_localmem)
+  {
+    constexpr uint32_t M = cfg::tileM;
+    constexpr uint32_t N = cfg::tileN;
+    constexpr uint32_t K = cfg::tileK;
 
-    constexpr uint32_t fmt_s = It::id;
-    constexpr uint32_t fmt_d = Ot::id;
+    uint32_t lane = vx_thread_id();
 
-    // Layout bits for TMEM tiles, if your UMMA cares (here all row-major = 0)
-    constexpr uint32_t la = 0u; // A_tmem row-major
-    constexpr uint32_t lb = 0u; // B_tmem row-major
-    constexpr uint32_t lc = 0u; // C_tmem row-major
-    constexpr uint32_t ctrl =
-        (la << 0) |
-        (lb << 1) |
-        (lc << 2);
+    // Simple choice: only lane 0 performs the compute for now.
+    if (lane != 0)
+      return;
 
-    // TODO: replace RISCV_CUSTOM1 and operand pattern with actual UMMA encoding.
-    __asm__ volatile (
-      ".insn r %[insn], 1, 2, x%[rd], x%[rs1], x%[rs2]\n"
-      :
-      : [insn]"i"(RISCV_CUSTOM1),
-        [rd]"i"(12),   // rc in x12
-        [rs1]"i"(10),  // ra in x10
-        [rs2]"i"(11),  // rb in x11
-        "r"(ra), "r"(rb), "r"(rc),
-        "r"(rlda), "r"(rldb), "r"(rldc),
-        "i"(fmt_s), "i"(fmt_d), "i"(ctrl)
-      : "memory"
-    );
+    if (lane == 0) {
+      register uintptr_t rA __asm__("x10") = reinterpret_cast<uintptr_t>(A_localmem);
+      register uintptr_t rB __asm__("x11") = reinterpret_cast<uintptr_t>(B_localmem);
+      register uintptr_t rC __asm__("x12") = reinterpret_cast<uintptr_t>(C_localmem);
+  
+      __asm__ volatile(".insn r %[insn], 1, 2, %[rc], %[ra], %[rb]"
+        :
+        : [insn]"i"(RISCV_CUSTOM0), // or your UMMA opcode
+          [rc]"r"(rC),
+          [ra]"r"(rA),
+          [rb]"r"(rB)
+        : "memory");
+    }
   }
 };
+
 
 } // namespace tensor
 } // namespace vortex

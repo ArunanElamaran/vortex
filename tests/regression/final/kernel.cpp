@@ -32,21 +32,16 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
     const auto* B_tile_global = pB + k * N      + tile_col;
     auto*       C_tile_global = pC + tile_row * N + tile_col;
 
-    // 1) Stage tiles into TMEM cooperatively
-    ctx::load_tile_sync<row_major, tileA>(A_tile_global, A_tmem, K);
-    ctx::load_tile_sync<row_major, tileB>(B_tile_global, B_tmem, N);
-    ctx::load_tile_sync<row_major, tileC>(C_tile_global, C_tmem, N);
+    // 1) Load tiles from global → local
+    ctx::load_tile_sync_A(tensor_A, A_tile_global, K);
+    ctx::load_tile_sync_B(local_B, B_tile_global, N);
+    ctx::load_tile_sync_C(tensor_C, C_tile_global, N);
 
-    // 2) Run UMMA on TMEM tiles
-    ctx::umma_sync(tensor_C, tensor_A, local_B,
-                    ctx::tileK, // lda_tile
-                    ctx::tileN, // ldb_tile
-                    ctx::tileN  // ldc_tile
-                    );
-  }
+    // 2) Do UMMA in local memory
+    ctx::umma_sync(tensor_C, tensor_A, local_B);
 
-  // Store the computed C tile
-  ctx::store_tile_sync<row_major, tileC>(C_tile_global, C_tmem, N);
+    // 3) Store result back to global
+    ctx::store_tile_sync_C(C_tile_global, tensor_C, N);
 }
 
 int main() {
