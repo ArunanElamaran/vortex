@@ -173,5 +173,15 @@ public:
   static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
 };
 
+template <uint32_t NT,
+          typename It = fp32,
+          typename Ot = fp32>
+struct umma_config_t {
+  static constexpr uint32_t tileM = 256;
+  static constexpr uint32_t tileN = 256;
+  static constexpr uint32_t tileK = 16;
+};
+
+
 } // namespace tensor
 } // namespace vortex
