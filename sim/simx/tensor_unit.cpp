@@ -302,7 +302,15 @@ public:
 
   // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
   // Registers contain addresses pointing to data in tensor memory
-  // Data is laid out linearly in tensor memory (not in micro-tile format)
+  // Unlike WMMA (which processes one micro-tile per instruction), UMMA processes
+  // the entire tile in one instruction by loading from tensor memory.
+  //
+  // Tensor memory layout (from kernel):
+  // - A: tileM x tileK elements in input_t (e.g., fp16), row-major
+  // - B: tileK x tileN elements in input_t, row-major  
+  // - C: tileM x tileN elements in output_t (e.g., fp32), row-major
+  //
+  // Where tileK = xtileK * i_ratio (i_ratio = 32bits / input_bits)
   void umma(uint32_t wid,
             uint32_t fmt_s,
             uint32_t fmt_d,
@@ -317,89 +325,71 @@ public:
     __unused(trace_data);
     __unused(step_m);  // Always 0 - UMMA generates only one instruction
     __unused(step_n);  // Always 0 - UMMA generates only one instruction
+    __unused(fmt_s);
+    __unused(fmt_d);
 
     auto tensor_mem = core_->tensor_mem();
 
-    // Get base addresses from registers (32-bit on RV32)
-    uint64_t addr_a_base = rs1_data[0].u32;
-    uint64_t addr_b_base = rs2_data[0].u32;
-    uint64_t addr_c_base = rs3_data[0].u32;
+    // Get base addresses from registers
+    uint64_t addr_a = rs1_data[0].u32;
+    uint64_t addr_b = rs2_data[0].u32;
+    uint64_t addr_c = rs3_data[0].u32;
 
-    // Calculate tile sizes based on actual tile dimensions and data types
-    // Input element size in bytes
-    uint32_t i_size = (fmt_s == vt::int8::id || fmt_s == vt::uint8::id) ? 1 : 
-                      (fmt_s == vt::int4::id || fmt_s == vt::uint4::id) ? 1 :  // 4-bit uses byte addressing
-                      (fmt_s == vt::fp16::id || fmt_s == vt::bf16::id) ? 2 : 4;
-    // Output element size in bytes  
-    uint32_t o_size = (fmt_d == vt::int32::id || fmt_d == vt::fp32::id) ? 4 :
-                      (fmt_d == vt::fp16::id || fmt_d == vt::bf16::id) ? 2 : 4;
-    uint32_t i_ratio = 4 / i_size;  // number of input elements per 4 bytes
-    
-    // Actual tile dimensions (after applying i_ratio for tileK)
-    uint32_t tileM = cfg::xtileM;
-    uint32_t tileN = cfg::xtileN;
-    uint32_t tileK = cfg::xtileK * i_ratio;
-    
-    uint32_t a_tile_bytes = tileM * tileK * i_size;
-    uint32_t b_tile_bytes = tileK * tileN * i_size;
-    uint32_t c_tile_bytes = tileM * tileN * o_size;
+    // Tile dimensions in elements (not 32-bit words)
+    // tileK = xtileK * i_ratio to account for packed input elements
+    constexpr uint32_t tileM = cfg::tileM;
+    constexpr uint32_t tileN = cfg::tileN;
+    constexpr uint32_t tileK = cfg::tileK;
 
-    // Allocate buffers for tile data
-    std::vector<uint8_t> a_bytes(a_tile_bytes);
-    std::vector<uint8_t> b_bytes(b_tile_bytes);
-    std::vector<uint8_t> c_bytes(c_tile_bytes);
-    std::vector<uint8_t> d_bytes(c_tile_bytes);
+    // Sizes in bytes
+    constexpr uint32_t a_bytes = tileM * tileK * sizeof(uint16_t);  // fp16 input
+    constexpr uint32_t b_bytes = tileK * tileN * sizeof(uint16_t);  // fp16 input
+    constexpr uint32_t c_bytes = tileM * tileN * sizeof(float);     // fp32 output
 
-    // Load tiles from tensor memory
-    tensor_mem->read(a_bytes.data(), addr_a_base, a_tile_bytes);
-    tensor_mem->read(b_bytes.data(), addr_b_base, b_tile_bytes);
-    tensor_mem->read(c_bytes.data(), addr_c_base, c_tile_bytes);
+    // Read tiles from tensor memory as raw bytes
+    std::vector<uint16_t> a_tile(tileM * tileK);
+    std::vector<uint16_t> b_tile(tileK * tileN);
+    std::vector<float> c_tile(tileM * tileN);
+    std::vector<float> d_tile(tileM * tileN);
 
-    DTH(3, "UMMA: wid=" << wid << ", step_m=" << step_m << ", step_n=" << step_n);
-    DTN(3, ", addr_a=0x" << std::hex << addr_a_base);
-    DTN(3, ", addr_b=0x" << addr_b_base);
-    DTN(3, ", addr_c=0x" << addr_c_base);
-    DTN(3, ", tileM=" << std::dec << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
+    tensor_mem->read(a_tile.data(), addr_a, a_bytes);
+    tensor_mem->read(b_tile.data(), addr_b, b_bytes);
+    tensor_mem->read(c_tile.data(), addr_c, c_bytes);
 
-    // Perform matrix multiply-accumulate
-    // C[m,n] = sum_k(A[m,k] * B[k,n]) + C[m,n]
+    DTH(3, "UMMA: wid=" << wid);
+    DTN(3, ", addr_a=0x" << std::hex << addr_a);
+    DTN(3, ", addr_b=0x" << addr_b);
+    DTN(3, ", addr_c=0x" << addr_c << std::dec);
+    DTN(3, ", tileM=" << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
+
+    // Simple row-major matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
+    // Tiles are stored contiguously in tensor memory in row-major order
     for (uint32_t m = 0; m < tileM; ++m) {
       for (uint32_t n = 0; n < tileN; ++n) {
-        int32_t acc = 0;
+        uint32_t c_idx = m * tileN + n;
+        uint32_t acc = bit_cast<uint32_t>(c_tile[c_idx]);
         
-        // Read C accumulator value
-        if (fmt_d == vt::int32::id) {
-          acc = *reinterpret_cast<int32_t*>(&c_bytes[(m * tileN + n) * o_size]);
-        } else if (fmt_d == vt::fp32::id) {
-          // For float, we'd use float accumulator - simplified for now
-          acc = *reinterpret_cast<int32_t*>(&c_bytes[(m * tileN + n) * o_size]);
-        }
-        
-        // Dot product along K dimension
+        // Dot product over K dimension
         for (uint32_t k = 0; k < tileK; ++k) {
-          int32_t a_val = 0, b_val = 0;
+          uint32_t a_idx = m * tileK + k;
+          uint32_t b_idx = k * tileN + n;
           
-          if (fmt_s == vt::int8::id) {
-            a_val = static_cast<int32_t>(*reinterpret_cast<int8_t*>(&a_bytes[m * tileK + k]));
-            b_val = static_cast<int32_t>(*reinterpret_cast<int8_t*>(&b_bytes[k * tileN + n]));
-          } else if (fmt_s == vt::uint8::id) {
-            a_val = static_cast<int32_t>(*reinterpret_cast<uint8_t*>(&a_bytes[m * tileK + k]));
-            b_val = static_cast<int32_t>(*reinterpret_cast<uint8_t*>(&b_bytes[k * tileN + n]));
-          }
-          
-          acc += a_val * b_val;
+          // Convert fp16 to fp32, multiply, then accumulate
+          uint32_t a_fp32 = rv_htof_s(a_tile[a_idx], 0, nullptr);
+          uint32_t b_fp32 = rv_htof_s(b_tile[b_idx], 0, nullptr);
+          uint32_t prod = rv_fmul_s(a_fp32, b_fp32, 0, nullptr);
+          acc = rv_fadd_s(acc, prod, 0, nullptr);
         }
         
-        // Store result
-        *reinterpret_cast<int32_t*>(&d_bytes[(m * tileN + n) * o_size]) = acc;
+        d_tile[c_idx] = bit_cast<float>(acc);
       }
     }
 
-    // Store result D back to tensor memory
-    tensor_mem->write(d_bytes.data(), addr_c_base, c_tile_bytes);
+    // Write result tile back to tensor memory
+    tensor_mem->write(d_tile.data(), addr_c, c_bytes);
 
-    // Return the C address in rd_data (32-bit on RV32)
-    rd_data[0].u32 = static_cast<uint32_t>(addr_c_base);
+    // Return the C/D address
+    rd_data[0].u32 = static_cast<uint32_t>(addr_c);
   }
 
   const PerfStats& perf_stats() const {

@@ -1,6 +1,7 @@
 #include "common.h"
 #include <vx_spawn.h>
 #include <vx_tensor.h>
+#include <vx_print.h>
 
 namespace vt = vortex::tensor;
 
@@ -45,14 +46,18 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   ctx::set_fragment_addr(tmemC, reinterpret_cast<void*>(block_tmem_base + a_tile_size + b_tile_size));
 
   // DEBUG: Print fragment addresses
-  printf("Block (%u,%u) TMEM addresses: A=0x%lx B=0x%lx C=0x%lx\n",
+  vx_printf("Block (%u,%u) TMEM addresses: A=0x%u B=0x%u C=0x%u\n",
          blockIdx.x, blockIdx.y,
-         reinterpret_cast<uint64_t>(tmemA.addr),
-         reinterpret_cast<uint64_t>(tmemB.addr),
-         reinterpret_cast<uint64_t>(tmemC.addr));
+         reinterpret_cast<uintptr_t>(tmemA.addr),
+         reinterpret_cast<uintptr_t>(tmemB.addr),
+         reinterpret_cast<uintptr_t>(tmemC.addr));
 
   // Initialize accumulator in tensor memory to zero
   ctx::fill_fragment(tmemC, 0);
+
+  // Counters for MMA verification
+  uint32_t total_checks = 0;
+  uint32_t total_mismatches = 0;
 
   for (uint32_t i = 0; i < K; i += ctx::tileK) {
     auto pTileA = pA + tile_row * K + i;
@@ -70,8 +75,72 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
       ctx::load_matrix_sync(tmemB, pTileB, N);
     }
 
+    // Software reference MMA: compute expected result before hardware MMA
+    // Thread 0 computes the full reference result for comparison
+    // Store a copy of C before mma_sync, then compute reference, then compare
+    ctx::output_t ref_C[ctx::tileM * ctx::tileN];
+    if (vx_thread_id() == 0) {
+      auto tmem_A = reinterpret_cast<volatile ctx::input_t*>(tmemA.addr);
+      auto tmem_B = reinterpret_cast<volatile ctx::input_t*>(tmemB.addr);
+      auto tmem_C = reinterpret_cast<volatile ctx::output_t*>(tmemC.addr);
+      
+      // Copy current C accumulator
+      for (uint32_t idx = 0; idx < ctx::tileM * ctx::tileN; ++idx) {
+        ref_C[idx] = tmem_C[idx];
+      }
+      
+      // Compute reference: C[m][n] += A[m][k] * B[k][n]
+      // A is tileM x tileK (row-major in tmem)
+      // B is tileK x tileN (row-major in tmem)
+      // C is tileM x tileN (row-major in tmem)
+      for (uint32_t m = 0; m < ctx::tileM; ++m) {
+        for (uint32_t n = 0; n < ctx::tileN; ++n) {
+          ctx::output_t sum = ref_C[m * ctx::tileN + n];
+          for (uint32_t k = 0; k < ctx::tileK; ++k) {
+            ctx::input_t a_val = tmem_A[m * ctx::tileK + k];
+            ctx::input_t b_val = tmem_B[k * ctx::tileN + n];
+            sum += static_cast<ctx::output_t>(a_val) * static_cast<ctx::output_t>(b_val);
+          }
+          ref_C[m * ctx::tileN + n] = sum;
+        }
+      }
+    }
+
     // MMA; All data stays in tensor memory, only addresses in registers
     ctx::mma_sync(tmemC, tmemA, tmemB, tmemC);
+
+    // Compare hardware result with software reference
+    if (vx_thread_id() == 0) {
+      auto tmem_C = reinterpret_cast<volatile ctx::output_t*>(tmemC.addr);
+      uint32_t iter_mismatches = 0;
+      for (uint32_t m = 0; m < ctx::tileM; ++m) {
+        for (uint32_t n = 0; n < ctx::tileN; ++n) {
+          uint32_t idx = m * ctx::tileN + n;
+          ctx::output_t hw_val = tmem_C[idx];
+          ctx::output_t sw_val = ref_C[idx];
+          // Use bit comparison for floats to detect any difference including NaN
+          uint32_t hw_bits, sw_bits;
+          __builtin_memcpy(&hw_bits, &hw_val, sizeof(hw_bits));
+          __builtin_memcpy(&sw_bits, &sw_val, sizeof(sw_bits));
+          total_checks++;
+          if (hw_bits != sw_bits) {
+            vx_printf("MMA MISMATCH C[%u,%u]: hw=0x%x sw=0x%x (block=%u,%u iter=%u)\n",
+                     m, n, hw_bits, sw_bits, blockIdx.x, blockIdx.y, i);
+            iter_mismatches++;
+            total_mismatches++;
+          }
+        }
+      }
+      if (iter_mismatches == 0) {
+        vx_printf("MMA verified OK (block=%u,%u iter=%u)\n", blockIdx.x, blockIdx.y, i);
+      }
+    }
+  }
+
+  // Print summary
+  if (vx_thread_id() == 0) {
+    vx_printf("MMA SUMMARY (block=%u,%u): %u mismatches / %u checks\n",
+             blockIdx.x, blockIdx.y, total_mismatches, total_checks);
   }
 
   // Store the computed C tile from tensor memory to global memory
