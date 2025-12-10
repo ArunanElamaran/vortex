@@ -5,6 +5,41 @@
 
 namespace vt = vortex::tensor;
 
+// Software fp16 to fp32 conversion for verification
+// IEEE 754 half-precision: 1 sign, 5 exponent, 10 mantissa
+inline float fp16_to_fp32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 0x1;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+  
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      // Zero
+      f = sign << 31;
+    } else {
+      // Subnormal - convert to normalized fp32
+      exp = 1;
+      while ((mant & 0x400) == 0) {
+        mant <<= 1;
+        exp--;
+      }
+      mant &= 0x3FF;
+      f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    // Inf or NaN
+    f = (sign << 31) | 0x7F800000 | (mant << 13);
+  } else {
+    // Normal number
+    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  
+  float result;
+  __builtin_memcpy(&result, &f, sizeof(result));
+  return result;
+}
+
 // Use UMMA context - registers hold addresses to tensor memory
 using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
@@ -97,9 +132,12 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
         for (uint32_t n = 0; n < ctx::tileN; ++n) {
           ctx::output_t sum = ref_C[m * ctx::tileN + n];
           for (uint32_t k = 0; k < ctx::tileK; ++k) {
-            ctx::input_t a_val = tmem_A[m * ctx::tileK + k];
-            ctx::input_t b_val = tmem_B[k * ctx::tileN + n];
-            sum += static_cast<ctx::output_t>(a_val) * static_cast<ctx::output_t>(b_val);
+            ctx::input_t a_bits = tmem_A[m * ctx::tileK + k];
+            ctx::input_t b_bits = tmem_B[k * ctx::tileN + n];
+            // Properly convert fp16 bit patterns to fp32 values
+            float a_val = fp16_to_fp32(a_bits);
+            float b_val = fp16_to_fp32(b_bits);
+            sum += a_val * b_val;
           }
           ref_C[m * ctx::tileN + n] = sum;
         }
