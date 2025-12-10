@@ -1144,8 +1144,8 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
         // parse rd into fmt_s, fmt_d, layout, etc.
         IntrTcuArgs tcuArgs{};
-        tcuArgs.fmt_s   = fmt_s;
-        tcuArgs.fmt_d   = fmt_d;
+        tcuArgs.fmt_s   = rd;
+        tcuArgs.fmt_d   = rs1;
         tcuArgs.step_m  = 0; // use for sub-tiling if needed
         tcuArgs.step_n  = 0;
         // (if extend IntrTcuArgs, also fill base addresses/strides here)
@@ -1153,6 +1153,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         instr->setArgs(tcuArgs);
 
         // Instead of assigning FP regs, you mark as integer address regs:
+        instr->setDestReg(reg_addr_c, RegType::Integer);  // D address (same as C)
         instr->setSrcReg(0, rs1, RegType::Integer); // A base
         instr->setSrcReg(1, rs2, RegType::Integer); // B base
         instr->setSrcReg(2, rs3, RegType::Integer); // C/D base

@@ -21,6 +21,7 @@ using namespace vortex;
 
 namespace vt = vortex::tensor;
 using cfg = vt::wmma_config_t<NUM_THREADS>;
+using cfg_umma = vt::umma_config_t<NUM_THREADS>;
 
 inline uint64_t nan_box(uint32_t value) {
   return value | 0xffffffff00000000;
@@ -246,6 +247,9 @@ public:
       case TcuType::WMMA:
         delay = 4;
         break;
+      case TcuType::UMMA:
+        delay = 4;
+        break;
       default:
         std::abort();
       }
@@ -311,62 +315,81 @@ public:
   void umma(uint32_t wid,
             uint32_t fmt_s,
             uint32_t fmt_d,
-            uint32_t a_base,  // base addr of A tile in TMEM/SMEM
-            uint32_t b_base,  // base addr of B tile in TMEM/SMEM
-            uint32_t c_base,  // base addr of C/D tile in TMEM/SMEM
-            uint32_t lda,     // leading dim for A in TMEM (in elements)
-            uint32_t ldb,     // leading dim for B in TMEM
-            uint32_t ldc,     // leading dim for C/D in TMEM
+            uint32_t step_m,
+            uint32_t step_n,
+            const std::vector<reg_data_t>& rs1_data,
+            const std::vector<reg_data_t>& rs2_data,
+            const std::vector<reg_data_t>& rs3_data,
+            std::vector<reg_data_t>& rd_data,
             ExeTraceData* trace_data) {
     __unused(wid);
     __unused(trace_data);
+    __unused(step_m);  // Always 0 - UMMA generates only one instruction
+    __unused(step_n);  // Always 0 - UMMA generates only one instruction
 
-    auto fedp = select_FEDP(fmt_s, fmt_d);
+    auto tensor_mem = core_->tensor_mem();
 
-    // temp row/col buffers like WMMA's a_row/b_col
-    std::array<reg_data_t, cfg::tcK> a_row;
-    std::array<reg_data_t, cfg::tcK> b_col;
+    // Get base addresses from registers
+    uint64_t addr_a = rs1_data[0].u32;
+    uint64_t addr_b = rs2_data[0].u32;
+    uint64_t addr_c = rs3_data[0].u32;
 
-    for (uint32_t i = 0; i < cfg::tcM; ++i) {
-      for (uint32_t j = 0; j < cfg::tcN; ++j) {
+    DTH(3, "UMMA: wid=" << wid);
+    DTN(3, ", fmt_s=" << fmt_s << ", fmt_d=" << fmt_d);
+    DTN(3, ", addr_a=0x" << std::hex << addr_a);
+    DTN(3, ", addr_b=0x" << addr_b);
+    DTN(3, ", addr_c=0x" << addr_c << std::dec << std::endl);
 
-        // 1) gather A row and B column from TMEM
-        for (uint32_t k = 0; k < cfg::tcK; ++k) {
-          a_row[k] = mem_load(a_base, i, k, lda); // A(i,k)
-          b_col[k] = mem_load(b_base, k, j, ldb); // B(k,j)
+    // Use FMA function based on format types
+    // For now, handle fp16->fp32 case (most common)
+    // TODO: Add support for other format combinations using fmt_s/fmt_d
+    if (fmt_s == vt::fp16::id && fmt_d == vt::fp32::id) {
+      // Use the correct config for fp16 input, fp32 output
+      constexpr uint32_t tileM = umma_cfg_fp16_fp32::tileM;  // 8
+      constexpr uint32_t tileN = umma_cfg_fp16_fp32::tileN;  // 4
+      constexpr uint32_t tileK = umma_cfg_fp16_fp32::tileK;  // 8 (= xtileK * i_ratio = 4 * 2)
+
+      DTN(3, ", tileM=" << tileM << ", tileN=" << tileN << ", tileK=" << tileK << std::endl);
+
+      // fp16 input, fp32 output
+      constexpr uint32_t a_bytes = tileM * tileK * sizeof(uint16_t);
+      constexpr uint32_t b_bytes = tileK * tileN * sizeof(uint16_t);
+      constexpr uint32_t c_bytes = tileM * tileN * sizeof(float);
+
+      std::vector<uint16_t> a_tile(tileM * tileK);
+      std::vector<uint16_t> b_tile(tileK * tileN);
+      std::vector<float> c_tile(tileM * tileN);
+      std::vector<float> d_tile(tileM * tileN);
+
+      tensor_mem->read(a_tile.data(), addr_a, a_bytes);
+      tensor_mem->read(b_tile.data(), addr_b, b_bytes);
+      tensor_mem->read(c_tile.data(), addr_c, c_bytes);
+
+      // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
+      for (uint32_t m = 0; m < tileM; ++m) {
+        for (uint32_t n = 0; n < tileN; ++n) {
+          uint32_t c_idx = m * tileN + n;
+          float acc = c_tile[c_idx];
+          
+          for (uint32_t k = 0; k < tileK; ++k) {
+            uint32_t a_idx = m * tileK + k;
+            uint32_t b_idx = k * tileN + n;
+            // Use FMA template for proper fp16->fp32 conversion
+            acc = FMA<vt::fp16, vt::fp32>::eval(a_tile[a_idx], b_tile[b_idx], acc);
+          }
+          
+          d_tile[c_idx] = acc;
         }
-
-        // 2) load accumulator C(i,j)
-        reg_data_t c = mem_load(c_base, i, j, ldc);
-        uint32_t c_val = c.u32;
-
-        // 3) FEDP dot-product
-        uint32_t d_val = fedp(a_row.data(), b_col.data(), c_val);
-
-        // 4) write back D(i,j) into C_tmem
-        reg_data_t d;
-        d.u64 = nan_box(d_val);
-        mem_store(c_base, i, j, ldc, d);
-
-        DTH(3, "UMMA FEDP: wid=" << wid
-                                << ", i=" << i
-                                << ", j=" << j
-                                << ", a_row={"
-                                << std::hex);
-        for (uint32_t q = 0; q < cfg::tcK; ++q) {
-          if (q) DTN(3, ", ");
-          DTN(3, "0x" << a_row[q].u32);
-        }
-        DTN(3, "}, b_col={");
-        for (uint32_t q = 0; q < cfg::tcK; ++q) {
-          if (q) DTN(3, ", ");
-          DTN(3, "0x" << b_col[q].u32);
-        }
-        DTN(3, "}, c_val=0x" << c_val
-                            << ", d_val=0x" << d_val
-                            << std::dec << std::endl);
       }
+
+      tensor_mem->write(d_tile.data(), addr_c, c_bytes);
+    } else {
+      std::cout << "UMMA: Unsupported format combination fmt_s=" << fmt_s << " fmt_d=" << fmt_d << std::endl;
+      std::abort();
     }
+
+    // Return the C/D address
+    rd_data[0].u32 = static_cast<uint32_t>(addr_c);
   }
 
 

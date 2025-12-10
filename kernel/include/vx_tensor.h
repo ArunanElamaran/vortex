@@ -623,13 +623,21 @@ public:
       register uintptr_t rB __asm__("x11") = reinterpret_cast<uintptr_t>(B_localmem);
       register uintptr_t rC __asm__("x12") = reinterpret_cast<uintptr_t>(C_localmem);
   
-      __asm__ volatile(".insn r %[insn], 1, 2, %[rc], %[ra], %[rb]"
-        :
-        : [insn]"i"(RISCV_CUSTOM0), // or your UMMA opcode
-          [rc]"r"(rC),
-          [ra]"r"(rA),
-          [rb]"r"(rB)
-        : "memory");
+      // Build instruction word manually to ensure correct encoding
+      // R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
+      constexpr uint32_t opcode = RISCV_CUSTOM0;
+      constexpr uint32_t funct3 = 1;
+      constexpr uint32_t funct7 = 2;
+      constexpr uint32_t rs2_val = 0;
+      constexpr uint32_t insn_word = (funct7 << 25) | (rs2_val << 20) | (It::id << 15) | 
+                                    (funct3 << 12) | (Ot::id << 7) | opcode;
+      
+      __asm__ volatile (
+        ".word %[insn]"
+        : "=r"(rC)
+        : [insn]"i"(insn_word),
+          "r"(rA), "r"(rB), "r"(rC)
+      );
     }
   }
 };

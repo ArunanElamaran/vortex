@@ -66,9 +66,9 @@ public:
 	void umma(uint32_t wid,
             uint32_t fmt_s,
             uint32_t fmt_d,
-            uint32_t a_base,  // base addr of A tile in TMEM/SMEM
-            uint32_t b_base,  // base addr of B tile in TMEM/SMEM
-            uint32_t c_base,  // base addr of C/D tile in TMEM/SMEM
+            const uint32_t rs1_data_a_base,  // base addr of A tile in TMEM/SMEM
+            const uint32_t rs2_data_b_base,  // base addr of B tile in TMEM/SMEM
+            uint32_t rs3_data_c_base,  		 // base addr of C/D tile in TMEM/SMEM
             uint32_t lda,     // leading dim for A in TMEM (in elements)
             uint32_t ldb,     // leading dim for B in TMEM
             uint32_t ldc,     // leading dim for C/D in TMEM
