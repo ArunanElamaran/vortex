@@ -43,6 +43,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     input   wire                  avs_readdatavalidL [NUM_LOCAL_MEM_BANKS],
 
     // Avalon signals for tensor memory access
+    /* verilator lint_off UNUSEDSIGNAL */
     output  t_tensor_mem_data      avs_writedataT [NUM_TENSOR_MEM_BANKS],
     input   t_tensor_mem_data      avs_readdataT [NUM_TENSOR_MEM_BANKS],
     output  t_tensor_mem_addr      avs_addressT [NUM_TENSOR_MEM_BANKS],
@@ -52,6 +53,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     output  t_tensor_mem_byte_mask avs_byteenableT [NUM_TENSOR_MEM_BANKS],
     output  t_tensor_mem_burst_cnt avs_burstcountT [NUM_TENSOR_MEM_BANKS],
     input   wire                   avs_readdatavalidT [NUM_TENSOR_MEM_BANKS]
+    /* verilator lint_on UNUSEDSIGNAL */
 );
     localparam LMEM_DATA_WIDTH    = $bits(t_local_mem_data);
     localparam LMEM_DATA_SIZE     = LMEM_DATA_WIDTH / 8;
@@ -66,8 +68,10 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     localparam TMEM_DATA_SIZE     = TMEM_DATA_WIDTH / 8;
     localparam TMEM_ADDR_WIDTH    = $bits(t_tensor_mem_addr);
 
+    /* verilator lint_off UNUSEDPARAM */
     localparam TMEM_BYTE_ADDR_WIDTH = TMEM_ADDR_WIDTH + $clog2(TMEM_DATA_SIZE);
     localparam TMEM_BURST_CTRW    = $bits(t_tensor_mem_burst_cnt);
+    /* verilator lint_on UNUSEDPARAM */
 
     localparam MEM_PORTS_BITS     = `CLOG2(VX_MEM_PORTS);
     localparam MEM_PORTS_WIDTH    = `UP(MEM_PORTS_BITS);
@@ -729,16 +733,26 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
         .mem_rsp_ready    (mem_rsp_ready),
 
         // AVS bus
-        .avs_writedataL    (avs_writedataL),
-        .avs_readdataL     (avs_readdataL),
-        .avs_addressL      (avs_addressL),
-        .avs_waitrequestL  (avs_waitrequestL),
-        .avs_writeL        (avs_writeL),
-        .avs_readL         (avs_readL),
-        .avs_byteenableL   (avs_byteenableL),
-        .avs_burstcountL   (avs_burstcountL),
-        .avs_readdatavalidL(avs_readdatavalidL)
+        .avs_writedata     (avs_writedataL),
+        .avs_readdata      (avs_readdataL),
+        .avs_address       (avs_addressL),
+        .avs_waitrequest   (avs_waitrequestL),
+        .avs_write         (avs_writeL),
+        .avs_read          (avs_readL),
+        .avs_byteenable    (avs_byteenableL),
+        .avs_burstcount    (avs_burstcountL),
+        .avs_readdatavalid (avs_readdatavalidL)
     );
+
+    // Tensor memory interface - not yet implemented, drive outputs to zero
+    for (genvar i = 0; i < NUM_TENSOR_MEM_BANKS; ++i) begin : g_tmem_dummy
+        assign avs_writedataT[i] = '0;
+        assign avs_addressT[i] = '0;
+        assign avs_writeT[i] = 1'b0;
+        assign avs_readT[i] = 1'b0;
+        assign avs_byteenableT[i] = '0;
+        assign avs_burstcountT[i] = '0;
+    end
 
     // CCI-P Read Request /////////////////////////////////////////////////////
 

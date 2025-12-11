@@ -70,19 +70,31 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // is I/O address
         wire [MEM_ADDRW-1:0] io_addr_start = MEM_ADDRW'(`XLEN'(`IO_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] io_addr_end = MEM_ADDRW'(`XLEN'(`IO_END_ADDR) >> MEM_ASHIFT);
-        assign mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
-        assign mem_req_flags[i][MEM_REQ_FLAG_IO] = (block_addr >= io_addr_start) && (block_addr < io_addr_end);
+        wire is_io = (block_addr >= io_addr_start) && (block_addr < io_addr_end);
     `ifdef LMEM_ENABLE
         // is local memory address
         wire [MEM_ADDRW-1:0] lmem_addr_start = MEM_ADDRW'(`XLEN'(`LMEM_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] lmem_addr_end = MEM_ADDRW'((`XLEN'(`LMEM_BASE_ADDR) + `XLEN'(1 << `LMEM_LOG_SIZE)) >> MEM_ASHIFT);
-        assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
-    `endif
-    `ifdef LMEM_ENABLE
+        wire is_lmem = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
         // is tensor memory address
         wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);
-        assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
+        wire is_tmem = (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
+        
+        // Assign flags - all bits must be assigned to avoid MULTIDRIVEN warnings
+        always_comb begin
+            mem_req_flags[i] = '0;
+            mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
+            mem_req_flags[i][MEM_REQ_FLAG_IO] = is_io;
+            mem_req_flags[i][MEM_REQ_FLAG_LMEM] = is_lmem;
+            mem_req_flags[i][MEM_REQ_FLAG_TMEM] = is_tmem;
+        end
+    `else
+        always_comb begin
+            mem_req_flags[i] = '0;
+            mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
+            mem_req_flags[i][MEM_REQ_FLAG_IO] = is_io;
+        end
     `endif
     end
 

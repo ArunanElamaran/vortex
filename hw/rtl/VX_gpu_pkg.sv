@@ -106,7 +106,7 @@ package VX_gpu_pkg;
     localparam MEM_REQ_FLAG_LMEM  = MEM_REQ_FLAG_LOCAL;                    // 2
     localparam MEM_REQ_FLAG_TMEM  = MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED;    // 2 or 3
 
-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
+    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED + 1); // +1 for TMEM when LMEM enabled
 
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = 32;

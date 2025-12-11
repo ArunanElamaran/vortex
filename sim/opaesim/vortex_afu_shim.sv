@@ -92,22 +92,53 @@ module vortex_afu_shim import local_mem_cfg_pkg::*; import ccip_if_pkg::*; (
 t_if_ccip_Rx cp2af_sRxPort;
 t_if_ccip_Tx af2cp_sTxPort;
 
+// Dummy wires for tensor memory interface (not used in shim)
+/* verilator lint_off UNUSEDSIGNAL */
+t_tensor_mem_data     avs_writedataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+t_tensor_mem_data     avs_readdataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+t_tensor_mem_addr     avs_addressT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+logic                 avs_waitrequestT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+logic                 avs_writeT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+logic                 avs_readT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+t_tensor_mem_byte_mask avs_byteenableT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+t_tensor_mem_burst_cnt avs_burstcountT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+logic                 avs_readdatavalidT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
+/* verilator lint_on UNUSEDSIGNAL */
+
+// Initialize unpacked arrays properly
+for (genvar i = 0; i < `PLATFORM_MEMORY_NUM_BANKS; ++i) begin : g_tmem_dummy
+    assign avs_readdataT_dummy[i] = '0;
+    assign avs_waitrequestT_dummy[i] = 1'b0;
+    assign avs_readdatavalidT_dummy[i] = 1'b0;
+end
+
 vortex_afu #(
-  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
+  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS),
+  .NUM_TENSOR_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
 ) afu (
     .clk(clk),
     .reset(reset),
     .cp2af_sRxPort(cp2af_sRxPort),
     .af2cp_sTxPort(af2cp_sTxPort),
-    .avs_writedata(avs_writedata),
-    .avs_readdata(avs_readdata),
-    .avs_address(avs_address),
-    .avs_waitrequest(avs_waitrequest),
-    .avs_write(avs_write),
-    .avs_read(avs_read),
-    .avs_byteenable(avs_byteenable),
-    .avs_burstcount(avs_burstcount),
-    .avs_readdatavalid(avs_readdatavalid)
+    .avs_writedataL(avs_writedata),
+    .avs_readdataL(avs_readdata),
+    .avs_addressL(avs_address),
+    .avs_waitrequestL(avs_waitrequest),
+    .avs_writeL(avs_write),
+    .avs_readL(avs_read),
+    .avs_byteenableL(avs_byteenable),
+    .avs_burstcountL(avs_burstcount),
+    .avs_readdatavalidL(avs_readdatavalid),
+    // Tensor memory pins - connect to dummy for now
+    .avs_writedataT(avs_writedataT_dummy),
+    .avs_readdataT(avs_readdataT_dummy),
+    .avs_addressT(avs_addressT_dummy),
+    .avs_waitrequestT(avs_waitrequestT_dummy),
+    .avs_writeT(avs_writeT_dummy),
+    .avs_readT(avs_readT_dummy),
+    .avs_byteenableT(avs_byteenableT_dummy),
+    .avs_burstcountT(avs_burstcountT_dummy),
+    .avs_readdatavalidT(avs_readdatavalidT_dummy)
 );
 
 t_if_ccip_c0_RxHdr c0_RxHdr;
