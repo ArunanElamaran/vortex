@@ -21,6 +21,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
 `ifdef PERF_ENABLE
     output lmem_perf_t      lmem_perf,
+    output tmem_perf_t      tmem_perf,
     output coalescer_perf_t coalescer_perf,
 `endif
 
@@ -39,6 +40,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     `STATIC_ASSERT(0 == (`LMEM_BASE_ADDR % (1 << `LMEM_LOG_SIZE)), ("invalid parameter"))
 
     localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
+
+    `STATIC_ASSERT(`IS_DIVISBLE((1 << `TMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
+    `STATIC_ASSERT(0 == (`TMEM_BASE_ADDR % (1 << `TMEM_LOG_SIZE)), ("invalid parameter"))
+
+    localparam TMEM_ADDR_WIDTH = `TMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
 
     VX_lsu_mem_if #(
         .NUM_LANES (`NUM_LSU_LANES),
@@ -122,10 +128,29 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .mem_bus_if (lmem_adapt_if)
     );
 
+    VX_tensor_mem #(
+        .INSTANCE_ID(`SFORMATF(("%s-tmem", INSTANCE_ID))),
+        .SIZE       (1 << `TMEM_LOG_SIZE),
+        .NUM_REQS   (`NUM_LSU_LANES),
+        .NUM_BANKS  (`TMEM_NUM_BANKS),
+        .WORD_SIZE  (LSU_WORD_SIZE),
+        .ADDR_WIDTH (TMEM_ADDR_WIDTH),
+        .TAG_WIDTH  (TMEM_TAG_WIDTH),
+        .OUT_BUF    (3)
+    ) tensor_mem (
+        .clk        (clk),
+        .reset      (reset),
+    `ifdef PERF_ENABLE
+        .tmem_perf  (tmem_perf),
+    `endif
+        .mem_bus_if (tmem_adapt_if)
+    );
+
 `else
 
 `ifdef PERF_ENABLE
     assign lmem_perf = '0;
+    assign tmem_perf = '0;
 `endif
 
     for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lsu_dcache_if

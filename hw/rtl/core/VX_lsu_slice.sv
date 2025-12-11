@@ -78,6 +78,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         wire [MEM_ADDRW-1:0] lmem_addr_end = MEM_ADDRW'((`XLEN'(`LMEM_BASE_ADDR) + `XLEN'(1 << `LMEM_LOG_SIZE)) >> MEM_ASHIFT);
         assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
     `endif
+    `ifdef LMEM_ENABLE
+        // is tensor memory address
+        wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
+        wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);
+        assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
+    `endif
     end
 
     // schedule memory request

@@ -133,6 +133,7 @@ module VX_core_top import VX_gpu_pkg::*; #(
     assign mem_perf.l2cache = '0;
     assign mem_perf.l3cache = '0;
     assign mem_perf.lmem    = '0;
+    assign mem_perf.tmem    = '0;
     assign mem_perf.mem     = '0;
 `endif
 

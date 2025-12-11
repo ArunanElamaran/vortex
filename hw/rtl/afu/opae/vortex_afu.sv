@@ -20,7 +20,8 @@
 `endif
 
 module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_gpu_pkg::*; #(
-    parameter NUM_LOCAL_MEM_BANKS = 2
+    parameter NUM_LOCAL_MEM_BANKS = 2,
+    parameter NUM_TENSOR_MEM_BANKS = 2
 ) (
     // global signals
     input wire clk,
@@ -31,15 +32,26 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     output  t_if_ccip_Tx  af2cp_sTxPort,
 
     // Avalon signals for local memory access
-    output  t_local_mem_data      avs_writedata [NUM_LOCAL_MEM_BANKS],
-    input   t_local_mem_data      avs_readdata [NUM_LOCAL_MEM_BANKS],
-    output  t_local_mem_addr      avs_address [NUM_LOCAL_MEM_BANKS],
-    input   wire                  avs_waitrequest [NUM_LOCAL_MEM_BANKS],
-    output  wire                  avs_write [NUM_LOCAL_MEM_BANKS],
-    output  wire                  avs_read [NUM_LOCAL_MEM_BANKS],
-    output  t_local_mem_byte_mask avs_byteenable [NUM_LOCAL_MEM_BANKS],
-    output  t_local_mem_burst_cnt avs_burstcount [NUM_LOCAL_MEM_BANKS],
-    input   wire                  avs_readdatavalid [NUM_LOCAL_MEM_BANKS]
+    output  t_local_mem_data      avs_writedataL [NUM_LOCAL_MEM_BANKS],
+    input   t_local_mem_data      avs_readdataL [NUM_LOCAL_MEM_BANKS],
+    output  t_local_mem_addr      avs_addressL [NUM_LOCAL_MEM_BANKS],
+    input   wire                  avs_waitrequestL [NUM_LOCAL_MEM_BANKS],
+    output  wire                  avs_writeL [NUM_LOCAL_MEM_BANKS],
+    output  wire                  avs_readL [NUM_LOCAL_MEM_BANKS],
+    output  t_local_mem_byte_mask avs_byteenableL [NUM_LOCAL_MEM_BANKS],
+    output  t_local_mem_burst_cnt avs_burstcountL [NUM_LOCAL_MEM_BANKS],
+    input   wire                  avs_readdatavalidL [NUM_LOCAL_MEM_BANKS],
+
+    // Avalon signals for tensor memory access
+    output  t_tensor_mem_data      avs_writedataT [NUM_TENSOR_MEM_BANKS],
+    input   t_tensor_mem_data      avs_readdataT [NUM_TENSOR_MEM_BANKS],
+    output  t_tensor_mem_addr      avs_addressT [NUM_TENSOR_MEM_BANKS],
+    input   wire                   avs_waitrequestT [NUM_TENSOR_MEM_BANKS],
+    output  wire                   avs_writeT [NUM_TENSOR_MEM_BANKS],
+    output  wire                   avs_readT [NUM_TENSOR_MEM_BANKS],
+    output  t_tensor_mem_byte_mask avs_byteenableT [NUM_TENSOR_MEM_BANKS],
+    output  t_tensor_mem_burst_cnt avs_burstcountT [NUM_TENSOR_MEM_BANKS],
+    input   wire                   avs_readdatavalidT [NUM_TENSOR_MEM_BANKS]
 );
     localparam LMEM_DATA_WIDTH    = $bits(t_local_mem_data);
     localparam LMEM_DATA_SIZE     = LMEM_DATA_WIDTH / 8;
@@ -49,6 +61,13 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     localparam CCI_VX_ADDR_WIDTH  = VX_MEM_ADDR_WIDTH + ($clog2(VX_MEM_DATA_WIDTH) - $clog2(LMEM_DATA_WIDTH));
 
     localparam LMEM_BURST_CTRW    = $bits(t_local_mem_burst_cnt);
+
+    localparam TMEM_DATA_WIDTH    = $bits(t_tensor_mem_data);
+    localparam TMEM_DATA_SIZE     = TMEM_DATA_WIDTH / 8;
+    localparam TMEM_ADDR_WIDTH    = $bits(t_tensor_mem_addr);
+
+    localparam TMEM_BYTE_ADDR_WIDTH = TMEM_ADDR_WIDTH + $clog2(TMEM_DATA_SIZE);
+    localparam TMEM_BURST_CTRW    = $bits(t_tensor_mem_burst_cnt);
 
     localparam MEM_PORTS_BITS     = `CLOG2(VX_MEM_PORTS);
     localparam MEM_PORTS_WIDTH    = `UP(MEM_PORTS_BITS);
@@ -710,15 +729,15 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
         .mem_rsp_ready    (mem_rsp_ready),
 
         // AVS bus
-        .avs_writedata    (avs_writedata),
-        .avs_readdata     (avs_readdata),
-        .avs_address      (avs_address),
-        .avs_waitrequest  (avs_waitrequest),
-        .avs_write        (avs_write),
-        .avs_read         (avs_read),
-        .avs_byteenable   (avs_byteenable),
-        .avs_burstcount   (avs_burstcount),
-        .avs_readdatavalid(avs_readdatavalid)
+        .avs_writedataL    (avs_writedataL),
+        .avs_readdataL     (avs_readdataL),
+        .avs_addressL      (avs_addressL),
+        .avs_waitrequestL  (avs_waitrequestL),
+        .avs_writeL        (avs_writeL),
+        .avs_readL         (avs_readL),
+        .avs_byteenableL   (avs_byteenableL),
+        .avs_burstcountL   (avs_burstcountL),
+        .avs_readdatavalidL(avs_readdatavalidL)
     );
 
     // CCI-P Read Request /////////////////////////////////////////////////////
@@ -1093,7 +1112,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     wire state_changed   = (state != state_prev);
     wire vx_mem_req_fire = vx_mem_req_valid[0] && vx_mem_req_ready[0];
     wire vx_mem_rsp_fire = vx_mem_rsp_valid[0] && vx_mem_rsp_ready[0];
-    wire avs_req_fire    = (avs_write[0] || avs_read[0]) && ~avs_waitrequest[0];
+    wire avs_req_fire    = (avs_writeL[0] || avs_readL[0]) && ~avs_waitrequestL[0];
     wire reset_negedge;
     `NEG_EDGE (reset_negedge, reset);
     `SCOPE_TAP (0, 0, {
@@ -1103,9 +1122,9 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
             vx_mem_req_ready[0],
             vx_mem_rsp_valid[0],
             vx_mem_rsp_ready[0],
-            avs_read[0],
-            avs_write[0],
-            avs_waitrequest[0],
+            avs_readL[0],
+            avs_writeL[0],
+            avs_waitrequestL[0],
             cp2af_sRxPort.c0.rspValid,
             cp2af_sRxPort.c1.rspValid,
             af2cp_sTxPort.c0.valid,
@@ -1115,7 +1134,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
         },{
             state_changed,
             vx_dcr_wr_valid, // ack-free
-            avs_readdatavalid[0], // ack-free
+            avs_readdatavalidL[0], // ack-free
             cp2af_sRxPort.c0.mmioRdValid, // ack-free
             cp2af_sRxPort.c0.mmioWrValid, // ack-free
             af2cp_sTxPort.c2.mmioRdValid, // ack-free
@@ -1143,9 +1162,9 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
             af2cp_sTxPort.c0.hdr.address,
             af2cp_sTxPort.c0.hdr.mdata,
             af2cp_sTxPort.c1.hdr.address,
-            avs_address[0],
-            avs_byteenable[0],
-            avs_burstcount[0],
+            avs_addressL[0],
+            avs_byteenableL[0],
+            avs_burstcountL[0],
             cci_mem_rd_req_ctr,
             cci_mem_wr_req_ctr,
             cci_rd_req_ctr,
@@ -1163,14 +1182,14 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
 `ifdef DBG_TRACE_AFU
     always @(posedge clk) begin
         for (integer i = 0; i < NUM_LOCAL_MEM_BANKS; ++i) begin
-            if (avs_write[i] && ~avs_waitrequest[i]) begin
-                `TRACE(2, ("%t: AVS Wr Req[%0d]: addr=0x%0h, byteen=0x%0h, burst=0x%0h, data=0x%h\n", $time, i, `TO_FULL_ADDR(avs_address[i]), avs_byteenable[i], avs_burstcount[i], avs_writedata[i]))
+            if (avs_writeL[i] && ~avs_waitrequestL[i]) begin
+                `TRACE(2, ("%t: AVS Wr Req[%0d]: addr=0x%0h, byteen=0x%0h, burst=0x%0h, data=0x%h\n", $time, i, `TO_FULL_ADDR(avs_addressL[i]), avs_byteenableL[i], avs_burstcountL[i], avs_writedataL[i]))
             end
-            if (avs_read[i] && ~avs_waitrequest[i]) begin
-                `TRACE(2, ("%t: AVS Rd Req[%0d]: addr=0x%0h, byteen=0x%0h,  burst=0x%0h\n", $time, i, `TO_FULL_ADDR(avs_address[i]), avs_byteenable[i], avs_burstcount[i]))
+            if (avs_readL[i] && ~avs_waitrequestL[i]) begin
+                `TRACE(2, ("%t: AVS Rd Req[%0d]: addr=0x%0h, byteen=0x%0h,  burst=0x%0h\n", $time, i, `TO_FULL_ADDR(avs_addressL[i]), avs_byteenableL[i], avs_burstcountL[i]))
             end
-            if (avs_readdatavalid[i]) begin
-                `TRACE(2, ("%t: AVS Rd Rsp[%0d]: data=0x%h\n", $time, i, avs_readdata[i]))
+            if (avs_readdatavalidL[i]) begin
+                `TRACE(2, ("%t: AVS Rd Rsp[%0d]: data=0x%h\n", $time, i, avs_readdataL[i]))
             end
         end
     end
