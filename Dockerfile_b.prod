@@ -32,8 +32,15 @@ WORKDIR /tmp/vortex-setup
 RUN git submodule update --init --recursive || true
 RUN ./ci/install_dependencies.sh
 RUN mkdir -p build && cd build && ../configure
-RUN cd build && ./ci/toolchain_install.sh --all
+# Install toolchain - verilator will be reinstalled at runtime if needed for correct arch
+RUN cd build && ./ci/toolchain_install.sh --all || true
 RUN echo "source /tmp/vortex-setup/build/ci/toolchain_env.sh" >> ~/.bashrc
+# Create a script to fix toolchain architecture issues at runtime
+RUN echo '#!/bin/bash' > /usr/local/bin/fix-toolchain.sh && \
+    echo 'cd /tmp/vortex-setup/build 2>/dev/null || cd /vortex/build' >> /usr/local/bin/fix-toolchain.sh && \
+    echo 'source ./ci/toolchain_env.sh 2>/dev/null || source /tmp/vortex-setup/build/ci/toolchain_env.sh' >> /usr/local/bin/fix-toolchain.sh && \
+    echo './ci/toolchain_install.sh --verilator' >> /usr/local/bin/fix-toolchain.sh && \
+    chmod +x /usr/local/bin/fix-toolchain.sh
 
 # Clean up working dir back to /vortex (which will be volume-mounted later)
 WORKDIR /vortex
