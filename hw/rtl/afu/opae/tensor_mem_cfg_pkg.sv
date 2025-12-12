@@ -30,49 +30,40 @@
 
 `include "VX_define.vh"
 
-`ifndef PLATFORM_PARAM_LOCAL_MEMORY_ADDR_WIDTH
-`define PLATFORM_PARAM_LOCAL_MEMORY_ADDR_WIDTH ((`PLATFORM_MEMORY_ADDR_WIDTH - $clog2(`PLATFORM_MEMORY_NUM_BANKS)) - $clog2(`PLATFORM_MEMORY_DATA_SIZE))
+`ifndef PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH
+`define PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH ((`PLATFORM_MEMORY_ADDR_WIDTH - $clog2(`PLATFORM_MEMORY_NUM_BANKS)) - $clog2(`PLATFORM_MEMORY_DATA_SIZE))
 `endif
 
-`ifndef PLATFORM_PARAM_LOCAL_MEMORY_DATA_WIDTH
-`define PLATFORM_PARAM_LOCAL_MEMORY_DATA_WIDTH (`PLATFORM_MEMORY_DATA_SIZE * 8)
+`ifndef PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH
+`define PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH (`PLATFORM_MEMORY_DATA_SIZE * 8)
 `endif
 
-`ifndef PLATFORM_PARAM_LOCAL_MEMORY_BURST_CNT_WIDTH
-`define PLATFORM_PARAM_LOCAL_MEMORY_BURST_CNT_WIDTH 4
+`ifndef PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH
+`define PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH 4
 `endif
 
-package local_mem_cfg_pkg;
+package tensor_mem_cfg_pkg;
 
-    parameter LOCAL_MEM_VERSION_NUMBER = 1;
+    parameter TENSOR_MEM_VERSION_NUMBER = 1;
 
-    parameter LOCAL_MEM_ADDR_WIDTH = `PLATFORM_PARAM_LOCAL_MEMORY_ADDR_WIDTH;
-    parameter LOCAL_MEM_DATA_WIDTH = `PLATFORM_PARAM_LOCAL_MEMORY_DATA_WIDTH;
+    parameter TENSOR_MEM_ADDR_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH;
+    parameter TENSOR_MEM_DATA_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH;
 
-    parameter LOCAL_MEM_BURST_CNT_WIDTH = `PLATFORM_PARAM_LOCAL_MEMORY_BURST_CNT_WIDTH;
+    parameter TENSOR_MEM_BURST_CNT_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH;
 
     // Number of bytes in a data line
-    parameter LOCAL_MEM_DATA_N_BYTES = LOCAL_MEM_DATA_WIDTH / 8;
+    parameter TENSOR_MEM_DATA_N_BYTES = TENSOR_MEM_DATA_WIDTH / 8;
 
 
     // Base types
     // --------------------------------------------------------------------
 
-    typedef logic [LOCAL_MEM_ADDR_WIDTH-1:0] t_local_mem_addr;
-    typedef logic [LOCAL_MEM_DATA_WIDTH-1:0] t_local_mem_data;
+    typedef logic [TENSOR_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
+    typedef logic [TENSOR_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
 
-    typedef logic [LOCAL_MEM_BURST_CNT_WIDTH-1:0] t_local_mem_burst_cnt;
-
-    // Byte-level mask of a data line
-    typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_local_mem_byte_mask;
-
-    // Tensor memory types (using same parameters as local memory)
-    typedef logic [LOCAL_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
-    typedef logic [LOCAL_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
-
-    typedef logic [LOCAL_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
+    typedef logic [TENSOR_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
 
     // Byte-level mask of a data line
-    typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
+    typedef logic [TENSOR_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
 
-endpackage // local_mem_cfg_pkg
+endpackage // tensor_mem_cfg_pkg

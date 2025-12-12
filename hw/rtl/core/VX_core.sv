@@ -67,12 +67,14 @@ module VX_core import VX_gpu_pkg::*; #(
 
 `ifdef PERF_ENABLE
     lmem_perf_t lmem_perf;
+    tmem_perf_t tmem_perf;
     coalescer_perf_t coalescer_perf;
     pipeline_perf_t pipeline_perf;
     sysmem_perf_t sysmem_perf_tmp;
     always @(*) begin
         sysmem_perf_tmp = sysmem_perf;
         sysmem_perf_tmp.lmem = lmem_perf;
+        sysmem_perf_tmp.tmem = tmem_perf;
         sysmem_perf_tmp.coalescer = coalescer_perf;
     end
 `endif
@@ -205,6 +207,7 @@ module VX_core import VX_gpu_pkg::*; #(
         .reset         (reset),
     `ifdef PERF_ENABLE
         .lmem_perf     (lmem_perf),
+        .tmem_perf     (tmem_perf),
         .coalescer_perf(coalescer_perf),
     `endif
         .lsu_mem_if    (lsu_mem_if),

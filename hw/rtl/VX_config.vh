@@ -232,11 +232,11 @@
 `endif
 
 `ifndef TMEM_BASE_ADDR
-`define TMEM_BASE_ADDR  (LMEM_BASE_ADDR + (1 << LMEM_LOG_SIZE))
+`define TMEM_BASE_ADDR  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
 `endif
 
-`define TMEM_SIZE       (1 << TMEM_LOG_SIZE)
-`define TMEM_END_ADDR   (TMEM_BASE_ADDR + TMEM_SIZE)
+`define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
+`define TMEM_END_ADDR   (`TMEM_BASE_ADDR + `TMEM_SIZE)
 
 `ifndef IO_COUT_ADDR
 `define IO_COUT_ADDR    `IO_BASE_ADDR
@@ -689,12 +689,7 @@
 `endif
 
 // TMEM Configurable Knobs ////////////////////////////////////////////////////
-
-`ifndef TMEM_DISABLE
-`define TMEM_ENABLE
-`endif
-
-`ifndef TMEM_ENABLE
+`ifndef LMEM_ENABLE
     `define TMEM_NUM_BANKS 1
 `endif
 
@@ -867,6 +862,12 @@
     `define LMEM_ENABLED 0
 `endif
 
+`ifdef LMEM_ENABLE
+    `define TMEM_ENABLED 1
+`else
+    `define TMEM_ENABLED 0
+`endif
+
 `ifdef GBAR_ENABLE
     `define GBAR_ENABLED 1
 `else
@@ -952,6 +953,7 @@
 `define ISA_EXT_LMEM        4
 `define ISA_EXT_ZICOND      5
 `define ISA_EXT_TCU         6
+`define ISA_EXT_TMEM        7
 
 `define MISA_EXT  (`ICACHE_ENABLED  << `ISA_EXT_ICACHE) \
                 | (`DCACHE_ENABLED  << `ISA_EXT_DCACHE) \
@@ -960,6 +962,7 @@
                 | (`LMEM_ENABLED    << `ISA_EXT_LMEM) \
                 | (`EXT_ZICOND_ENABLED << `ISA_EXT_ZICOND) \
                 | (`EXT_TCU_ENABLED << `ISA_EXT_TCU) \
+                | (`TMEM_ENABLED    << `ISA_EXT_TMEM) \
 
 `define MISA_STD  (`EXT_A_ENABLED <<  0) /* A - Atomic Instructions extension */ \
                 | (0 <<  1) /* B - Tentatively reserved for Bit operations extension */ \
