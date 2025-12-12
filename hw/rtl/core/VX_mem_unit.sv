@@ -133,7 +133,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     assign tmem_adapter_if[0].req_data.flags = lmem_arb_if[0].req_data.flags;
     assign tmem_adapter_if[0].req_data.tag = lmem_arb_if[0].req_data.tag;
 
-    assign lmem_arb_if[0].req_ready = (has_lmem_req ? lmem_adapter_if[0].req_ready : 1'b1) && 
+    assign lmem_arb_if[0].req_ready = (has_lmem_req ? lmem_adapter_if[0].req_ready : 1'b1) &&
                                       (has_tmem_req ? tmem_adapter_if[0].req_ready : 1'b1);
 
     // Response arbitration - prioritize local memory, then tensor memory

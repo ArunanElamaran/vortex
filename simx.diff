@@ -259,7 +259,7 @@ index b1f71a7..ad3a6ed 100644
 @@ -688,21 +688,6 @@
  `define LMEM_NUM_BANKS `NUM_LSU_LANES
  `endif
- 
+
 -// TMEM Configurable Knobs ////////////////////////////////////////////////////
 -
 -`ifndef TMEM_DISABLE
@@ -276,7 +276,7 @@ index b1f71a7..ad3a6ed 100644
 -`endif
 -
  // L2cache Configurable Knobs /////////////////////////////////////////////////
- 
+
  // Cache Size
 diff --git a/kernel/include/vx_tensor.h b/kernel/include/vx_tensor.h
 index a16a6ca..e888310 100644
@@ -285,7 +285,7 @@ index a16a6ca..e888310 100644
 @@ -405,170 +405,5 @@ public:
    }
  };
- 
+
 -///////////////////////////////////////////////////////////////////////////////
 -// UMMA - Unified MMA with Tensor Memory
 -// Registers contain addresses pointing to data in tensor memory
@@ -460,7 +460,7 @@ index 591a367..99136ae 100644
 @@ -173,78 +173,5 @@ public:
    static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
  };
- 
+
 -template <uint32_t NT,      // number of threads per warp
 -          typename It = fp32, // input type (A,B)
 -          typename Ot = fp32, // output type (C,D)
@@ -548,7 +548,7 @@ index c769e09..1eca622 100644
 -SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/tensor_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
 +SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
  SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/types.cpp
- 
+
  # Add V extension sources
 diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
 index d52569d..5579190 100644
@@ -557,7 +557,7 @@ index d52569d..5579190 100644
 @@ -79,16 +79,6 @@ Core::Core(const SimContext& ctx,
      false
    });
- 
+
 -  // create tensor memory
 -  snprintf(sname, 100, "%s-tmem", this->name().c_str());
 -  tensor_mem_ = TensorMem::Create(sname, TensorMem::Config{
@@ -574,7 +574,7 @@ index d52569d..5579190 100644
 @@ -106,27 +96,10 @@ Core::Core(const SimContext& ctx,
    snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
    auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
- 
+
 -  // create tmem arbiter
 -  snprintf(sname, 100, "%s-tmem_arb", this->name().c_str());
 -  auto tmem_arb = LsuArbiter::Create(
@@ -587,7 +587,7 @@ index d52569d..5579190 100644
    // create lmem adapter
    snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
    auto lsu_lmem_adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
- 
+
 -  // create tmem adapter
 -  snprintf(sname, 100, "%s-lsu_tmem_adapter", this->name().c_str());
 -  auto lsu_tmem_adapter = LsuMemAdapter::Create(
@@ -602,7 +602,7 @@ index d52569d..5579190 100644
 @@ -136,32 +109,16 @@ Core::Core(const SimContext& ctx,
      lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
    }
- 
+
 -  // connect tmem switch
 -  for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
 -    lmem_switch_.at(b)->ReqTmem.bind(&tmem_arb->ReqIn.at(b));
@@ -612,7 +612,7 @@ index d52569d..5579190 100644
    // connect lmem arbiter
    lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
    lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
- 
+
 -  // connect tmem arbiter
 -  tmem_arb->ReqOut.at(0).bind(&lsu_tmem_adapter->ReqIn);
 -  lsu_tmem_adapter->RspIn.bind(&tmem_arb->RspOut.at(0));
@@ -622,7 +622,7 @@ index d52569d..5579190 100644
      lsu_lmem_adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(c));
      local_mem_->Outputs.at(c).bind(&lsu_lmem_adapter->RspOut.at(c));
    }
- 
+
 -  // connect tmem adapter
 -  for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
 -    lsu_tmem_adapter->ReqOut.at(c).bind(&tensor_mem_->Inputs.at(c));
@@ -677,9 +677,9 @@ index 0b7633e..658a750 100644
  #include "processor_impl.h"
  #include "local_mem.h"
 -#include "tensor_mem.h"
- 
+
  using namespace vortex;
- 
+
 diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
 index 557381c..6155027 100644
 --- a/sim/simx/execute.cpp
@@ -706,40 +706,40 @@ index 00ea555..c1f2b2e 100644
 +++ b/sim/simx/tensor_mem.cpp
 @@ -10,17 +10,13 @@ class TensorMem::Impl {
  protected:
- 	TensorMem* simobject_;
- 	Config    config_;
+	TensorMem* simobject_;
+	Config    config_;
 -	RAM       ram_;
 +	RAM       ram_; // TODO: is RAM the correct MemDevice here?
- 	uint32_t 	line_bits_;
- 	MemCrossBar::Ptr mem_xbar_;
- 	mutable PerfStats perf_stats_;
- 
- 	uint64_t to_local_addr(uint64_t addr) {
+	uint32_t 	line_bits_;
+	MemCrossBar::Ptr mem_xbar_;
+	mutable PerfStats perf_stats_;
+
+	uint64_t to_local_addr(uint64_t addr) {
 -		// Convert global TMEM address to local byte offset within the RAM
 -		// Note: addr is expected to be in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
 -		uint64_t local = addr - TMEM_BASE_ADDR;
 -		// Ensure the local address is within capacity bounds
 -		return local & (config_.capacity - 1);  // Assumes capacity is power of 2
 +		return bit_getw(addr, 0, line_bits_-1);
- 	}
- 
+	}
+
  public:
 @@ -55,13 +51,13 @@ public:
- 
- 	void read(void* data, uint64_t addr, uint32_t size) {
- 		auto l_addr = to_local_addr(addr);
+
+	void read(void* data, uint64_t addr, uint32_t size) {
+		auto l_addr = to_local_addr(addr);
 -		DPH(3, "Tensor Mem Read: addr=0x" << std::hex << l_addr << std::dec << std::endl);
 +		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
- 		ram_.read(data, l_addr, size);
- 	}
- 
- 	void write(const void* data, uint64_t addr, uint32_t size) {
- 		auto l_addr = to_local_addr(addr);
+		ram_.read(data, l_addr, size);
+	}
+
+	void write(const void* data, uint64_t addr, uint32_t size) {
+		auto l_addr = to_local_addr(addr);
 -		DPH(3, "Tensor Mem Write: addr=0x" << std::hex << l_addr << std::dec << std::endl);
 +		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
- 		ram_.write(data, l_addr, size);
- 	}
- 
+		ram_.write(data, l_addr, size);
+	}
+
 diff --git a/sim/simx/tensor_unit.cpp b/sim/simx/tensor_unit.cpp
 index b3397de..e6cf4a3 100644
 --- a/sim/simx/tensor_unit.cpp
@@ -749,20 +749,20 @@ index b3397de..e6cf4a3 100644
  #include <rvfloats.h>
  #include "core.h"
 -#include "tensor_mem.h"
- 
+
  using namespace vortex;
- 
+
  namespace vt = vortex::tensor;
  using cfg = vt::wmma_config_t<NUM_THREADS>;
 -// UMMA config for fp16 input, fp32 output
 -using umma_cfg_fp16_fp32 = vt::umma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
- 
+
  inline uint64_t nan_box(uint32_t value) {
    return value | 0xffffffff00000000;
 @@ -164,119 +161,6 @@ struct FEDP<vt::uint4, vt::int32>{
- 
+
  using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
- 
+
 -// Get type size in bytes from format ID
 -static uint32_t get_type_bytes(uint32_t fmt) {
 -  switch (fmt) {
@@ -892,7 +892,7 @@ index b3397de..e6cf4a3 100644
 @@ -415,70 +296,6 @@ public:
      }
    }
- 
+
 -  // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
 -  // Registers contain addresses pointing to data in tensor memory
 -  // Unlike WMMA (which processes one micro-tile per instruction), UMMA processes
@@ -994,9 +994,9 @@ index 8a63420..87cf8f6 100644
 --- a/sim/simx/tensor_unit.h
 +++ b/sim/simx/tensor_unit.h
 @@ -63,22 +63,6 @@ public:
- 					  std::vector<reg_data_t>& rd_data,
- 					  ExeTraceData* trace_data);
- 
+					  std::vector<reg_data_t>& rd_data,
+					  ExeTraceData* trace_data);
+
 -	// UMMA: Registers contain addresses to tensor memory, not actual data
 -	// rs1_data: addresses for matrix A tiles in tensor memory
 -	// rs2_data: addresses for matrix B tiles in tensor memory
@@ -1013,8 +1013,8 @@ index 8a63420..87cf8f6 100644
 -					  std::vector<reg_data_t>& rd_data,
 -					  ExeTraceData* trace_data);
 -
- 	const PerfStats& perf_stats() const;
- 
+	const PerfStats& perf_stats() const;
+
  private:
 diff --git a/sim/simx/types.cpp b/sim/simx/types.cpp
 index b6c500d..56bf60c 100644
@@ -1044,10 +1044,10 @@ index b6c500d..56bf60c 100644
      DT(4, this->name() << "-dc-rsp: " << out_rsp);
 @@ -65,21 +57,14 @@ void LocalMemSwitch::tick() {
      out_dc_req.uuid  = in_req.uuid;
- 
+
      LsuReq out_lmem_req(out_dc_req);
 -    LsuReq out_tmem_req(out_dc_req);
- 
+
      for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
        if (in_req.mask.test(i)) {
          auto type = get_addr_type(in_req.addrs.at(i));
@@ -1082,12 +1082,12 @@ index 6c5ab35..e2ca691 100644
 --- a/sim/simx/types.h
 +++ b/sim/simx/types.h
 @@ -643,7 +643,6 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
- 
+
  enum class TcuType {
    WMMA,
 -  UMMA,
  };
- 
+
  struct IntrTcuArgs {
 @@ -656,7 +655,6 @@ struct IntrTcuArgs {
  inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
@@ -1110,13 +1110,13 @@ index 6c5ab35..e2ca691 100644
 @@ -1590,12 +1587,11 @@ public:
    SimPort<LsuReq> ReqLmem;
    SimPort<LsuRsp> RspLmem;
- 
+
 -  SimPort<LsuReq> ReqTmem;
 -  SimPort<LsuRsp> RspTmem;
 -
    SimPort<LsuReq> ReqDC;
    SimPort<LsuRsp> RspDC;
- 
+
 +  // TODO: Add ReqTmem, RspTmem ports for TCU local memory access
 +
    LocalMemSwitch(
@@ -1221,7 +1221,7 @@ index b859061..0000000
 -
 -  // Calculate unique tensor memory addresses for this block's tiles
 -  uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
--  
+-
 -  // Layout in tensor memory:
 -  // - A tiles: starts at TMEM_BASE_ADDR
 -  // - B tiles: after A tiles
