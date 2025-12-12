@@ -1,0 +1,2554 @@
+diff --git a/docs/umma_implementation.md b/docs/umma_implementation.md
+new file mode 100644
+index 0000000..db81591
+--- /dev/null
++++ b/docs/umma_implementation.md
+@@ -0,0 +1,248 @@
++# UMMA (Unified Matrix Multiply-Accumulate) Implementation
++
++## Overview
++
++UMMA is a tensor unit instruction that performs matrix multiplication and accumulation using **tensor memory (TMEM)** instead of register files. Unlike WMMA (which uses register-packed data), UMMA operates on contiguous memory regions in TMEM, simplifying the programming model while leveraging specialized tensor memory.
++
++## Architecture
++
++```
++┌─────────────────────────────────────────────────────────────┐
++│                        Kernel Code                          │
++│  ctx::mma_sync(tmemC, tmemA, tmemB, tmemC)                 │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│                    UMMA Instruction                         │
++│  Registers contain TMEM addresses: a0=A, a1=B, a2=C        │
++│  Format encoded in instruction: fmt_s (input), fmt_d (out) │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│               Tensor Unit (tensor_unit.cpp)                 │
++│  1. Read tiles from TMEM                                    │
++│  2. Compute D = C + A × B                                   │
++│  3. Write result back to TMEM                               │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│               Tensor Memory (tensor_mem.cpp)                │
++│  Per-core scratchpad memory for tensor operations           │
++│  Direct read/write access (no cache hierarchy)              │
++└─────────────────────────────────────────────────────────────┘
++```
++
++## Tile Dimensions
++
++The UMMA tile dimensions are derived from the base configuration and input type:
++
++| Parameter | Formula | Example (fp16→fp32) |
++|-----------|---------|---------------------|
++| `tileM` | `xtileM` | 8 |
++| `tileN` | `xtileN` | 4 |
++| `tileK` | `xtileK × i_ratio` | 4 × 2 = 8 |
++
++Where:
++- `xtileM`, `xtileN`, `xtileK` are base tile dimensions (8, 4, 4 for 4 threads)
++- `i_ratio = 4 / sizeof(input_type)` (e.g., 2 for fp16, 4 for int8)
++
++## Memory Layout
++
++All tiles are stored in **row-major** order in tensor memory:
++
++```
++Tensor Memory Layout:
++┌────────────────────────────────────────┐
++│ A tile: tileM × tileK elements         │
++│ [a00, a01, ..., a0K, a10, a11, ...]   │
++├────────────────────────────────────────┤
++│ B tile: tileK × tileN elements         │
++│ [b00, b01, ..., b0N, b10, b11, ...]   │
++├────────────────────────────────────────┤
++│ C tile: tileM × tileN elements         │
++│ [c00, c01, ..., c0N, c10, c11, ...]   │
++└────────────────────────────────────────┘
++```
++
++## Implementation Details
++
++### 1. Instruction Decoding (`decode.cpp`)
++
++The UMMA instruction is encoded as:
++```
++R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
++- opcode = RISCV_CUSTOM0 (0x0b)
++- funct3 = 1 (distinguishes from WMMA which uses funct3=0)
++- funct7 = 2
++- rd = output format ID (fmt_d)
++- rs1 = input format ID (fmt_s)
++```
++
++### 2. Execution Flow (`execute.cpp` → `tensor_unit.cpp`)
++
++```cpp
++case TcuType::UMMA: {
++    tensor_unit_->umma(wid, fmt_s, fmt_d, step_m, step_n,
++                       rs1_data, rs2_data, rs3_data, rd_data, trace_data);
++}
++```
++
++### 3. UMMA Function (`tensor_unit.cpp`)
++
++The `umma()` function:
++
++1. **Extract addresses** from registers (thread 0's values):
++   ```cpp
++   uint64_t addr_a = rs1_data[0].u32;  // A tile address in TMEM
++   uint64_t addr_b = rs2_data[0].u32;  // B tile address in TMEM
++   uint64_t addr_c = rs3_data[0].u32;  // C tile address in TMEM
++   ```
++
++2. **Calculate tile dimensions** based on format:
++   ```cpp
++   uint32_t input_bytes = get_type_bytes(fmt_s);
++   uint32_t i_ratio = 4 / input_bytes;
++   uint32_t tileK = xtileK * i_ratio;
++   ```
++
++3. **Dispatch to appropriate executor**:
++   ```cpp
++   auto umma_fn = select_UMMA(fmt_s, fmt_d);
++   umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
++   ```
++
++4. **Return address to ALL threads**:
++   ```cpp
++   for (size_t t = 0; t < rd_data.size(); ++t) {
++       rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++   }
++   ```
++
++### 4. Matrix Computation (`execute_umma<It, Ot>`)
++
++```cpp
++template <typename It, typename Ot>
++static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
++                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
++                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
++    // Read tiles from TMEM
++    tensor_mem->read(a_tile.data(), addr_a, a_bytes);
++    tensor_mem->read(b_tile.data(), addr_b, b_bytes);
++    tensor_mem->read(c_tile.data(), addr_c, c_bytes);
++
++    // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
++    for (uint32_t m = 0; m < tileM; ++m) {
++        for (uint32_t n = 0; n < tileN; ++n) {
++            otype acc = c_tile[m * tileN + n];
++            for (uint32_t k = 0; k < tileK; ++k) {
++                acc = FMA<It, Ot>::eval(a_tile[m * tileK + k],
++                                        b_tile[k * tileN + n], acc);
++            }
++            d_tile[m * tileN + n] = acc;
++        }
++    }
++
++    // Write result back to TMEM
++    tensor_mem->write(d_tile.data(), addr_c, c_bytes);
++}
++```
++
++## Supported Format Combinations
++
++| Input Type (`fmt_s`) | Output Type (`fmt_d`) | `i_ratio` | `tileK` |
++|---------------------|----------------------|-----------|---------|
++| fp16 (id=1) | fp32 (id=0) | 2 | 8 |
++| bf16 (id=2) | fp32 (id=0) | 2 | 8 |
++| tf32 (id=3) | fp32 (id=0) | 1 | 4 |
++| fp16 (id=1) | fp16 (id=1) | 2 | 8 |
++| bf16 (id=2) | bf16 (id=2) | 2 | 8 |
++| int8 (id=9) | int32 (id=8) | 4 | 16 |
++| uint8 (id=10) | int32 (id=8) | 4 | 16 |
++
++## FMA (Fused Multiply-Add) Templates
++
++Each format combination has a specialized FMA template for proper type conversion:
++
++```cpp
++// Example: fp16 → fp32
++template <>
++struct FMA<vt::fp16, vt::fp32> {
++    static float eval(uint16_t a, uint16_t b, float c) {
++        auto xa = rv_htof_s(a, 0, nullptr);  // Convert fp16 to fp32
++        auto xb = rv_htof_s(b, 0, nullptr);
++        auto xab = rv_fmul_s(xa, xb, 0, nullptr);  // Multiply in fp32
++        auto xc = bit_cast<uint32_t>(c);
++        auto xd = rv_fadd_s(xab, xc, 0, nullptr);  // Add accumulator
++        return bit_cast<float>(xd);
++    }
++};
++```
++
++## Tensor Memory Addressing
++
++TMEM uses a simple linear addressing scheme:
++
++```cpp
++uint64_t to_local_addr(uint64_t addr) {
++    uint64_t local = addr - TMEM_BASE_ADDR;
++    return local & (config_.capacity - 1);  // Wrap within capacity
++}
++```
++
++- `TMEM_BASE_ADDR` = 0xC0000000 (3GB mark)
++- Capacity = 64KB per core (configurable via `TMEM_LOG_SIZE`)
++
++## Key Differences: UMMA vs WMMA
++
++| Aspect | WMMA | UMMA |
++|--------|------|------|
++| Data Location | Register file | Tensor memory |
++| Data Layout | Packed in registers (complex) | Contiguous row-major (simple) |
++| Addressing | Register indices | Memory addresses |
++| Steps | Multiple (step_m, step_n) | Single instruction |
++| Memory Access | Via loads/stores | Direct TMEM read/write |
++
++## Critical Implementation Notes
++
++### 1. All Threads Need Return Value
++
++The UMMA instruction returns the output address, and **all threads** must receive this value:
++
++```cpp
++// CRITICAL: Set rd for ALL threads, not just thread 0
++for (size_t t = 0; t < rd_data.size(); ++t) {
++    rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++}
++```
++
++This is because `store_matrix_sync` uses this address, and each thread reads from its own register.
++
++### 2. Per-Core TMEM
++
++Tensor memory is **per-core**, not shared across cores. Each core has its own 64KB TMEM starting at the same base address (0xC0000000). The kernel must use warp-local offsets:
++
++```cpp
++uint32_t warp_id = vx_warp_id();
++uint64_t block_tmem_base = TMEM_BASE_ADDR + warp_id * tile_size;
++```
++
++### 3. Type-Specific tileK
++
++The K dimension varies based on input type due to packing:
++- fp32/tf32: `tileK = 4`
++- fp16/bf16: `tileK = 8`
++- int8/uint8: `tileK = 16`
++
++This is automatically calculated using `i_ratio = 4 / sizeof(input_type)`.
++
++## File References
++
++- **Instruction Decode**: `sim/simx/decode.cpp`
++- **Instruction Execute**: `sim/simx/execute.cpp`
++- **Tensor Unit**: `sim/simx/tensor_unit.cpp`
++- **Tensor Memory**: `sim/simx/tensor_mem.cpp`
++- **Type Definitions**: `sim/common/tensor_cfg.h`
++- **Kernel API**: `kernel/include/vx_tensor.h`
+diff --git a/hw/rtl/VX_config.vh b/hw/rtl/VX_config.vh
+index 730382b..b1f71a7 100644
+--- a/hw/rtl/VX_config.vh
++++ b/hw/rtl/VX_config.vh
+@@ -227,6 +227,17 @@
+ `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+ `endif
+ 
++`ifndef TMEM_LOG_SIZE
++`define TMEM_LOG_SIZE   16  // 64KB tensor memory
++`endif
++
++`ifndef TMEM_BASE_ADDR
++`define TMEM_BASE_ADDR  (LMEM_BASE_ADDR + (1 << LMEM_LOG_SIZE))
++`endif
++
++`define TMEM_SIZE       (1 << TMEM_LOG_SIZE)
++`define TMEM_END_ADDR   (TMEM_BASE_ADDR + TMEM_SIZE)
++
+ `ifndef IO_COUT_ADDR
+ `define IO_COUT_ADDR    `IO_BASE_ADDR
+ `endif
+@@ -677,6 +688,21 @@
+ `define LMEM_NUM_BANKS `NUM_LSU_LANES
+ `endif
+ 
++// TMEM Configurable Knobs ////////////////////////////////////////////////////
++
++`ifndef TMEM_DISABLE
++`define TMEM_ENABLE
++`endif
++
++`ifndef TMEM_ENABLE
++    `define TMEM_NUM_BANKS 1
++`endif
++
++// Number of Banks
++`ifndef TMEM_NUM_BANKS
++`define TMEM_NUM_BANKS `NUM_LSU_LANES
++`endif
++
+ // L2cache Configurable Knobs /////////////////////////////////////////////////
+ 
+ // Cache Size
+diff --git a/kernel/include/vx_tensor.h b/kernel/include/vx_tensor.h
+index e888310..a16a6ca 100644
+--- a/kernel/include/vx_tensor.h
++++ b/kernel/include/vx_tensor.h
+@@ -405,5 +405,170 @@ public:
+   }
+ };
+ 
++///////////////////////////////////////////////////////////////////////////////
++// UMMA - Unified MMA with Tensor Memory
++// Registers contain addresses pointing to data in tensor memory
++///////////////////////////////////////////////////////////////////////////////
++
++template <uint32_t NT, // number of threads per warp
++          typename It, // input type (A,B)
++          typename Ot> // output type (C,D)
++struct umma_context {
++private:
++  using cfg = wmma_config_t<NT, It, Ot>;  // Pass input/output types for correct i_ratio calculation
++
++  enum frag_use_t { matrix_a, matrix_b, accumulator };
++
++public:
++  using input_t  = typename It::dtype;
++  using output_t = typename Ot::dtype;
++
++  static constexpr uint32_t tileM = cfg::tileM;
++  static constexpr uint32_t tileN = cfg::tileN;
++  static constexpr uint32_t tileK = cfg::tileK;  // Already adjusted for input type size in wmma_config_t
++
++  // Fragment that holds an address to tensor memory instead of actual data
++  template <frag_use_t Use>
++  struct fragment_addr_t {
++    static constexpr frag_use_t use = Use;
++    uintptr_t addr;  // Address in tensor memory (32-bit on RV32, 64-bit on RV64)
++  };
++
++  using fragment_a   = fragment_addr_t<matrix_a>;
++  using fragment_b   = fragment_addr_t<matrix_b>;
++  using fragment_acc = fragment_addr_t<accumulator>;
++
++  // Set fragment address to point to tensor memory location
++  template <typename Frag>
++  static __attribute__((always_inline)) void set_fragment_addr(Frag &frag, void* ptr) {
++    frag.addr = reinterpret_cast<uintptr_t>(ptr);
++  }
++
++  // Initialize accumulator in tensor memory to zero
++  // This writes zeros directly to tensor memory at the given address
++  static __attribute__((always_inline)) void fill_fragment(fragment_acc &frag, output_t value) {
++    auto ptr = reinterpret_cast<volatile output_t*>(frag.addr);
++    // Each thread writes its portion
++    uint32_t lane = vx_thread_id();
++    uint32_t elements_per_thread = (tileM * tileN) / NT; // MxN bc this is for C/D accumulator arrays
++    for (uint32_t i = 0; i < elements_per_thread; ++i) {
++      ptr[lane * elements_per_thread + i] = value;
++    }
++  }
++
++  // Load matrix data from global memory into tensor memory
++  // Unlike WMMA which loads into registers with complex thread-to-register mapping,
++  // UMMA loads into tensor memory in simple row-major contiguous format.
++  // The tensor unit reads from tensor memory directly, so we just need the data
++  // laid out contiguously - no special register mapping required.
++  template <mem_layout src_layout = row_major, typename Frag>
++  static __attribute__((always_inline)) void load_matrix_sync(Frag &frag, const void *src, size_t ldm) {
++    auto dst_ptr = reinterpret_cast<volatile input_t*>(frag.addr);
++    auto src_ptr = reinterpret_cast<const input_t*>(src);
++
++    uint32_t lane = vx_thread_id();
++
++    // If loading Matrix A (M x K)
++    if constexpr (Frag::use == matrix_a) {
++      uint32_t total_elements = tileM * tileK;
++      uint32_t elements_per_thread = total_elements / NT;
++
++      for (uint32_t i = 0; i < elements_per_thread; ++i) {
++        uint32_t idx = lane * elements_per_thread + i;
++        uint32_t row = idx / tileK;
++        uint32_t col = idx % tileK;
++        if constexpr (src_layout == row_major) {
++          dst_ptr[idx] = src_ptr[row * ldm + col];
++        } else {
++          dst_ptr[idx] = src_ptr[col * ldm + row];
++        }
++      }
++    } else if constexpr (Frag::use == matrix_b) { // If loading Matrix B (K x N)
++      uint32_t total_elements = tileK * tileN;
++      uint32_t elements_per_thread = total_elements / NT;
++
++      for (uint32_t i = 0; i < elements_per_thread; ++i) {
++        uint32_t idx = lane * elements_per_thread + i;
++        uint32_t row = idx / tileN;
++        uint32_t col = idx % tileN;
++        if constexpr (src_layout == row_major) {
++          dst_ptr[idx] = src_ptr[row * ldm + col];
++        } else {
++          dst_ptr[idx] = src_ptr[col * ldm + row];
++        }
++      }
++    }
++  }
++
++  // Store accumulator from tensor memory to global memory
++  template <mem_layout dst_layout = row_major>
++  static __attribute__((always_inline)) void store_matrix_sync(void *dst, const fragment_acc &frag, size_t ldm) {
++    auto src = reinterpret_cast<const volatile output_t*>(frag.addr);
++    auto dst_ptr = reinterpret_cast<output_t*>(dst);
++
++    uint32_t lane = vx_thread_id();
++    uint32_t total_elements = tileM * tileN;
++    uint32_t elements_per_thread = total_elements / NT;
++
++    for (uint32_t i = 0; i < elements_per_thread; ++i) {
++      uint32_t idx = lane * elements_per_thread + i;
++      uint32_t row = idx / tileN;
++      uint32_t col = idx % tileN;
++      if constexpr (dst_layout == row_major) {
++        dst_ptr[row * ldm + col] = src[idx];
++      } else {
++        dst_ptr[col * ldm + row] = src[idx];
++      }
++    }
++  }
++
++  // UMMA: Matrix multiply-accumulate using tensor memory
++  // All data is in tensor memory, registers only hold addresses
++  static __attribute__((always_inline)) void mma_sync(
++      fragment_acc &fragD,
++      const fragment_a &fragA,
++      const fragment_b &fragB,
++      const fragment_acc &fragC) {
++
++    // Pass addresses in fixed integer registers (Register File): a0=A, a1=B, a2=C
++    register uintptr_t addr_a __asm__("a0") = static_cast<uintptr_t>(fragA.addr);
++    register uintptr_t addr_b __asm__("a1") = static_cast<uintptr_t>(fragB.addr);
++    register uintptr_t addr_c __asm__("a2") = static_cast<uintptr_t>(fragC.addr);
++    register uintptr_t addr_d __asm__("a0");  // Output address (not used, result stays in tensor memory)
++
++    // UMMA instruction encoding:
++    // - opcode = RISCV_CUSTOM0 (0x0b)
++    // - funct3 = 1 (WMMA uses funct3=0)
++    // - funct7 = 2
++    // - rd field = output format ID (Ot::id)
++    // - rs1 field = input format ID (It::id)
++    // - rs2 field = 0 (unused)
++    // - Addresses are in fixed registers a0, a1, a2 by convention (Register file)
++
++    // DEBUG: Use compile-time format IDs as literal values
++    static_assert(Ot::id >= 0 && Ot::id < 32, "Output format ID must fit in 5 bits");
++    static_assert(It::id >= 0 && It::id < 32, "Input format ID must fit in 5 bits");
++
++    // Build instruction word manually to ensure correct encoding
++    // R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
++    constexpr uint32_t opcode = RISCV_CUSTOM0;
++    constexpr uint32_t funct3 = 1;
++    constexpr uint32_t funct7 = 2;
++    constexpr uint32_t rs2_val = 0;
++    constexpr uint32_t insn_word = (funct7 << 25) | (rs2_val << 20) | (It::id << 15) |
++                                   (funct3 << 12) | (Ot::id << 7) | opcode;
++
++    __asm__ volatile (
++      ".word %[insn]"
++      : "=r"(addr_d)
++      : [insn]"i"(insn_word),
++        "r"(addr_a), "r"(addr_b), "r"(addr_c)
++    );
++
++    // Result is written to tensor memory at addr_c location
++    fragD.addr = addr_c;
++  }
++};
++
+ } // namespace tensor
+ } // namespace vortex
+diff --git a/progress_diff.patch b/progress_diff.patch
+new file mode 100644
+index 0000000..b7f9a08
+--- /dev/null
++++ b/progress_diff.patch
+@@ -0,0 +1,313 @@
++diff --git a/sim/simx/core.h b/sim/simx/core.h
++index a8b674d..f6be86f 100644
++--- a/sim/simx/core.h
+++++ b/sim/simx/core.h
++@@ -20,6 +20,7 @@
++ #include "pipeline.h"
++ #include "cache_sim.h"
++ #include "local_mem.h"
+++#include "tensor_mem.h"
++ #include "ibuffer.h"
++ #include "scoreboard.h"
++ 
++@@ -147,6 +148,10 @@ public:
++     return local_mem_;
++   }
++ 
+++  const TensorMem::Ptr& tensor_mem() const {
+++    return tensor_mem_;
+++  }
+++
++   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
++     return mem_coalescers_.at(idx);
++   }
++@@ -208,6 +213,7 @@ private:
++   std::vector<Dispatcher::Ptr> dispatchers_;
++   std::vector<FuncUnit::Ptr> func_units_;
++   LocalMem::Ptr local_mem_;
+++  TensorMem::Ptr tensor_mem_;
++   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
++   std::vector<MemCoalescer::Ptr> mem_coalescers_;
++ 
++diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
++index 3eb62f9..658a750 100644
++--- a/sim/simx/emulator.cpp
+++++ b/sim/simx/emulator.cpp
++@@ -313,6 +313,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
++   auto type = get_addr_type(addr);
++   if (type == AddrType::Shared) {
++     core_->local_mem()->read(data, addr, size);
+++  } else if (type == AddrType::Tensor) {
+++    core_->tensor_mem()->read(data, addr, size);
++   } else {
++     try
++     {
++@@ -331,6 +333,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
++   auto type = get_addr_type(addr);
++   if (type == AddrType::Shared) {
++     core_->local_mem()->read(data, addr, size);
+++  } else if (type == AddrType::Tensor) {
+++    core_->tensor_mem()->read(data, addr, size);
++   } else {
++     mmu_.read(data, addr, size, 0);
++   }
++@@ -348,6 +352,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
++   } else {
++     if (type == AddrType::Shared) {
++       core_->local_mem()->write(data, addr, size);
+++    } else if (type == AddrType::Tensor) {
+++      core_->tensor_mem()->write(data, addr, size);
++     } else {
++       try
++       {
++@@ -372,6 +378,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
++   } else {
++     if (type == AddrType::Shared) {
++       core_->local_mem()->write(data, addr, size);
+++    } else if (type == AddrType::Tensor) {
+++      core_->tensor_mem()->write(data, addr, size);
++     } else {
++       mmu_.write(data, addr, size, 0);
++     }
++diff --git a/sim/simx/tensor_mem.cpp b/sim/simx/tensor_mem.cpp
++new file mode 100644
++index 0000000..c1f2b2e
++--- /dev/null
+++++ b/sim/simx/tensor_mem.cpp
++@@ -0,0 +1,127 @@
+++#include "tensor_mem.h"
+++#include "core.h"
+++#include <bitmanip.h>
+++#include <vector>
+++#include "types.h"
+++
+++using namespace vortex;
+++
+++class TensorMem::Impl {
+++protected:
+++	TensorMem* simobject_;
+++	Config    config_;
+++	RAM       ram_; // TODO: is RAM the correct MemDevice here?
+++	uint32_t 	line_bits_;
+++	MemCrossBar::Ptr mem_xbar_;
+++	mutable PerfStats perf_stats_;
+++
+++	uint64_t to_local_addr(uint64_t addr) {
+++		return bit_getw(addr, 0, line_bits_-1);
+++	}
+++
+++public:
+++	Impl(TensorMem* simobject, const Config& config)
+++		: simobject_(simobject)
+++		, config_(config)
+++		, ram_(config.capacity)
+++	{
+++		uint32_t total_lines = config.capacity / config.line_size;
+++		line_bits_ = log2ceil(total_lines);
+++
+++		char sname[100];
+++		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
+++		uint32_t lg2_line_size = log2ceil(config_.line_size);
+++		uint32_t num_banks = 1 << config.B;
+++		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
+++		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
+++    	// Custom logic to calculate the output index using bank interleaving
+++			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
+++		});
+++		for (uint32_t i = 0; i < config.num_reqs; ++i) {
+++			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
+++			mem_xbar_->RspIn.at(i).bind(&simobject->Outputs.at(i));
+++		}
+++	}
+++
+++	virtual ~Impl() {}
+++
+++	void reset() {
+++		perf_stats_ = PerfStats();
+++	}
+++
+++	void read(void* data, uint64_t addr, uint32_t size) {
+++		auto l_addr = to_local_addr(addr);
+++		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+++		ram_.read(data, l_addr, size);
+++	}
+++
+++	void write(const void* data, uint64_t addr, uint32_t size) {
+++		auto l_addr = to_local_addr(addr);
+++		DPH(3, "Local Mem addr=0x" << std::hex << l_addr << std::dec << std::endl);
+++		ram_.write(data, l_addr, size);
+++	}
+++
+++	void tick() {
+++		// process bank requets from xbar
+++		uint32_t num_banks = (1 << config_.B);
+++		for (uint32_t i = 0; i < num_banks; ++i) {
+++			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
+++			if (xbar_req_out.empty())
+++				continue;
+++
+++			auto& bank_req = xbar_req_out.front();
+++			DT(4, simobject_->name() << "-bank" << i << "-req : " << bank_req);
+++
+++			if (!bank_req.write || config_.write_reponse) {
+++				// send xbar response
+++				MemRsp bank_rsp{bank_req.tag, bank_req.cid, bank_req.uuid};
+++				mem_xbar_->RspOut.at(i).push(bank_rsp);
+++			}
+++
+++			// update perf counters
+++			perf_stats_.reads += !bank_req.write;
+++			perf_stats_.writes += bank_req.write;
+++
+++			// remove input
+++			xbar_req_out.pop();
+++		}
+++	}
+++
+++	const PerfStats& perf_stats() const {
+++		perf_stats_.bank_stalls = mem_xbar_->collisions();
+++		return perf_stats_;
+++	}
+++};
+++
+++///////////////////////////////////////////////////////////////////////////////
+++
+++TensorMem::TensorMem(const SimContext& ctx, const char* name, const Config& config)
+++	: SimObject<TensorMem>(ctx, name)
+++	, Inputs(config.num_reqs, this)
+++	, Outputs(config.num_reqs, this)
+++	, impl_(new Impl(this, config))
+++{}
+++
+++TensorMem::~TensorMem() {
+++  delete impl_;
+++}
+++
+++void TensorMem::reset() {
+++  impl_->reset();
+++}
+++
+++void TensorMem::read(void* data, uint64_t addr, uint32_t size) {
+++  impl_->read(data, addr, size);
+++}
+++
+++void TensorMem::write(const void* data, uint64_t addr, uint32_t size) {
+++  impl_->write(data, addr, size);
+++}
+++
+++void TensorMem::tick() {
+++  impl_->tick();
+++}
+++
+++const TensorMem::PerfStats& TensorMem::perf_stats() const {
+++  return impl_->perf_stats();
+++}
++\ No newline at end of file
++diff --git a/sim/simx/tensor_mem.h b/sim/simx/tensor_mem.h
++new file mode 100644
++index 0000000..c4cda78
++--- /dev/null
+++++ b/sim/simx/tensor_mem.h
++@@ -0,0 +1,59 @@
+++#pragma once
+++
+++#include <simobject.h>
+++#include "types.h"
+++
+++namespace vortex {
+++
+++class TensorMem : public SimObject<TensorMem> {
+++public:
+++  struct Config {
+++    uint32_t capacity;
+++    uint32_t line_size;
+++    uint32_t num_reqs;
+++    uint32_t B; // log2 number of banks
+++    bool write_reponse;
+++  };
+++
+++  struct PerfStats {
+++    uint64_t reads;
+++    uint64_t writes;
+++    uint64_t bank_stalls;
+++
+++    PerfStats()
+++      : reads(0)
+++      , writes(0)
+++      , bank_stalls(0)
+++    {}
+++
+++    PerfStats& operator+=(const PerfStats& rhs) {
+++      this->reads += rhs.reads;
+++      this->writes += rhs.writes;
+++      this->bank_stalls += rhs.bank_stalls;
+++      return *this;
+++    }
+++  };
+++
+++  std::vector<SimPort<MemReq>> Inputs;
+++  std::vector<SimPort<MemRsp>> Outputs;
+++
+++  TensorMem(const SimContext& ctx, const char* name, const Config& config);
+++  virtual ~TensorMem();
+++
+++  void reset();
+++
+++  void read(void* data, uint64_t addr, uint32_t size);
+++
+++  void write(const void* data, uint64_t addr, uint32_t size);
+++
+++  void tick();
+++
+++  const PerfStats& perf_stats() const;
+++
+++protected:
+++
+++  class Impl;
+++  Impl* impl_;
+++};
+++
+++}
++diff --git a/sim/simx/types.h b/sim/simx/types.h
++index 3182c33..cfe115b 100644
++--- a/sim/simx/types.h
+++++ b/sim/simx/types.h
++@@ -708,7 +708,8 @@ using IntrArgs = std::variant<
++ enum class AddrType {
++   Global,
++   Shared,
++-  IO
+++  IO,
+++  Tensor
++ };
++ 
++ inline AddrType get_addr_type(uint64_t addr) {
++@@ -720,6 +721,11 @@ inline AddrType get_addr_type(uint64_t addr) {
++         return AddrType::Shared;
++     }
++   }
+++  if (EXT_TCU_ENABLED) {
+++    if (addr >= TMEM_BASE_ADDR && addr < TMEM_END_ADDR) {
+++      return AddrType::Tensor;
+++    }
+++  }
++   return AddrType::Global;
++ }
++ 
++@@ -728,6 +734,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
++   case AddrType::Global: os << "Global"; break;
++   case AddrType::Shared: os << "Shared"; break;
++   case AddrType::IO:     os << "IO"; break;
+++  case AddrType::Tensor: os << "Tensor"; break;
++   default: assert(false);
++   }
++   return os;
++@@ -1583,6 +1590,8 @@ public:
++   SimPort<LsuReq> ReqDC;
++   SimPort<LsuRsp> RspDC;
++ 
+++  // TODO: Add ReqTmem, RspTmem ports for TCU local memory access
+++
++   LocalMemSwitch(
++     const SimContext& ctx,
++     const char* name,
+diff --git a/sim/common/tensor_cfg.h b/sim/common/tensor_cfg.h
+index 99136ae..591a367 100644
+--- a/sim/common/tensor_cfg.h
++++ b/sim/common/tensor_cfg.h
+@@ -173,5 +173,78 @@ public:
+   static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
+ };
+ 
++template <uint32_t NT,      // number of threads per warp
++          typename It = fp32, // input type (A,B)
++          typename Ot = fp32, // output type (C,D)
++          uint32_t XB = 4,  // vector element type size in bytes
++          uint32_t NR = 8,  // registers per fragment (TODO: what would this be for UMMA?)
++          uint32_t DP = 0   // Dot-Product Length (0 for auto)
++          >
++struct umma_config_t {
++private:
++  static constexpr uint32_t clog2(uint32_t x) {
++    return (x < 2) ? 0 : (1 + clog2(x / 2));
++  }
++  static constexpr uint32_t tile_cap = NT * NR;
++  static constexpr uint32_t lg_tile_cap = clog2(tile_cap);
++  static constexpr uint32_t tile_en = lg_tile_cap / 2;
++  static constexpr uint32_t tile_em = lg_tile_cap - tile_en;
++
++  static constexpr uint32_t block_cap = NT;
++  static constexpr uint32_t lg_block_cap = clog2(block_cap);
++  static constexpr uint32_t block_en = lg_block_cap / 2;
++  static constexpr uint32_t block_em = lg_block_cap - block_en;
++
++public:
++
++  static constexpr uint32_t i_ratio = XB / sizeof(typename It::dtype);
++  static constexpr uint32_t o_ratio = XB / sizeof(typename Ot::dtype);
++  static_assert(i_ratio * sizeof(typename It::dtype) == XB, "XB must be multiple of sizeof(It)");
++  static_assert(o_ratio * sizeof(typename Ot::dtype) == XB, "XB must be multiple of sizeof(Ot)");
++
++  static constexpr uint32_t xtileM = 1u << tile_em;
++  static constexpr uint32_t xtileN = 1u << tile_en;
++  static constexpr uint32_t xtileK = tile_cap / ((xtileM > xtileN) ? xtileM : xtileN);
++
++  static constexpr uint32_t tcM = 1u << block_em;
++  static constexpr uint32_t tcN = 1u << block_en;
++  static constexpr uint32_t tcK = (DP != 0) ? DP : (block_cap / ((tcM > tcN) ? tcM : tcN));
++
++  static constexpr uint32_t m_steps = xtileM / tcM;  // number of M steps per register
++  static constexpr uint32_t n_steps = xtileN / tcN;  // number of N steps per register
++  static constexpr uint32_t k_steps = xtileK / tcK;  // number of K steps per register
++
++  static constexpr uint32_t a_block_size = tcM * tcK;                 // size of A micro-tile
++  static constexpr uint32_t a_sub_blocks = block_cap / a_block_size;  // number of A micro-tiles per register
++  static constexpr uint32_t a_sub_steps  = m_steps / a_sub_blocks;    // number of A sub-steps per register
++
++  static constexpr uint32_t b_block_size = tcK * tcN;                 // size of B micro-tile
++  static constexpr uint32_t b_sub_blocks = block_cap / b_block_size;  // number of B micro-tiles per register
++  static constexpr uint32_t b_sub_steps  = n_steps / b_sub_blocks;    // number of B sub-steps per register
++
++  static constexpr uint32_t NRA = (xtileM * xtileK) / NT; // Number of A registers
++  static constexpr uint32_t NRB = (xtileN * xtileK) / NT; // Number of B registers
++  static constexpr uint32_t NRC = (xtileM * xtileN) / NT; // Number of C registers
++
++  static_assert((m_steps / a_sub_blocks) != 0, "tcK is too small for tile A");
++  static_assert((n_steps / b_sub_blocks) != 0, "tcK is too small for tile B");
++
++  static_assert((xtileM * xtileK <= tile_cap), "xtileM * xtileK <= tile_cap");
++  static_assert((xtileN * xtileK <= tile_cap), "xtileN * xtileK <= tile_cap");
++  static_assert((xtileM * xtileN <= tile_cap), "xtileM * xtileN <= tile_cap");
++
++  static_assert((tcM * tcK <= block_cap), "tcM * tcK <= block_cap");
++  static_assert((tcN * tcK <= block_cap), "tcN * tcK <= block_cap");
++  static_assert((tcM * tcN <= block_cap), "tcM * tcN <= block_cap");
++
++  static_assert((xtileM % tcM) == 0, "M,m divisibility");
++  static_assert((xtileN % tcN) == 0, "N,n divisibility");
++  static_assert((xtileK % tcK) == 0, "K,k divisibility");
++
++  static constexpr uint32_t tileM = xtileM;
++  static constexpr uint32_t tileN = xtileN;
++  static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
++};
++
+ } // namespace tensor
+ } // namespace vortex
+\ No newline at end of file
+diff --git a/sim/simx/Makefile b/sim/simx/Makefile
+index 1eca622..c769e09 100644
+--- a/sim/simx/Makefile
++++ b/sim/simx/Makefile
+@@ -24,7 +24,7 @@ SRCS = $(SW_COMMON_DIR)/util.cpp $(SW_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softf
+ SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/emulator.cpp
+ SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
+ SRCS += $(SRC_DIR)/execute.cpp $(SRC_DIR)/func_unit.cpp
+-SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
++SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/tensor_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
+ SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/types.cpp
+ 
+ # Add V extension sources
+diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
+index 5579190..d52569d 100644
+--- a/sim/simx/core.cpp
++++ b/sim/simx/core.cpp
+@@ -79,6 +79,16 @@ Core::Core(const SimContext& ctx,
+     false
+   });
+ 
++  // create tensor memory
++  snprintf(sname, 100, "%s-tmem", this->name().c_str());
++  tensor_mem_ = TensorMem::Create(sname, TensorMem::Config{
++    (1 << TMEM_LOG_SIZE),
++    LSU_WORD_SIZE,      // or TMEM_WORD_SIZE if different
++    LSU_CHANNELS,      // number of banks/channels
++    log2ceil(TMEM_NUM_BANKS),
++    false
++  });
++
+   // create lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     snprintf(sname, 100, "%s-lmem_switch%d", this->name().c_str(), b);
+@@ -96,10 +106,27 @@ Core::Core(const SimContext& ctx,
+   snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
+   auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
+ 
++  // create tmem arbiter
++  snprintf(sname, 100, "%s-tmem_arb", this->name().c_str());
++  auto tmem_arb = LsuArbiter::Create(
++      sname,
++      ArbiterType::RoundRobin,
++      NUM_LSU_BLOCKS,    // one input per LSU block
++      1                  // single output
++  );
++
+   // create lmem adapter
+   snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
+   auto lsu_lmem_adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
+ 
++  // create tmem adapter
++  snprintf(sname, 100, "%s-lsu_tmem_adapter", this->name().c_str());
++  auto lsu_tmem_adapter = LsuMemAdapter::Create(
++      sname,
++      LSU_CHANNELS,     // physical channels
++      1                  // one input stream from arbiter
++  );
++
+   // connect lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     lmem_switch_.at(b)->ReqDC.bind(&mem_coalescers_.at(b)->ReqIn);
+@@ -109,16 +136,32 @@ Core::Core(const SimContext& ctx,
+     lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
+   }
+ 
++  // connect tmem switch
++  for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
++    lmem_switch_.at(b)->ReqTmem.bind(&tmem_arb->ReqIn.at(b));
++    tmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspTmem);
++  }
++
+   // connect lmem arbiter
+   lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
+   lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
+ 
++  // connect tmem arbiter
++  tmem_arb->ReqOut.at(0).bind(&lsu_tmem_adapter->ReqIn);
++  lsu_tmem_adapter->RspIn.bind(&tmem_arb->RspOut.at(0));
++
+   // connect lmem adapter
+   for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
+     lsu_lmem_adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(c));
+     local_mem_->Outputs.at(c).bind(&lsu_lmem_adapter->RspOut.at(c));
+   }
+ 
++  // connect tmem adapter
++  for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
++    lsu_tmem_adapter->ReqOut.at(c).bind(&tensor_mem_->Inputs.at(c));
++    tensor_mem_->Outputs.at(c).bind(&lsu_tmem_adapter->RspOut.at(c));
++  }
++
+   // connect dcache coalescer
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     mem_coalescers_.at(b)->ReqOut.bind(&lsu_dcache_adapter.at(b)->ReqIn);
+diff --git a/sim/simx/core.h b/sim/simx/core.h
+index a8b674d..f6be86f 100644
+--- a/sim/simx/core.h
++++ b/sim/simx/core.h
+@@ -20,6 +20,7 @@
+ #include "pipeline.h"
+ #include "cache_sim.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ #include "ibuffer.h"
+ #include "scoreboard.h"
+ 
+@@ -147,6 +148,10 @@ public:
+     return local_mem_;
+   }
+ 
++  const TensorMem::Ptr& tensor_mem() const {
++    return tensor_mem_;
++  }
++
+   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
+     return mem_coalescers_.at(idx);
+   }
+@@ -208,6 +213,7 @@ private:
+   std::vector<Dispatcher::Ptr> dispatchers_;
+   std::vector<FuncUnit::Ptr> func_units_;
+   LocalMem::Ptr local_mem_;
++  TensorMem::Ptr tensor_mem_;
+   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
+   std::vector<MemCoalescer::Ptr> mem_coalescers_;
+ 
+diff --git a/sim/simx/decode.cpp b/sim/simx/decode.cpp
+index 65e2abd..2106ebe 100644
+--- a/sim/simx/decode.cpp
++++ b/sim/simx/decode.cpp
+@@ -1140,6 +1140,31 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
+           }
+         }
+       } break;
++      case 1: { // UMMA - Unified MMA with tensor memory addresses
++        // For UMMA:
++        // - rd field: output format ID (fmt_d)
++        // - rs1 field: input format ID (fmt_s)
++        // - Addresses come from fixed integer registers:
++        //   a0 = A tile address, a1 = B tile address, a2 = C/D tile address
++        // Unlike WMMA, UMMA processes the entire tile at once, so we generate
++        // only ONE instruction (no micro-stepping through k/m/n).
++        uint32_t fmt_d = rd;
++        uint32_t fmt_s = rs1;
++        // Fixed register indices for addresses (a0=10, a1=11, a2=12)
++        constexpr uint32_t reg_addr_a = 10;  // a0
++        constexpr uint32_t reg_addr_b = 11;  // a1
++        constexpr uint32_t reg_addr_c = 12;  // a2
++
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::UMMA);
++        instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, 0, 0});  // step_m=0, step_n=0 (only step)
++        // Use fixed integer registers for addresses
++        instr->setDestReg(reg_addr_c, RegType::Integer);  // D address (same as C)
++        instr->setSrcReg(0, reg_addr_a, RegType::Integer);  // A address
++        instr->setSrcReg(1, reg_addr_b, RegType::Integer);  // B address
++        instr->setSrcReg(2, reg_addr_c, RegType::Integer);  // C address
++        ibuffer.push_back(instr);
++      } break;
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
+index 3eb62f9..0b7633e 100644
+--- a/sim/simx/emulator.cpp
++++ b/sim/simx/emulator.cpp
+@@ -27,6 +27,7 @@
+ #include "cluster.h"
+ #include "processor_impl.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ 
+ using namespace vortex;
+ 
+@@ -313,6 +314,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     try
+     {
+@@ -331,6 +334,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     mmu_.read(data, addr, size, 0);
+   }
+@@ -348,6 +353,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       try
+       {
+@@ -372,6 +379,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       mmu_.write(data, addr, size, 0);
+     }
+diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
+index 6155027..557381c 100644
+--- a/sim/simx/execute.cpp
++++ b/sim/simx/execute.cpp
+@@ -1479,6 +1479,15 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
+         tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+         rd_write = true;
+       } break;
++      case TcuType::UMMA: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        assert(warp.tmask.count() == num_threads);
++        // For UMMA, registers contain addresses to tensor memory
++        // TODO: Print rs1_data, rs2_data, rs3_data as addresses for DEBUG
++        tensor_unit_->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
++        rd_write = true;
++      } break;
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/tensor_mem.cpp b/sim/simx/tensor_mem.cpp
+new file mode 100644
+index 0000000..00ea555
+--- /dev/null
++++ b/sim/simx/tensor_mem.cpp
+@@ -0,0 +1,131 @@
++#include "tensor_mem.h"
++#include "core.h"
++#include <bitmanip.h>
++#include <vector>
++#include "types.h"
++
++using namespace vortex;
++
++class TensorMem::Impl {
++protected:
++	TensorMem* simobject_;
++	Config    config_;
++	RAM       ram_;
++	uint32_t 	line_bits_;
++	MemCrossBar::Ptr mem_xbar_;
++	mutable PerfStats perf_stats_;
++
++	uint64_t to_local_addr(uint64_t addr) {
++		// Convert global TMEM address to local byte offset within the RAM
++		// Note: addr is expected to be in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
++		uint64_t local = addr - TMEM_BASE_ADDR;
++		// Ensure the local address is within capacity bounds
++		return local & (config_.capacity - 1);  // Assumes capacity is power of 2
++	}
++
++public:
++	Impl(TensorMem* simobject, const Config& config)
++		: simobject_(simobject)
++		, config_(config)
++		, ram_(config.capacity)
++	{
++		uint32_t total_lines = config.capacity / config.line_size;
++		line_bits_ = log2ceil(total_lines);
++
++		char sname[100];
++		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
++		uint32_t lg2_line_size = log2ceil(config_.line_size);
++		uint32_t num_banks = 1 << config.B;
++		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
++		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
++    	// Custom logic to calculate the output index using bank interleaving
++			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
++		});
++		for (uint32_t i = 0; i < config.num_reqs; ++i) {
++			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
++			mem_xbar_->RspIn.at(i).bind(&simobject->Outputs.at(i));
++		}
++	}
++
++	virtual ~Impl() {}
++
++	void reset() {
++		perf_stats_ = PerfStats();
++	}
++
++	void read(void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem Read: addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.read(data, l_addr, size);
++	}
++
++	void write(const void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem Write: addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.write(data, l_addr, size);
++	}
++
++	void tick() {
++		// process bank requets from xbar
++		uint32_t num_banks = (1 << config_.B);
++		for (uint32_t i = 0; i < num_banks; ++i) {
++			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
++			if (xbar_req_out.empty())
++				continue;
++
++			auto& bank_req = xbar_req_out.front();
++			DT(4, simobject_->name() << "-bank" << i << "-req : " << bank_req);
++
++			if (!bank_req.write || config_.write_reponse) {
++				// send xbar response
++				MemRsp bank_rsp{bank_req.tag, bank_req.cid, bank_req.uuid};
++				mem_xbar_->RspOut.at(i).push(bank_rsp);
++			}
++
++			// update perf counters
++			perf_stats_.reads += !bank_req.write;
++			perf_stats_.writes += bank_req.write;
++
++			// remove input
++			xbar_req_out.pop();
++		}
++	}
++
++	const PerfStats& perf_stats() const {
++		perf_stats_.bank_stalls = mem_xbar_->collisions();
++		return perf_stats_;
++	}
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++TensorMem::TensorMem(const SimContext& ctx, const char* name, const Config& config)
++	: SimObject<TensorMem>(ctx, name)
++	, Inputs(config.num_reqs, this)
++	, Outputs(config.num_reqs, this)
++	, impl_(new Impl(this, config))
++{}
++
++TensorMem::~TensorMem() {
++  delete impl_;
++}
++
++void TensorMem::reset() {
++  impl_->reset();
++}
++
++void TensorMem::read(void* data, uint64_t addr, uint32_t size) {
++  impl_->read(data, addr, size);
++}
++
++void TensorMem::write(const void* data, uint64_t addr, uint32_t size) {
++  impl_->write(data, addr, size);
++}
++
++void TensorMem::tick() {
++  impl_->tick();
++}
++
++const TensorMem::PerfStats& TensorMem::perf_stats() const {
++  return impl_->perf_stats();
++}
+\ No newline at end of file
+diff --git a/sim/simx/tensor_mem.h b/sim/simx/tensor_mem.h
+new file mode 100644
+index 0000000..c4cda78
+--- /dev/null
++++ b/sim/simx/tensor_mem.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <simobject.h>
++#include "types.h"
++
++namespace vortex {
++
++class TensorMem : public SimObject<TensorMem> {
++public:
++  struct Config {
++    uint32_t capacity;
++    uint32_t line_size;
++    uint32_t num_reqs;
++    uint32_t B; // log2 number of banks
++    bool write_reponse;
++  };
++
++  struct PerfStats {
++    uint64_t reads;
++    uint64_t writes;
++    uint64_t bank_stalls;
++
++    PerfStats()
++      : reads(0)
++      , writes(0)
++      , bank_stalls(0)
++    {}
++
++    PerfStats& operator+=(const PerfStats& rhs) {
++      this->reads += rhs.reads;
++      this->writes += rhs.writes;
++      this->bank_stalls += rhs.bank_stalls;
++      return *this;
++    }
++  };
++
++  std::vector<SimPort<MemReq>> Inputs;
++  std::vector<SimPort<MemRsp>> Outputs;
++
++  TensorMem(const SimContext& ctx, const char* name, const Config& config);
++  virtual ~TensorMem();
++
++  void reset();
++
++  void read(void* data, uint64_t addr, uint32_t size);
++
++  void write(const void* data, uint64_t addr, uint32_t size);
++
++  void tick();
++
++  const PerfStats& perf_stats() const;
++
++protected:
++
++  class Impl;
++  Impl* impl_;
++};
++
++}
+diff --git a/sim/simx/tensor_unit.cpp b/sim/simx/tensor_unit.cpp
+index e6cf4a3..b3397de 100644
+--- a/sim/simx/tensor_unit.cpp
++++ b/sim/simx/tensor_unit.cpp
+@@ -16,11 +16,14 @@
+ #include "tensor_cfg.h"
+ #include <rvfloats.h>
+ #include "core.h"
++#include "tensor_mem.h"
+ 
+ using namespace vortex;
+ 
+ namespace vt = vortex::tensor;
+ using cfg = vt::wmma_config_t<NUM_THREADS>;
++// UMMA config for fp16 input, fp32 output
++using umma_cfg_fp16_fp32 = vt::umma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
+ 
+ inline uint64_t nan_box(uint32_t value) {
+   return value | 0xffffffff00000000;
+@@ -161,6 +164,119 @@ struct FEDP<vt::uint4, vt::int32>{
+ 
+ using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
+ 
++// Get type size in bytes from format ID
++static uint32_t get_type_bytes(uint32_t fmt) {
++  switch (fmt) {
++  case vt::fp32::id:  return sizeof(float);
++  case vt::fp16::id:  return sizeof(uint16_t);
++  case vt::bf16::id:  return sizeof(uint16_t);
++  case vt::tf32::id:  return sizeof(uint32_t);
++  case vt::int32::id: return sizeof(int32_t);
++  case vt::int8::id:  return sizeof(int8_t);
++  case vt::uint8::id: return sizeof(uint8_t);
++  case vt::int4::id:  return 1;  // 4-bit packed, but minimum addressable is 1 byte
++  case vt::uint4::id: return 1;
++  default:
++    std::cout << "Error: unknown format type: " << fmt << std::endl;
++    std::abort();
++  }
++}
++
++// Template to execute UMMA for specific input/output types
++template <typename It, typename Ot>
++static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
++                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
++                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
++  using itype = typename It::dtype;
++  using otype = typename Ot::dtype;
++
++  uint32_t a_bytes = tileM * tileK * sizeof(itype);
++  uint32_t b_bytes = tileK * tileN * sizeof(itype);
++  uint32_t c_bytes = tileM * tileN * sizeof(otype);
++
++  std::vector<itype> a_tile(tileM * tileK);
++  std::vector<itype> b_tile(tileK * tileN);
++  std::vector<otype> c_tile(tileM * tileN);
++  std::vector<otype> d_tile(tileM * tileN);
++
++  tensor_mem->read(a_tile.data(), addr_a, a_bytes);
++  tensor_mem->read(b_tile.data(), addr_b, b_bytes);
++  tensor_mem->read(c_tile.data(), addr_c, c_bytes);
++
++  // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
++  for (uint32_t m = 0; m < tileM; ++m) {
++    for (uint32_t n = 0; n < tileN; ++n) {
++      uint32_t c_idx = m * tileN + n;
++      otype acc = c_tile[c_idx];
++
++      for (uint32_t k = 0; k < tileK; ++k) {
++        uint32_t a_idx = m * tileK + k;
++        uint32_t b_idx = k * tileN + n;
++        acc = FMA<It, Ot>::eval(a_tile[a_idx], b_tile[b_idx], acc);
++      }
++
++      d_tile[c_idx] = acc;
++    }
++  }
++
++  tensor_mem->write(d_tile.data(), addr_c, c_bytes);
++}
++
++// Function pointer type for UMMA executor
++using PFN_UMMA = void (*)(const std::shared_ptr<TensorMem>&, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
++
++// Select the appropriate UMMA executor based on format types
++static PFN_UMMA select_UMMA(uint32_t IT, uint32_t OT) {
++  switch (OT) {
++  case vt::fp32::id:
++    switch (IT) {
++    case vt::fp16::id:
++      return execute_umma<vt::fp16, vt::fp32>;
++    case vt::bf16::id:
++      return execute_umma<vt::bf16, vt::fp32>;
++    case vt::tf32::id:
++      return execute_umma<vt::tf32, vt::fp32>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::fp16::id:
++    switch (IT) {
++    case vt::fp16::id:
++      return execute_umma<vt::fp16, vt::fp16>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::bf16::id:
++    switch (IT) {
++    case vt::bf16::id:
++      return execute_umma<vt::bf16, vt::bf16>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::int32::id:
++    switch (IT) {
++    case vt::int8::id:
++      return execute_umma<vt::int8, vt::int32>;
++    case vt::uint8::id:
++      return execute_umma<vt::uint8, vt::int32>;
++    // Note: int4/uint4 would need special handling for packed 4-bit values
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  default:
++    std::cout << "UMMA: unsupported output type: " << OT << std::endl;
++    std::abort();
++  }
++}
++
+ static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
+   switch (OT) {
+   case vt::fp32::id:
+@@ -246,6 +362,9 @@ public:
+       case TcuType::WMMA:
+         delay = 4;
+         break;
++      case TcuType::UMMA:
++        delay = 8; // Higher latency due to tensor memory access
++        break;
+       default:
+         std::abort();
+       }
+@@ -296,6 +415,70 @@ public:
+     }
+   }
+ 
++  // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
++  // Registers contain addresses pointing to data in tensor memory
++  // Unlike WMMA (which processes one micro-tile per instruction), UMMA processes
++  // the entire tile in one instruction by loading from tensor memory.
++  //
++  // Tensor memory layout (from kernel):
++  // - A: tileM x tileK elements in input_t, row-major
++  // - B: tileK x tileN elements in input_t, row-major
++  // - C: tileM x tileN elements in output_t, row-major
++  //
++  // Where tileK = xtileK * i_ratio (i_ratio = 32bits / input_bits)
++  void umma(uint32_t wid,
++            uint32_t fmt_s,
++            uint32_t fmt_d,
++            uint32_t step_m,
++            uint32_t step_n,
++            const std::vector<reg_data_t>& rs1_data,
++            const std::vector<reg_data_t>& rs2_data,
++            const std::vector<reg_data_t>& rs3_data,
++            std::vector<reg_data_t>& rd_data,
++            ExeTraceData* trace_data) {
++    __unused(wid);
++    __unused(trace_data);
++    __unused(step_m);  // Always 0 - UMMA generates only one instruction
++    __unused(step_n);  // Always 0 - UMMA generates only one instruction
++
++    auto tensor_mem = core_->tensor_mem();
++
++    // Get base addresses from registers
++    uint64_t addr_a = rs1_data[0].u32;
++    uint64_t addr_b = rs2_data[0].u32;
++    uint64_t addr_c = rs3_data[0].u32;
++
++    DTH(3, "UMMA: wid=" << wid);
++    DTN(3, ", fmt_s=" << fmt_s << ", fmt_d=" << fmt_d);
++    DTN(3, ", addr_a=0x" << std::hex << addr_a);
++    DTN(3, ", addr_b=0x" << addr_b);
++    DTN(3, ", addr_c=0x" << addr_c << std::dec << std::endl);
++
++    // Calculate tile dimensions based on format types
++    // Base tile dimensions (for 32-bit types)
++    constexpr uint32_t xtileM = cfg::xtileM;  // 8
++    constexpr uint32_t xtileN = cfg::xtileN;  // 4
++    constexpr uint32_t xtileK = cfg::xtileK;  // 4
++
++    // Adjust K dimension based on input type size
++    // i_ratio = 4 bytes / input_type_bytes (e.g., 2 for fp16, 4 for int8)
++    uint32_t input_bytes = get_type_bytes(fmt_s);
++    uint32_t i_ratio = 4 / input_bytes;
++    uint32_t tileK = xtileK * i_ratio;
++
++    DTN(3, ", tileM=" << xtileM << ", tileN=" << xtileN << ", tileK=" << tileK << std::endl);
++
++    // Get the appropriate UMMA executor for this format combination
++    auto umma_fn = select_UMMA(fmt_s, fmt_d);
++    umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
++
++    // Return the C/D address to ALL threads
++    // All threads in the warp execute the UMMA instruction together
++    for (size_t t = 0; t < rd_data.size(); ++t) {
++      rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++    }
++  }
++
+   const PerfStats& perf_stats() const {
+     return perf_stats_;
+   }
+@@ -315,6 +498,9 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
+   case TcuType::WMMA:
+     return {"WMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
+              + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
++  case TcuType::UMMA:
++    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
++             + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
+   default:
+     std::abort();
+   }
+@@ -356,4 +542,17 @@ void TensorUnit::wmma(uint32_t wid,
+                       std::vector<reg_data_t>& rd_data,
+                       ExeTraceData* trace_data) {
+   impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
++}
++
++void TensorUnit::umma(uint32_t wid,
++                      uint32_t fmt_s,
++                      uint32_t fmt_d,
++                      uint32_t step_m,
++                      uint32_t step_n,
++                      const std::vector<reg_data_t>& rs1_data,
++                      const std::vector<reg_data_t>& rs2_data,
++                      const std::vector<reg_data_t>& rs3_data,
++                      std::vector<reg_data_t>& rd_data,
++                      ExeTraceData* trace_data) {
++  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+ }
+\ No newline at end of file
+diff --git a/sim/simx/tensor_unit.h b/sim/simx/tensor_unit.h
+index 87cf8f6..8a63420 100644
+--- a/sim/simx/tensor_unit.h
++++ b/sim/simx/tensor_unit.h
+@@ -63,6 +63,22 @@ public:
+ 					  std::vector<reg_data_t>& rd_data,
+ 					  ExeTraceData* trace_data);
+ 
++	// UMMA: Registers contain addresses to tensor memory, not actual data
++	// rs1_data: addresses for matrix A tiles in tensor memory
++	// rs2_data: addresses for matrix B tiles in tensor memory
++	// rs3_data: addresses for accumulator C tiles in tensor memory
++	// rd_data: addresses for output D tiles in tensor memory (can be same as C)
++	void umma(uint32_t wid,
++				    uint32_t fmt_s,
++						uint32_t fmt_d,
++				    uint32_t step_m,
++						uint32_t step_n,
++	          const std::vector<reg_data_t>& rs1_data,
++					  const std::vector<reg_data_t>& rs2_data,
++					  const std::vector<reg_data_t>& rs3_data,
++					  std::vector<reg_data_t>& rd_data,
++					  ExeTraceData* trace_data);
++
+ 	const PerfStats& perf_stats() const;
+ 
+ private:
+diff --git a/sim/simx/types.cpp b/sim/simx/types.cpp
+index 56bf60c..b6c500d 100644
+--- a/sim/simx/types.cpp
++++ b/sim/simx/types.cpp
+@@ -24,6 +24,8 @@ LocalMemSwitch::LocalMemSwitch(
+   , RspIn(this)
+   , ReqLmem(this)
+   , RspLmem(this)
++  , ReqTmem(this)
++  , RspTmem(this)
+   , ReqDC(this)
+   , RspDC(this)
+   , delay_(delay)
+@@ -39,6 +41,12 @@ void LocalMemSwitch::tick() {
+     RspIn.push(out_rsp, 1);
+     RspLmem.pop();
+   }
++  if (!RspTmem.empty()) {
++    auto& out_rsp = RspTmem.front();
++    DT(4, this->name() << "-tmem-rsp: " << out_rsp);
++    RspIn.push(out_rsp, 1);
++    RspTmem.pop();
++  }
+   if (!RspDC.empty()) {
+     auto& out_rsp = RspDC.front();
+     DT(4, this->name() << "-dc-rsp: " << out_rsp);
+@@ -57,14 +65,21 @@ void LocalMemSwitch::tick() {
+     out_dc_req.uuid  = in_req.uuid;
+ 
+     LsuReq out_lmem_req(out_dc_req);
++    LsuReq out_tmem_req(out_dc_req);
+ 
+     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
+       if (in_req.mask.test(i)) {
+         auto type = get_addr_type(in_req.addrs.at(i));
+         if (type == AddrType::Shared) {
++          // LMEM
+           out_lmem_req.mask.set(i);
+           out_lmem_req.addrs.at(i) = in_req.addrs.at(i);
++        } else if (type == AddrType::Tensor) {
++          // TMEM
++          out_tmem_req.mask.set(i);
++          out_tmem_req.addrs.at(i) = in_req.addrs.at(i);
+         } else {
++          // default: global / dcache
+           out_dc_req.mask.set(i);
+           out_dc_req.addrs.at(i) = in_req.addrs.at(i);
+         }
+@@ -80,6 +95,12 @@ void LocalMemSwitch::tick() {
+       ReqLmem.push(out_lmem_req, delay_);
+       DT(4, this->name() << "-lmem-req: " << out_lmem_req);
+     }
++
++    if (!out_tmem_req.mask.none()) {
++      ReqTmem.push(out_tmem_req, delay_);
++      DT(4, this->name() << "-tmem-req: " << out_tmem_req);
++    }
++
+     ReqIn.pop();
+   }
+ }
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 70be5ac..6c5ab35 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -643,6 +643,7 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
+ 
+ enum class TcuType {
+   WMMA,
++  UMMA,
+ };
+ 
+ struct IntrTcuArgs {
+@@ -655,6 +656,7 @@ struct IntrTcuArgs {
+ inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
+   switch (type) {
+   case TcuType::WMMA: os << "WMMA"; break;
++  case TcuType::UMMA: os << "UMMA"; break;
+   default:
+     assert(false);
+   }
+@@ -708,7 +710,8 @@ using IntrArgs = std::variant<
+ enum class AddrType {
+   Global,
+   Shared,
+-  IO
++  IO,
++  Tensor
+ };
+ 
+ inline AddrType get_addr_type(uint64_t addr) {
+@@ -720,6 +723,12 @@ inline AddrType get_addr_type(uint64_t addr) {
+         return AddrType::Shared;
+     }
+   }
++  if (EXT_TCU_ENABLED) {
++    // Use offset comparison to avoid 32-bit overflow in TMEM_END_ADDR calculation
++    if (addr >= TMEM_BASE_ADDR && (addr - TMEM_BASE_ADDR) < TMEM_SIZE) {
++      return AddrType::Tensor;
++    }
++  }
+   return AddrType::Global;
+ }
+ 
+@@ -728,6 +737,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
+   case AddrType::Global: os << "Global"; break;
+   case AddrType::Shared: os << "Shared"; break;
+   case AddrType::IO:     os << "IO"; break;
++  case AddrType::Tensor: os << "Tensor"; break;
+   default: assert(false);
+   }
+   return os;
+@@ -1580,6 +1590,9 @@ public:
+   SimPort<LsuReq> ReqLmem;
+   SimPort<LsuRsp> RspLmem;
+ 
++  SimPort<LsuReq> ReqTmem;
++  SimPort<LsuRsp> RspTmem;
++
+   SimPort<LsuReq> ReqDC;
+   SimPort<LsuRsp> RspDC;
+ 
+diff --git a/tests/regression/final/Makefile b/tests/regression/final/Makefile
+new file mode 100644
+index 0000000..f80fd0f
+--- /dev/null
++++ b/tests/regression/final/Makefile
+@@ -0,0 +1,16 @@
++ROOT_DIR := $(realpath ../../..)
++include $(ROOT_DIR)/config.mk
++
++PROJECT := final
++
++SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
++
++SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp
++
++VX_SRCS := $(SRC_DIR)/kernel.cpp
++
++CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
++
++LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
++
++include ../common.mk
+diff --git a/tests/regression/final/common.h b/tests/regression/final/common.h
+new file mode 100644
+index 0000000..f2cfc72
+--- /dev/null
++++ b/tests/regression/final/common.h
+@@ -0,0 +1,33 @@
++#ifndef _COMMON_H_
++#define _COMMON_H_
++
++#include <stdint.h>
++#include <VX_config.h>
++
++#ifndef NUM_THREADS
++#define NUM_THREADS 4
++#endif
++
++#ifndef ITYPE
++#define ITYPE fp16
++#endif
++
++#ifndef OTYPE
++#define OTYPE fp32
++#endif
++
++// Tensor memory base address for accumulator storage
++#ifndef TMEM_ACCUM_BASE
++#define TMEM_ACCUM_BASE TMEM_BASE_ADDR
++#endif
++
++typedef struct {
++  uint32_t grid_dim[2];
++  uint32_t block_dim[2];
++  uint32_t M, N, K;
++  uint64_t A_addr;
++  uint64_t B_addr;
++  uint64_t C_addr;
++} kernel_arg_t;
++
++#endif
+diff --git a/tests/regression/final/kernel.cpp b/tests/regression/final/kernel.cpp
+new file mode 100644
+index 0000000..b859061
+--- /dev/null
++++ b/tests/regression/final/kernel.cpp
+@@ -0,0 +1,84 @@
++#include "common.h"
++#include <vx_spawn.h>
++#include <vx_tensor.h>
++#include <vx_print.h>
++
++namespace vt = vortex::tensor;
++
++// Software fp16 to fp32 conversion for verification
++// IEEE 754 half-precision: 1 sign, 5 exponent, 10 mantissa
++// Use UMMA context - registers hold addresses to tensor memory
++using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
++  auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
++  auto pB = reinterpret_cast<ctx::input_t *>(arg->B_addr);
++  auto pC = reinterpret_cast<ctx::output_t *>(arg->C_addr);
++
++  uint32_t M = arg->M;
++  uint32_t N = arg->N;
++  uint32_t K = arg->K;
++
++  // Fragments simply contain tensor memory addresses
++  ctx::fragment_a   tmemA;
++  ctx::fragment_b   tmemB;
++  ctx::fragment_acc tmemC;
++
++  // calculate tile row & column based on block index
++  uint32_t tile_row = blockIdx.y * ctx::tileM;
++  uint32_t tile_col = blockIdx.x * ctx::tileN;
++
++  // Calculate unique tensor memory addresses for this block's tiles
++  uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
++  
++  // Layout in tensor memory:
++  // - A tiles: starts at TMEM_BASE_ADDR
++  // - B tiles: after A tiles
++  // - C/D accumulators: after B tiles
++  uint32_t a_tile_size = sizeof(ctx::input_t) * ctx::tileM * ctx::tileK;
++  uint32_t b_tile_size = sizeof(ctx::input_t) * ctx::tileK * ctx::tileN;
++  uint32_t c_tile_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
++
++  // Each block gets its own region in tensor memory
++  uint64_t block_tmem_base = TMEM_ACCUM_BASE + block_id * (a_tile_size + b_tile_size + c_tile_size);
++
++  // Set fragment addresses to point to tensor memory locations
++  ctx::set_fragment_addr(tmemA, reinterpret_cast<void*>(block_tmem_base));
++  ctx::set_fragment_addr(tmemB, reinterpret_cast<void*>(block_tmem_base + a_tile_size));
++  ctx::set_fragment_addr(tmemC, reinterpret_cast<void*>(block_tmem_base + a_tile_size + b_tile_size));
++
++  // Initialize accumulator in tensor memory to zero
++  ctx::fill_fragment(tmemC, 0);
++
++  // Counters for MMA verification
++
++  for (uint32_t i = 0; i < K; i += ctx::tileK) {
++    auto pTileA = pA + tile_row * K + i;
++
++    // Load A tile from global memory to tensor memory
++    ctx::load_matrix_sync(tmemA, pTileA, K);
++
++    // Load B tile
++    if constexpr (vt::ITYPE::bits < 8) {
++      // For sub-byte matrix B must be in col-major format
++      auto pTileB = pB + tile_col * K + i;
++      ctx::load_matrix_sync<vt::col_major>(tmemB, pTileB, K);
++    } else {
++      auto pTileB = pB + i * N + tile_col;
++      ctx::load_matrix_sync(tmemB, pTileB, N);
++    }
++
++    // MMA; All data stays in tensor memory, only addresses in registers
++    ctx::mma_sync(tmemC, tmemA, tmemB, tmemC);
++
++  }
++
++  // Store the computed C tile from tensor memory to global memory
++  auto pTileC = pC + tile_row * N + tile_col;
++  ctx::store_matrix_sync(pTileC, tmemC, N);
++}
++
++int main() {
++  auto arg = (kernel_arg_t *)csr_read(VX_CSR_MSCRATCH);
++  return vx_spawn_threads(2, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)kernel_body, arg);
++}
+diff --git a/tests/regression/final/main.cpp b/tests/regression/final/main.cpp
+new file mode 100644
+index 0000000..d3356c9
+--- /dev/null
++++ b/tests/regression/final/main.cpp
+@@ -0,0 +1,689 @@
++#include "common.h"
++#include <chrono>
++#include <cmath>
++#include <iostream>
++#include <rvfloats.h>
++#include <string.h>
++#include <tensor_cfg.h>
++#include <unistd.h>
++#include <util.h>
++#include <vector>
++#include <vortex.h>
++
++#define FLOAT_ULP 6
++#define MAX_ERRORS 100
++
++#define RT_CHECK(_expr)                                      \
++  do {                                                       \
++    int _ret = _expr;                                        \
++    if (0 == _ret)                                           \
++      break;                                                 \
++    printf("Error: '%s' returned %d!\n", #_expr, (int)_ret); \
++    cleanup();                                               \
++    exit(-1);                                                \
++  } while (false)
++
++using namespace vortex;
++namespace vt = tensor;
++
++static bool g_enable_sparse = false;
++///////////////////////////////////////////////////////////////////////////////
++
++static void convert_row_to_col_major_4bit(uint8_t *dst, uint32_t width, uint32_t height, const uint8_t *src) {
++  // Calculate output size and stride
++  uint32_t out_bytes = (width * height + 1) / 2;
++  memset(dst, 0, out_bytes);
++  uint32_t dst_stride = (height + 1) / 2; // Bytes per column in output
++
++  // For each column in source (which becomes row in destination)
++  for (uint32_t c = 0; c < width; ++c) {
++    uint32_t base = c * dst_stride;
++
++    // For each row in source (which becomes column in destination)
++    for (uint32_t r = 0; r < height; r += 2) {
++      // Calculate source indices (row-major)
++      uint32_t idx_even = r * width + c;
++      uint32_t idx_odd = (r + 1) * width + c;
++
++      // Extract nibbles - consistent with data_accessor_t
++      uint8_t b_even = src[idx_even / 2];
++      uint8_t b_odd = (r + 1 < height) ? src[idx_odd / 2] : 0;
++
++      uint8_t nib_even = (idx_even & 1) ? (b_even >> 4) : (b_even & 0x0F);
++      uint8_t nib_odd = (r + 1 < height)
++                            ? ((idx_odd & 1) ? (b_odd >> 4) : (b_odd & 0x0F))
++                            : 0;
++
++      // Pack into destination: even row in low nibble, odd row in high nibble
++      dst[base + r / 2] = (nib_odd << 4) | nib_even;
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename T>
++struct data_accessor_t {
++  using Type = typename T::dtype;
++  static Type read(const Type *ptr, uint32_t offset) {
++    return ptr[offset];
++  }
++  static void write(Type *ptr, uint32_t offset, Type value) {
++    ptr[offset] = value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::int4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::uint4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename Type>
++class Comparator {};
++
++template <>
++class Comparator<vt::int8> {
++public:
++  static int8_t generate() {
++    return (int8_t)rand();
++  }
++  static bool compare(int8_t a, int8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint8> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand();
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int32> {
++public:
++  static int32_t generate() {
++    return (int32_t)rand();
++  }
++  static bool compare(int32_t a, int32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftoh_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::bf16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftob_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::tf32> {
++public:
++  static uint32_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftox_s(bit_cast<uint32_t>(fvalue), 8, 10, 0, nullptr);
++  }
++  static bool compare(uint32_t a, uint32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp32> {
++public:
++  static float generate() {
++    return static_cast<float>(rand()) / RAND_MAX;
++  }
++  static bool compare(float a, float b, int index, int errors) {
++    union fi_t {
++      float f;
++      int32_t i;
++    };
++    fi_t fa, fb;
++    fa.f = a;
++    fb.f = b;
++    auto d = std::abs(fa.i - fb.i);
++    if (d > FLOAT_ULP) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=%f, actual=%f\n", index, fb.f, fa.f);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename S, typename D>
++struct muladd_t {
++  using stype = typename S::dtype;
++  using dtype = typename D::dtype;
++  static dtype eval(stype a, stype b, dtype c) {
++    return static_cast<dtype>(a) * static_cast<dtype>(b) + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_htof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftoh_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::bf16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_btof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftob_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::tf32, vt::fp32> {
++  static float eval(uint32_t a, uint32_t b, float c) {
++    auto fa = bit_cast<float>(rv_xtof_s(a, 8, 10, 0, nullptr));
++    auto fb = bit_cast<float>(rv_xtof_s(b, 8, 10, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::int4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    if (a & 0x8) {
++      a_val |= 0xFFFFFFF0; // sign extend
++    }
++    int32_t b_val = b & 0xF;
++    if (b & 0x8) {
++      b_val |= 0xFFFFFFF0; // sign extend
++    }
++    return a_val * b_val + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::uint4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    int32_t b_val = b & 0xF;
++    return a_val * b_val + c;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++using cfg = vt::wmma_config_t<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++using itype_t = typename vt::ITYPE::dtype;
++using otype_t = typename vt::OTYPE::dtype;
++
++struct SparseMat {
++  std::vector<itype_t> values;   // non-zeros
++  std::vector<uint8_t> meta;     // Array of row-masks: 1 byte marks the columns
++                                  // of the 4 elements in the block that are non-zero.
++                                  // e.g. 0b0101 means 2nd and 4th elements are non-zero.
++
++  uint32_t rows, cols;           // original A dims (M × K)
++};
++
++static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
++  uint32_t subbytes = 8 / vt::ITYPE::bits;
++  uint32_t KS = subbytes ? (K * subbytes) : K;
++  for (uint32_t m = 0; m < M; ++m) {
++    for (uint32_t n = 0; n < N; ++n) {
++      otype_t sum(0);
++      for (uint32_t k = 0; k < KS; ++k) {
++        auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
++        auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
++        sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, sum);
++      }
++      data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++const char *kernel_file = "kernel.vxbin";
++
++uint32_t xm = 32;
++uint32_t xn = 32;
++uint32_t xk = 32;
++
++vx_device_h device = nullptr;
++vx_buffer_h A_buffer = nullptr;
++vx_buffer_h B_buffer = nullptr;
++vx_buffer_h C_buffer = nullptr;
++vx_buffer_h krnl_buffer = nullptr;
++vx_buffer_h args_buffer = nullptr;
++kernel_arg_t kernel_arg = {};
++
++std::string last_build_options;
++
++static void show_usage() {
++  std::cout << "Vortex Sgemm TCU Test." << std::endl;
++  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [-h: help]" << std::endl;
++  std::cout << "  -s  Enable 2:4 structured sparsity " << std::endl;
++}
++
++static void parse_args(int argc, char **argv) {
++  int c;
++  while ((c = getopt(argc, argv, "m:n:k:i:o:hs")) != -1) {
++    switch (c) {
++    case 'm':
++      xm = atoi(optarg);
++      break;
++    case 'n':
++      xn = atoi(optarg);
++      break;
++    case 'k':
++      xk = atoi(optarg);
++      break;
++    case 's':
++      g_enable_sparse = true;
++      std::cout << "Sparse mode enabled (-s)" << std::endl;
++      break;
++    case 'h':
++      show_usage();
++      exit(0);
++      break;
++    default:
++      show_usage();
++      exit(-1);
++    }
++  }
++}
++
++void cleanup() {
++  if (device) {
++    vx_mem_free(A_buffer);
++    vx_mem_free(B_buffer);
++    vx_mem_free(C_buffer);
++    vx_mem_free(krnl_buffer);
++    vx_mem_free(args_buffer);
++    vx_dev_close(device);
++  }
++}
++
++
++static SparseMat pruneAndCompressMatrixA(const std::vector<itype_t>& denseA,
++                                         uint32_t M, uint32_t K) {
++  SparseMat out;
++  out.rows = M;
++  out.cols = K;
++  out.values.reserve(M * K / 2); // Select 2 values every 4 values
++  out.meta.reserve(M * K / 4); // 1 byte for every 4 values
++
++  const itype_t* src = denseA.data();
++
++  for (uint32_t r = 0; r < M; ++r) {
++    for (uint32_t c = 0; c < K; c += 4) {
++      itype_t blk[4] = {src[r * K + c],
++                        src[r * K + c + 1],
++                        src[r * K + c + 2],
++                        src[r * K + c + 3]};
++
++      uint32_t idx[4] = {0, 1, 2, 3};
++      std::sort(idx, idx + 4,
++        [&](uint32_t a, uint32_t b) {
++          return std::abs((int)blk[a]) < std::abs((int)blk[b]);
++        }); //Sort the 4 elements by absolute value, ascending order
++
++      uint8_t keep0 = idx[3];
++      uint8_t keep1 = idx[2]; //idx of largest 2 elements
++
++      out.values.push_back(blk[keep0]);
++      out.values.push_back(blk[keep1]);
++
++      uint8_t m = (1u << keep0) | (1u << keep1);  // e.g. 0b0101
++      out.meta.push_back(m);
++    }
++  }
++  return out;
++}
++
++void test_pruneA() {
++  const uint32_t M = 4, K = 8;
++  std::vector<itype_t> denseA(M * K);
++  for (auto& v : denseA) v = Comparator<vt::ITYPE>::generate();
++
++  auto spA = pruneAndCompressMatrixA(denseA, M, K);
++
++  std::vector<itype_t> recovered(M * K, 0);
++  size_t v_idx = 0, m_idx = 0;
++  for (uint32_t r = 0; r < M; ++r)
++    for (uint32_t c = 0; c < K; c += 4) {
++      uint8_t m = spA.meta[m_idx++];
++      for (uint32_t i = 0; i < 4; ++i)
++        if (m & (1u << i))
++          recovered[r * K + c + i] = spA.values[v_idx++];
++    }
++
++  for (uint32_t i = 0; i < M * K; ++i)
++    assert(recovered[i] == denseA[i] || recovered[i] == 0); //Either the value is preserved or pruned
++  std::cout << "pruneAndCompressMatrixA passed\n";
++}
++
++
++int main(int argc, char *argv[]) {
++  // parse command arguments
++  parse_args(argc, argv);
++
++  if(g_enable_sparse) {
++    test_pruneA(); // Test the pruning function
++  }
++
++  std::srand(50);
++
++  // open device connection
++  std::cout << "open device connection" << std::endl;
++  RT_CHECK(vx_dev_open(&device));
++
++  uint64_t isa_flags;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_ISA_FLAGS, &isa_flags));
++  bool has_ext = (isa_flags & VX_ISA_EXT_TCU) != 0;
++  if (!has_ext) {
++    std::cout << "TCU extension not supported!" << std::endl;
++    cleanup();
++    return -1;
++  }
++
++  uint64_t NT;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT));
++  if (NT != NUM_THREADS) {
++    std::cout << "Error: device warp size (" << NT << ") must match NUM_THREADS=" << NUM_THREADS << "!" << std::endl;
++    return -1;
++  }
++
++  uint32_t M = xm;
++  uint32_t N = xn;
++  uint32_t K = xk;
++
++  if ((M % cfg::tileM) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileM!" << std::endl;
++    return -1;
++  }
++
++  if ((N % cfg::tileN) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileN!" << std::endl;
++    return -1;
++  }
++
++  if ((K % cfg::tileK) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileK!" << std::endl;
++    return -1;
++  }
++
++  size_t sizeA = M * K;
++  size_t sizeB = K * N;
++  size_t sizeC = M * N;
++
++  std::cout << "input data type: " << vt::ITYPE::name << " (id=" << vt::ITYPE::id << ")" << std::endl;
++  std::cout << "output data type: " << vt::OTYPE::name << " (id=" << vt::OTYPE::id << ")" << std::endl;
++  std::cout << "UMMA Core Dimension: M=" << cfg::tcM << ", N=" << cfg::tcN << ", K=" << cfg::tcK << std::endl;
++  std::cout << "UMMA Tile Dimension: M=" << cfg::tileM << ", N=" << cfg::tileN << ", K=" << cfg::tileK << std::endl;
++  std::cout << "matrix A: " << M << "x" << K << std::endl;
++  std::cout << "matrix B: " << K << "x" << N << std::endl;
++  std::cout << "matrix C: " << M << "x" << N << std::endl;
++
++  // set block size to warp size
++  kernel_arg.grid_dim[0] = N / cfg::tileN;
++  kernel_arg.grid_dim[1] = M / cfg::tileM;
++  kernel_arg.block_dim[0] = NT; // warp sizeb
++  kernel_arg.block_dim[1] = 1;
++
++  // set matrix dimensions
++  kernel_arg.M = M;
++  kernel_arg.N = N;
++  kernel_arg.K = K;
++
++  // allocate device memory
++  std::cout << "allocate device memory" << std::endl;
++  RT_CHECK(vx_mem_alloc(device, sizeA * sizeof(itype_t), VX_MEM_READ, &A_buffer));
++  RT_CHECK(vx_mem_address(A_buffer, &kernel_arg.A_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeB * sizeof(itype_t), VX_MEM_READ, &B_buffer));
++  RT_CHECK(vx_mem_address(B_buffer, &kernel_arg.B_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeC * sizeof(otype_t), VX_MEM_WRITE, &C_buffer));
++  RT_CHECK(vx_mem_address(C_buffer, &kernel_arg.C_addr));
++
++  std::cout << "A_addr=0x" << std::hex << kernel_arg.A_addr << std::endl;
++  std::cout << "B_addr=0x" << std::hex << kernel_arg.B_addr << std::endl;
++  std::cout << "C_addr=0x" << std::hex << kernel_arg.C_addr << std::endl;
++
++  // generate source data
++  std::vector<itype_t> h_A(sizeA);
++  std::vector<itype_t> h_B(sizeB);
++  for (uint32_t i = 0; i < sizeA; ++i) {
++    h_A[i] = Comparator<vt::ITYPE>::generate();
++  }
++  for (uint32_t i = 0; i < sizeB; ++i) {
++    h_B[i] = Comparator<vt::ITYPE>::generate();
++  }
++
++  // upload matrix A buffer
++  {
++    std::cout << "upload matrix A buffer" << std::endl;
++    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, sizeA * sizeof(itype_t)));
++  }
++
++  // upload matrix B buffer
++  {
++    std::cout << "upload matrix B buffer" << std::endl;
++    if constexpr (std::is_same<vt::ITYPE, vt::int4>::value || std::is_same<vt::ITYPE, vt::uint4>::value) {
++      // sub-byte matrix B must be in col-major format
++      // we convert the 4-bit row-major to col-major here
++      std::vector<uint8_t> h_B_col(sizeB);
++      convert_row_to_col_major_4bit(h_B_col.data(), N, 2 * K, (uint8_t*)h_B.data());
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B_col.data(), 0, sizeB));
++    } else {
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, sizeB * sizeof(itype_t)));
++    }
++  }
++
++  // upload program
++  std::cout << "upload program" << std::endl;
++  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
++
++  // upload kernel argument
++  std::cout << "upload kernel argument" << std::endl;
++  RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
++
++  auto time_start = std::chrono::high_resolution_clock::now();
++
++  // start device
++  std::cout << "start device" << std::endl;
++  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
++
++  // wait for completion
++  std::cout << "wait for completion" << std::endl;
++  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
++
++  auto time_end = std::chrono::high_resolution_clock::now();
++  double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
++  printf("Elapsed time: %lg ms\n", elapsed);
++
++  // download destination buffer
++  std::vector<otype_t> h_C(sizeC);
++  std::cout << "download destination buffer" << std::endl;
++  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, sizeC * sizeof(otype_t)));
++
++  // verify result
++  std::cout << "verify result" << std::endl;
++  int errors = 0;
++  {
++    std::vector<otype_t> h_ref(sizeC);
++    matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
++
++    for (uint32_t i = 0; i < h_ref.size(); ++i) {
++      if (!Comparator<vt::OTYPE>::compare(h_C[i], h_ref[i], i, errors)) {
++        ++errors;
++      }
++    }
++  }
++
++  // cleanup
++  std::cout << "cleanup" << std::endl;
++  cleanup();
++
++  if (errors != 0) {
++    std::cout << "Found " << std::dec << errors << " / " << sizeC << " errors!" << std::endl;
++    std::cout << "FAILED!" << std::endl;
++    return errors;
++  }
++
++  std::cout << "PASSED!" << std::endl;
++
++  return 0;
++}
+\ No newline at end of file

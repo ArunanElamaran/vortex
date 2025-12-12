@@ -99,9 +99,10 @@ package VX_gpu_pkg;
 	localparam NUM_SOCKETS = `UP(`NUM_CORES / `SOCKET_SIZE);
 
     localparam MEM_REQ_FLAG_FLUSH =  0;
-    localparam MEM_REQ_FLAG_IO =     1;
-    localparam MEM_REQ_FLAG_LOCAL =  2; // shoud be last since optional
-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
+    localparam MEM_REQ_FLAG_IO    =  1;
+    localparam MEM_REQ_FLAG_LOCAL =  2; // should be last since optional
+    localparam MEM_REQ_FLAG_TMEM  = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED); // optional
+    localparam MEM_FLAGS_WIDTH    = (MEM_REQ_FLAG_TMEM + `TMEM_ENABLED);
 
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = 32;
@@ -440,6 +441,7 @@ package VX_gpu_pkg;
 `ifdef EXT_TCU_ENABLE
 
     localparam INST_TCU_WMMA = 4'h0;
+    localparam INST_TCU_UMMA = 4'h1;
     localparam INST_TCU_BITS = 4;
 
 `endif
@@ -708,6 +710,13 @@ package VX_gpu_pkg;
     } lmem_perf_t;
 
     typedef struct packed {
+        logic [PERF_CTR_BITS-1:0] reads;
+        logic [PERF_CTR_BITS-1:0] writes;
+        logic [PERF_CTR_BITS-1:0] bank_stalls;
+        logic [PERF_CTR_BITS-1:0] crsp_stalls;
+    } tmem_perf_t;
+
+    typedef struct packed {
         logic [PERF_CTR_BITS-1:0] misses;
     } coalescer_perf_t;
 
@@ -736,6 +745,7 @@ package VX_gpu_pkg;
         cache_perf_t l2cache;
         cache_perf_t l3cache;
         lmem_perf_t  lmem;
+        tmem_perf_t  tmem;
         coalescer_perf_t coalescer;
         mem_perf_t   mem;
     } sysmem_perf_t;
@@ -759,6 +769,7 @@ package VX_gpu_pkg;
     localparam LSU_TAG_WIDTH        = (UUID_WIDTH + LSU_TAG_ID_BITS);
     localparam LSU_NUM_REQS	        = `NUM_LSU_BLOCKS * `NUM_LSU_LANES;
     localparam LMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
+    localparam TMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
 
     ////////////////////////// Icache Parameters //////////////////////////////
 

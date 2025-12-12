@@ -109,7 +109,8 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
     end
 
 `ifdef PERF_ENABLE
-    VX_cache_pkg::cache_perf_t lmem_perf = '0;
+    lmem_perf_t lmem_perf;
+    tmem_perf_t tmem_perf;
 `endif
 
     VX_mem_unit #(
@@ -119,9 +120,15 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .reset         (reset),
     `ifdef PERF_ENABLE
         .lmem_perf     (lmem_perf),
+        .tmem_perf     (tmem_perf),
     `endif
         .lsu_mem_if    (lsu_mem_if),
         .dcache_bus_if (mem_bus_if)
     );
+
+`ifdef PERF_ENABLE
+    `UNUSED_VAR (lmem_perf);
+    `UNUSED_VAR (tmem_perf);
+`endif
 
 endmodule

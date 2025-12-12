@@ -183,6 +183,7 @@ import VX_fpu_pkg::*;
             `VX_CSR_NUM_WARPS  : read_data_ro_w = `XLEN'(`NUM_WARPS);
             `VX_CSR_NUM_CORES  : read_data_ro_w = `XLEN'(`NUM_CORES * `NUM_CLUSTERS);
             `VX_CSR_LOCAL_MEM_BASE: read_data_ro_w = `XLEN'(`LMEM_BASE_ADDR);
+            `VX_CSR_TENSOR_MEM_BASE: read_data_ro_w = `XLEN'(`TMEM_BASE_ADDR);
 
             `CSR_READ_64(`VX_CSR_MCYCLE, read_data_ro_w, cycles);
 
@@ -254,6 +255,10 @@ import VX_fpu_pkg::*;
                         `CSR_READ_64(`VX_CSR_MPM_LMEM_READS, read_data_ro_w, sysmem_perf.lmem.reads);
                         `CSR_READ_64(`VX_CSR_MPM_LMEM_WRITES, read_data_ro_w, sysmem_perf.lmem.writes);
                         `CSR_READ_64(`VX_CSR_MPM_LMEM_BANK_ST, read_data_ro_w, sysmem_perf.lmem.bank_stalls);
+                        // PERF: tmem
+                        `CSR_READ_64(`VX_CSR_MPM_TMEM_READS, read_data_ro_w, sysmem_perf.tmem.reads);
+                        `CSR_READ_64(`VX_CSR_MPM_TMEM_WRITES, read_data_ro_w, sysmem_perf.tmem.writes);
+                        `CSR_READ_64(`VX_CSR_MPM_TMEM_BANK_ST, read_data_ro_w, sysmem_perf.tmem.bank_stalls);
                         // PERF: l2cache
                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_READS, read_data_ro_w, sysmem_perf.l2cache.reads);
                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_WRITES, read_data_ro_w, sysmem_perf.l2cache.writes);
@@ -295,6 +300,7 @@ import VX_fpu_pkg::*;
 `ifdef PERF_ENABLE
     `UNUSED_VAR (sysmem_perf.icache);
     `UNUSED_VAR (sysmem_perf.lmem);
+    `UNUSED_VAR (sysmem_perf.tmem);
 `endif
 
 endmodule

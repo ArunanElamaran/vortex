@@ -127,13 +127,15 @@ module VX_core_top import VX_gpu_pkg::*; #(
     assign icache_rsp_ready = icache_bus_if.rsp_ready;
 
 `ifdef PERF_ENABLE
-    sysmem_perf_t mem_perf;
-    assign mem_perf.icache  = '0;
-    assign mem_perf.dcache  = '0;
-    assign mem_perf.l2cache = '0;
-    assign mem_perf.l3cache = '0;
-    assign mem_perf.lmem    = '0;
-    assign mem_perf.mem     = '0;
+    sysmem_perf_t sysmem_perf;
+    assign sysmem_perf.icache    = '0;
+    assign sysmem_perf.dcache    = '0;
+    assign sysmem_perf.l2cache   = '0;
+    assign sysmem_perf.l3cache   = '0;
+    assign sysmem_perf.lmem      = '0;
+    assign sysmem_perf.tmem      = '0;
+    assign sysmem_perf.coalescer = '0;
+    assign sysmem_perf.mem       = '0;
 `endif
 
 `ifdef SCOPE
