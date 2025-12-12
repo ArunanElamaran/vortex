@@ -1,0 +1,1516 @@
+diff --git a/hw/rtl/VX_config.vh b/hw/rtl/VX_config.vh
+index b1f71a7..f6aae05 100644
+--- a/hw/rtl/VX_config.vh
++++ b/hw/rtl/VX_config.vh
+@@ -223,20 +223,51 @@
+ `define LMEM_LOG_SIZE   14
+ `endif
+ 
++`ifndef TMEM_LOG_SIZE
++`define TMEM_LOG_SIZE   16  // 64KB tensor memory
++`endif
++
+ `ifndef LMEM_BASE_ADDR
++`ifdef XLEN_32
++`ifdef LMEM_ENABLE
++`ifndef TMEM_BASE_ADDR
++// For 32-bit with both LMEM and TMEM: Place TMEM before LMEM to avoid overflow
++// Align STACK_BASE_ADDR down to TMEM boundary, then place TMEM there, LMEM after
++`define _STACK_ALIGNED  (`STACK_BASE_ADDR & ~((1 << `TMEM_LOG_SIZE) - 1))
++`define TMEM_BASE_ADDR  `_STACK_ALIGNED
++`define LMEM_BASE_ADDR  (`_STACK_ALIGNED + (1 << `TMEM_LOG_SIZE))
++`else
++// TMEM_BASE_ADDR already defined, place LMEM after it
++`define LMEM_BASE_ADDR  (`TMEM_BASE_ADDR + (1 << `TMEM_LOG_SIZE))
++`endif
++`else
++// No LMEM, use standard
++`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
++`endif
++`else
++// 64-bit: standard placement
+ `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+ `endif
+-
+-`ifndef TMEM_LOG_SIZE
+-`define TMEM_LOG_SIZE   16  // 64KB tensor memory
+ `endif
+ 
+ `ifndef TMEM_BASE_ADDR
+-`define TMEM_BASE_ADDR  (LMEM_BASE_ADDR + (1 << LMEM_LOG_SIZE))
++// TMEM starts after LMEM, aligned to TMEM boundary
++`ifdef XLEN_32
++// For 32-bit: If LMEM_BASE_ADDR wasn't adjusted above, calculate normally
++// This handles the case when LMEM_ENABLE is not defined
++`define _LMEM_END  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
++`define _TMEM_ALIGN_MASK  ((1 << `TMEM_LOG_SIZE) - 1)
++`define TMEM_BASE_ADDR  ((`_LMEM_END + `_TMEM_ALIGN_MASK) & ~`_TMEM_ALIGN_MASK)
++`else
++// For 64-bit: Standard alignment formula
++`define _LMEM_END  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
++`define _TMEM_ALIGN_MASK  ((1 << `TMEM_LOG_SIZE) - 1)
++`define TMEM_BASE_ADDR  ((`_LMEM_END + `_TMEM_ALIGN_MASK) & ~`_TMEM_ALIGN_MASK)
++`endif
+ `endif
+ 
+-`define TMEM_SIZE       (1 << TMEM_LOG_SIZE)
+-`define TMEM_END_ADDR   (TMEM_BASE_ADDR + TMEM_SIZE)
++`define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
++`define TMEM_END_ADDR   (`TMEM_BASE_ADDR + `TMEM_SIZE)
+ 
+ `ifndef IO_COUT_ADDR
+ `define IO_COUT_ADDR    `IO_BASE_ADDR
+@@ -676,8 +707,10 @@
+ // LMEM Configurable Knobs ////////////////////////////////////////////////////
+ 
+ `ifndef LMEM_DISABLE
++`ifndef LMEM_ENABLE
+ `define LMEM_ENABLE
+ `endif
++`endif
+ 
+ `ifndef LMEM_ENABLE
+     `define LMEM_NUM_BANKS 1
+@@ -689,12 +722,7 @@
+ `endif
+ 
+ // TMEM Configurable Knobs ////////////////////////////////////////////////////
+-
+-`ifndef TMEM_DISABLE
+-`define TMEM_ENABLE
+-`endif
+-
+-`ifndef TMEM_ENABLE
++`ifndef LMEM_ENABLE
+     `define TMEM_NUM_BANKS 1
+ `endif
+ 
+@@ -867,6 +895,12 @@
+     `define LMEM_ENABLED 0
+ `endif
+ 
++`ifdef LMEM_ENABLE
++    `define TMEM_ENABLED 1
++`else
++    `define TMEM_ENABLED 0
++`endif
++
+ `ifdef GBAR_ENABLE
+     `define GBAR_ENABLED 1
+ `else
+@@ -952,6 +986,7 @@
+ `define ISA_EXT_LMEM        4
+ `define ISA_EXT_ZICOND      5
+ `define ISA_EXT_TCU         6
++`define ISA_EXT_TMEM        7
+ 
+ `define MISA_EXT  (`ICACHE_ENABLED  << `ISA_EXT_ICACHE) \
+                 | (`DCACHE_ENABLED  << `ISA_EXT_DCACHE) \
+@@ -960,6 +995,7 @@
+                 | (`LMEM_ENABLED    << `ISA_EXT_LMEM) \
+                 | (`EXT_ZICOND_ENABLED << `ISA_EXT_ZICOND) \
+                 | (`EXT_TCU_ENABLED << `ISA_EXT_TCU) \
++                | (`TMEM_ENABLED    << `ISA_EXT_TMEM) \
+ 
+ `define MISA_STD  (`EXT_A_ENABLED <<  0) /* A - Atomic Instructions extension */ \
+                 | (0 <<  1) /* B - Tentatively reserved for Bit operations extension */ \
+diff --git a/hw/rtl/VX_gpu_pkg.sv b/hw/rtl/VX_gpu_pkg.sv
+index 2ef9ae2..66d8638 100644
+--- a/hw/rtl/VX_gpu_pkg.sv
++++ b/hw/rtl/VX_gpu_pkg.sv
+@@ -101,7 +101,12 @@ package VX_gpu_pkg;
+     localparam MEM_REQ_FLAG_FLUSH =  0;
+     localparam MEM_REQ_FLAG_IO =     1;
+     localparam MEM_REQ_FLAG_LOCAL =  2; // shoud be last since optional
+-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
++
++    // Per-local-type flags
++    localparam MEM_REQ_FLAG_LMEM  = MEM_REQ_FLAG_LOCAL;                    // 2
++    localparam MEM_REQ_FLAG_TMEM  = MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED;    // 2 or 3
++
++    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED + 1); // +1 for TMEM when LMEM enabled
+ 
+     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
+     localparam VX_DCR_DATA_WIDTH = 32;
+@@ -440,6 +445,7 @@ package VX_gpu_pkg;
+ `ifdef EXT_TCU_ENABLE
+ 
+     localparam INST_TCU_WMMA = 4'h0;
++    localparam INST_TCU_UMMA = 4'h1;
+     localparam INST_TCU_BITS = 4;
+ 
+ `endif
+@@ -707,6 +713,13 @@ package VX_gpu_pkg;
+         logic [PERF_CTR_BITS-1:0] crsp_stalls;
+     } lmem_perf_t;
+ 
++    typedef struct packed {
++        logic [PERF_CTR_BITS-1:0] reads;
++        logic [PERF_CTR_BITS-1:0] writes;
++        logic [PERF_CTR_BITS-1:0] bank_stalls;
++        logic [PERF_CTR_BITS-1:0] crsp_stalls;
++    } tmem_perf_t;
++
+     typedef struct packed {
+         logic [PERF_CTR_BITS-1:0] misses;
+     } coalescer_perf_t;
+@@ -736,6 +749,7 @@ package VX_gpu_pkg;
+         cache_perf_t l2cache;
+         cache_perf_t l3cache;
+         lmem_perf_t  lmem;
++        tmem_perf_t  tmem;
+         coalescer_perf_t coalescer;
+         mem_perf_t   mem;
+     } sysmem_perf_t;
+@@ -759,6 +773,7 @@ package VX_gpu_pkg;
+     localparam LSU_TAG_WIDTH        = (UUID_WIDTH + LSU_TAG_ID_BITS);
+     localparam LSU_NUM_REQS	        = `NUM_LSU_BLOCKS * `NUM_LSU_LANES;
+     localparam LMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
++    localparam TMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
+ 
+     ////////////////////////// Icache Parameters //////////////////////////////
+ 
+diff --git a/hw/rtl/VX_types.vh b/hw/rtl/VX_types.vh
+index 7ff3326..9a575b9 100644
+--- a/hw/rtl/VX_types.vh
++++ b/hw/rtl/VX_types.vh
+@@ -179,6 +179,13 @@
+ `define VX_CSR_MPM_LMEM_WRITES_H        12'hB9C
+ `define VX_CSR_MPM_LMEM_BANK_ST         12'hB1D     // bank conflicts
+ `define VX_CSR_MPM_LMEM_BANK_ST_H       12'hB9D
++// PERF: tmem
++`define VX_CSR_MPM_TMEM_READS           12'hB20     // memory reads
++`define VX_CSR_MPM_TMEM_READS_H         12'hBA0
++`define VX_CSR_MPM_TMEM_WRITES          12'hB21     // memory writes
++`define VX_CSR_MPM_TMEM_WRITES_H        12'hBA1
++`define VX_CSR_MPM_TMEM_BANK_ST         12'hB22     // bank conflicts
++`define VX_CSR_MPM_TMEM_BANK_ST_H       12'hBA2
+ // PERF: coalescer
+ `define VX_CSR_MPM_COALESCER_MISS       12'hB1F     // coalescer misses
+ `define VX_CSR_MPM_COALESCER_MISS_H     12'hB9F
+@@ -214,5 +221,6 @@
+ `define VX_CSR_NUM_WARPS                12'hFC1
+ `define VX_CSR_NUM_CORES                12'hFC2
+ `define VX_CSR_LOCAL_MEM_BASE           12'hFC3
++`define VX_CSR_TENSOR_MEM_BASE          12'hFC4
+ 
+ `endif // VX_TYPES_VH
+diff --git a/hw/rtl/Vortex.sv b/hw/rtl/Vortex.sv
+index eee08c7..c1afe9a 100644
+--- a/hw/rtl/Vortex.sv
++++ b/hw/rtl/Vortex.sv
+@@ -207,8 +207,8 @@ module Vortex import VX_gpu_pkg::*; (
+ 
+     // dump device configuration
+     initial begin
+-        `TRACE(0, ("CONFIGS: num_threads=%0d, num_warps=%0d, num_cores=%0d, num_clusters=%0d, socket_size=%0d, local_mem_base=0x%0h, num_barriers=%0d\n",
+-                    `NUM_THREADS, `NUM_WARPS, `NUM_CORES, `NUM_CLUSTERS, `SOCKET_SIZE, `LMEM_BASE_ADDR, `NUM_BARRIERS))
++        `TRACE(0, ("CONFIGS: num_threads=%0d, num_warps=%0d, num_cores=%0d, num_clusters=%0d, socket_size=%0d, local_mem_base=0x%0h, tensor_mem_base=0x%0h, num_barriers=%0d\n",
++                    `NUM_THREADS, `NUM_WARPS, `NUM_CORES, `NUM_CLUSTERS, `SOCKET_SIZE, `LMEM_BASE_ADDR, `TMEM_BASE_ADDR, `NUM_BARRIERS))
+     end
+ 
+ `ifdef DBG_TRACE_MEM
+diff --git a/hw/rtl/afu/opae/ccip_std_afu.sv b/hw/rtl/afu/opae/ccip_std_afu.sv
+index b042ba6..b373eba 100644
+--- a/hw/rtl/afu/opae/ccip_std_afu.sv
++++ b/hw/rtl/afu/opae/ccip_std_afu.sv
+@@ -10,9 +10,11 @@
+ `include "platform_if.vh"
+ 
+ import local_mem_cfg_pkg::*;
++import tensor_mem_cfg_pkg::*;
+ 
+ module ccip_std_afu #(
+-    parameter NUM_LOCAL_MEM_BANKS = 2
++    parameter NUM_LOCAL_MEM_BANKS = 2,
++    parameter NUM_TENSOR_MEM_BANKS = 2
+ ) (
+     // CCI-P Clocks and Resets
+     input  logic        pClk,                 // Primary CCI-P interface clock.
+@@ -30,7 +32,8 @@ module ccip_std_afu #(
+     output t_if_ccip_Tx pck_af2cp_sTx,        // CCI-P Tx Port
+ 
+     // Local memory interface
+-    avalon_mem_if.to_fiu local_mem[NUM_LOCAL_MEM_BANKS]
++    avalon_mem_if.to_fiu local_mem[NUM_LOCAL_MEM_BANKS],
++    avalon_mem_if.to_fiu tensor_mem[NUM_TENSOR_MEM_BANKS]
+ );
+ 
+     // ====================================================================
+@@ -78,27 +81,51 @@ module ccip_std_afu #(
+     // User AFU goes here
+     // ====================================================================
+ 
+-    t_local_mem_byte_mask avs_byteenable [NUM_LOCAL_MEM_BANKS];
+-    logic                 avs_waitrequest [NUM_LOCAL_MEM_BANKS];
+-    t_local_mem_data      avs_readdata [NUM_LOCAL_MEM_BANKS];
+-    logic                 avs_readdatavalid [NUM_LOCAL_MEM_BANKS];
+-    t_local_mem_burst_cnt avs_burstcount [NUM_LOCAL_MEM_BANKS];
+-    t_local_mem_data      avs_writedata [NUM_LOCAL_MEM_BANKS];
+-    t_local_mem_addr      avs_address [NUM_LOCAL_MEM_BANKS];
+-    logic                 avs_write [NUM_LOCAL_MEM_BANKS];
+-    logic                 avs_read [NUM_LOCAL_MEM_BANKS];
++    t_local_mem_byte_mask avs_byteenableL [NUM_LOCAL_MEM_BANKS];
++    logic                 avs_waitrequestL [NUM_LOCAL_MEM_BANKS];
++    t_local_mem_data      avs_readdataL [NUM_LOCAL_MEM_BANKS];
++    logic                 avs_readdatavalidL [NUM_LOCAL_MEM_BANKS];
++    t_local_mem_burst_cnt avs_burstcountL [NUM_LOCAL_MEM_BANKS];
++    t_local_mem_data      avs_writedataL [NUM_LOCAL_MEM_BANKS];
++    t_local_mem_addr      avs_addressL [NUM_LOCAL_MEM_BANKS];
++    logic                 avs_writeL [NUM_LOCAL_MEM_BANKS];
++    logic                 avs_readL [NUM_LOCAL_MEM_BANKS];
++
++
++    t_tensor_mem_byte_mask avs_byteenableT [NUM_TENSOR_MEM_BANKS];
++    logic                 avs_waitrequestT [NUM_TENSOR_MEM_BANKS];
++    t_tensor_mem_data      avs_readdataT [NUM_TENSOR_MEM_BANKS];
++    logic                 avs_readdatavalidT [NUM_TENSOR_MEM_BANKS];
++    t_tensor_mem_burst_cnt avs_burstcountT [NUM_TENSOR_MEM_BANKS];
++    t_tensor_mem_data      avs_writedataT [NUM_TENSOR_MEM_BANKS];
++    t_tensor_mem_addr      avs_addressT [NUM_TENSOR_MEM_BANKS];
++    logic                 avs_writeT [NUM_TENSOR_MEM_BANKS];
++    logic                 avs_readT [NUM_TENSOR_MEM_BANKS];
+ 
+     for (genvar b = 0; b < NUM_LOCAL_MEM_BANKS; b++) begin
+-        assign local_mem[b].burstcount = avs_burstcount[b];
+-        assign local_mem[b].writedata  = avs_writedata[b];
+-        assign local_mem[b].address    = avs_address[b];
+-        assign local_mem[b].byteenable = avs_byteenable[b];
+-        assign local_mem[b].write      = avs_write[b];
+-        assign local_mem[b].read       = avs_read[b];
+-
+-        assign avs_waitrequest[b]   = local_mem[b].waitrequest;
+-        assign avs_readdata[b]      = local_mem[b].readdata;
+-        assign avs_readdatavalid[b] = local_mem[b].readdatavalid;
++        assign local_mem[b].burstcount = avs_burstcountL[b];
++        assign local_mem[b].writedata  = avs_writedataL[b];
++        assign local_mem[b].address    = avs_addressL[b];
++        assign local_mem[b].byteenable = avs_byteenableL[b];
++        assign local_mem[b].write      = avs_writeL[b];
++        assign local_mem[b].read       = avs_readL[b];
++
++        assign avs_waitrequestL[b]   = local_mem[b].waitrequest;
++        assign avs_readdataL[b]      = local_mem[b].readdata;
++        assign avs_readdatavalidL[b] = local_mem[b].readdatavalid;
++    end
++
++    for (genvar b = 0; b < NUM_TENSOR_MEM_BANKS; b++) begin
++        assign tensor_mem[b].burstcount = avs_burstcountT[b];
++        assign tensor_mem[b].writedata  = avs_writedataT[b];
++        assign tensor_mem[b].address    = avs_addressT[b];
++        assign tensor_mem[b].byteenable = avs_byteenableT[b];
++        assign tensor_mem[b].write      = avs_writeT[b];
++        assign tensor_mem[b].read       = avs_readT[b];
++
++        assign avs_waitrequestT[b]   = tensor_mem[b].waitrequest;
++        assign avs_readdataT[b]      = tensor_mem[b].readdata;
++        assign avs_readdatavalidT[b] = tensor_mem[b].readdatavalid;
+     end
+ 
+     vortex_afu #(
+@@ -110,15 +137,26 @@ module ccip_std_afu #(
+         .cp2af_sRxPort       (cp2af_sRx_T1),
+         .af2cp_sTxPort       (af2cp_sTx_T0),
+ 
+-        .avs_writedata       (avs_writedata),
+-        .avs_readdata        (avs_readdata),
+-        .avs_address         (avs_address),
+-        .avs_waitrequest     (avs_waitrequest),
+-        .avs_write           (avs_write),
+-        .avs_read            (avs_read),
+-        .avs_byteenable      (avs_byteenable),
+-        .avs_burstcount      (avs_burstcount),
+-        .avs_readdatavalid   (avs_readdatavalid)
++        .avs_writedataL       (avs_writedataL),
++        .avs_readdataL        (avs_readdataL),
++        .avs_addressL         (avs_addressL),
++        .avs_waitrequestL     (avs_waitrequestL),
++        .avs_writeL           (avs_writeL),
++        .avs_readL            (avs_readL),
++        .avs_byteenableL      (avs_byteenableL),
++        .avs_burstcountL      (avs_burstcountL),
++        .avs_readdatavalidL   (avs_readdatavalidL),
++
++
++        .avs_writedataT       (avs_writedataT),
++        .avs_readdataT        (avs_readdataT),
++        .avs_addressT         (avs_addressT),
++        .avs_waitrequestT     (avs_waitrequestT),
++        .avs_writeT           (avs_writeT),
++        .avs_readT            (avs_readT),
++        .avs_byteenableT      (avs_byteenableT),
++        .avs_burstcountT      (avs_burstcountT),
++        .avs_readdatavalidT   (avs_readdatavalidT),
+     );
+ 
+ endmodule
+diff --git a/hw/rtl/afu/opae/local_mem_cfg_pkg.sv b/hw/rtl/afu/opae/local_mem_cfg_pkg.sv
+index 87b3290..a957d51 100644
+--- a/hw/rtl/afu/opae/local_mem_cfg_pkg.sv
++++ b/hw/rtl/afu/opae/local_mem_cfg_pkg.sv
+@@ -66,4 +66,13 @@ package local_mem_cfg_pkg;
+     // Byte-level mask of a data line
+     typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_local_mem_byte_mask;
+ 
++    // Tensor memory types (using same parameters as local memory)
++    typedef logic [LOCAL_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
++    typedef logic [LOCAL_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
++
++    typedef logic [LOCAL_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
++
++    // Byte-level mask of a data line
++    typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
++
+ endpackage // local_mem_cfg_pkg
+diff --git a/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv b/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv
+new file mode 100644
+index 0000000..8f97c1c
+--- /dev/null
++++ b/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv
+@@ -0,0 +1,69 @@
++//
++// Copyright (c) 2017, Intel Corporation
++// All rights reserved.
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are met:
++//
++// Redistributions of source code must retain the above copyright notice, this
++// list of conditions and the following disclaimer.
++//
++// Redistributions in binary form must reproduce the above copyright notice,
++// this list of conditions and the following disclaimer in the documentation
++// and/or other materials provided with the distribution.
++//
++// Neither the name of the Intel Corporation nor the names of its contributors
++// may be used to endorse or promote products derived from this software
++// without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++// POSSIBILITY OF SUCH DAMAGE.
++
++`include "VX_define.vh"
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH ((`PLATFORM_MEMORY_ADDR_WIDTH - $clog2(`PLATFORM_MEMORY_NUM_BANKS)) - $clog2(`PLATFORM_MEMORY_DATA_SIZE))
++`endif
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH (`PLATFORM_MEMORY_DATA_SIZE * 8)
++`endif
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH 4
++`endif
++
++package tensor_mem_cfg_pkg;
++
++    parameter TENSOR_MEM_VERSION_NUMBER = 1;
++
++    parameter TENSOR_MEM_ADDR_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH;
++    parameter TENSOR_MEM_DATA_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH;
++
++    parameter TENSOR_MEM_BURST_CNT_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH;
++
++    // Number of bytes in a data line
++    parameter TENSOR_MEM_DATA_N_BYTES = TENSOR_MEM_DATA_WIDTH / 8;
++
++
++    // Base types
++    // --------------------------------------------------------------------
++
++    typedef logic [TENSOR_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
++    typedef logic [TENSOR_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
++
++    typedef logic [TENSOR_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
++
++    // Byte-level mask of a data line
++    typedef logic [TENSOR_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
++
++endpackage // tensor_mem_cfg_pkg
+diff --git a/hw/rtl/afu/opae/vortex_afu.sv b/hw/rtl/afu/opae/vortex_afu.sv
+index b8f981e..8a57271 100644
+--- a/hw/rtl/afu/opae/vortex_afu.sv
++++ b/hw/rtl/afu/opae/vortex_afu.sv
+@@ -20,7 +20,8 @@
+ `endif
+ 
+ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_gpu_pkg::*; #(
+-    parameter NUM_LOCAL_MEM_BANKS = 2
++    parameter NUM_LOCAL_MEM_BANKS = 2,
++    parameter NUM_TENSOR_MEM_BANKS = 2
+ ) (
+     // global signals
+     input wire clk,
+@@ -31,15 +32,28 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+     output  t_if_ccip_Tx  af2cp_sTxPort,
+ 
+     // Avalon signals for local memory access
+-    output  t_local_mem_data      avs_writedata [NUM_LOCAL_MEM_BANKS],
+-    input   t_local_mem_data      avs_readdata [NUM_LOCAL_MEM_BANKS],
+-    output  t_local_mem_addr      avs_address [NUM_LOCAL_MEM_BANKS],
+-    input   wire                  avs_waitrequest [NUM_LOCAL_MEM_BANKS],
+-    output  wire                  avs_write [NUM_LOCAL_MEM_BANKS],
+-    output  wire                  avs_read [NUM_LOCAL_MEM_BANKS],
+-    output  t_local_mem_byte_mask avs_byteenable [NUM_LOCAL_MEM_BANKS],
+-    output  t_local_mem_burst_cnt avs_burstcount [NUM_LOCAL_MEM_BANKS],
+-    input   wire                  avs_readdatavalid [NUM_LOCAL_MEM_BANKS]
++    output  t_local_mem_data      avs_writedataL [NUM_LOCAL_MEM_BANKS],
++    input   t_local_mem_data      avs_readdataL [NUM_LOCAL_MEM_BANKS],
++    output  t_local_mem_addr      avs_addressL [NUM_LOCAL_MEM_BANKS],
++    input   wire                  avs_waitrequestL [NUM_LOCAL_MEM_BANKS],
++    output  wire                  avs_writeL [NUM_LOCAL_MEM_BANKS],
++    output  wire                  avs_readL [NUM_LOCAL_MEM_BANKS],
++    output  t_local_mem_byte_mask avs_byteenableL [NUM_LOCAL_MEM_BANKS],
++    output  t_local_mem_burst_cnt avs_burstcountL [NUM_LOCAL_MEM_BANKS],
++    input   wire                  avs_readdatavalidL [NUM_LOCAL_MEM_BANKS],
++
++    // Avalon signals for tensor memory access
++    /* verilator lint_off UNUSEDSIGNAL */
++    output  t_tensor_mem_data      avs_writedataT [NUM_TENSOR_MEM_BANKS],
++    input   t_tensor_mem_data      avs_readdataT [NUM_TENSOR_MEM_BANKS],
++    output  t_tensor_mem_addr      avs_addressT [NUM_TENSOR_MEM_BANKS],
++    input   wire                   avs_waitrequestT [NUM_TENSOR_MEM_BANKS],
++    output  wire                   avs_writeT [NUM_TENSOR_MEM_BANKS],
++    output  wire                   avs_readT [NUM_TENSOR_MEM_BANKS],
++    output  t_tensor_mem_byte_mask avs_byteenableT [NUM_TENSOR_MEM_BANKS],
++    output  t_tensor_mem_burst_cnt avs_burstcountT [NUM_TENSOR_MEM_BANKS],
++    input   wire                   avs_readdatavalidT [NUM_TENSOR_MEM_BANKS]
++    /* verilator lint_on UNUSEDSIGNAL */
+ );
+     localparam LMEM_DATA_WIDTH    = $bits(t_local_mem_data);
+     localparam LMEM_DATA_SIZE     = LMEM_DATA_WIDTH / 8;
+@@ -50,6 +64,15 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+ 
+     localparam LMEM_BURST_CTRW    = $bits(t_local_mem_burst_cnt);
+ 
++    localparam TMEM_DATA_WIDTH    = $bits(t_tensor_mem_data);
++    localparam TMEM_DATA_SIZE     = TMEM_DATA_WIDTH / 8;
++    localparam TMEM_ADDR_WIDTH    = $bits(t_tensor_mem_addr);
++
++    /* verilator lint_off UNUSEDPARAM */
++    localparam TMEM_BYTE_ADDR_WIDTH = TMEM_ADDR_WIDTH + $clog2(TMEM_DATA_SIZE);
++    localparam TMEM_BURST_CTRW    = $bits(t_tensor_mem_burst_cnt);
++    /* verilator lint_on UNUSEDPARAM */
++
+     localparam MEM_PORTS_BITS     = `CLOG2(VX_MEM_PORTS);
+     localparam MEM_PORTS_WIDTH    = `UP(MEM_PORTS_BITS);
+ 
+@@ -710,17 +733,27 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+         .mem_rsp_ready    (mem_rsp_ready),
+ 
+         // AVS bus
+-        .avs_writedata    (avs_writedata),
+-        .avs_readdata     (avs_readdata),
+-        .avs_address      (avs_address),
+-        .avs_waitrequest  (avs_waitrequest),
+-        .avs_write        (avs_write),
+-        .avs_read         (avs_read),
+-        .avs_byteenable   (avs_byteenable),
+-        .avs_burstcount   (avs_burstcount),
+-        .avs_readdatavalid(avs_readdatavalid)
++        .avs_writedata     (avs_writedataL),
++        .avs_readdata      (avs_readdataL),
++        .avs_address       (avs_addressL),
++        .avs_waitrequest   (avs_waitrequestL),
++        .avs_write         (avs_writeL),
++        .avs_read          (avs_readL),
++        .avs_byteenable    (avs_byteenableL),
++        .avs_burstcount    (avs_burstcountL),
++        .avs_readdatavalid (avs_readdatavalidL)
+     );
+ 
++    // Tensor memory interface - not yet implemented, drive outputs to zero
++    for (genvar i = 0; i < NUM_TENSOR_MEM_BANKS; ++i) begin : g_tmem_dummy
++        assign avs_writedataT[i] = '0;
++        assign avs_addressT[i] = '0;
++        assign avs_writeT[i] = 1'b0;
++        assign avs_readT[i] = 1'b0;
++        assign avs_byteenableT[i] = '0;
++        assign avs_burstcountT[i] = '0;
++    end
++
+     // CCI-P Read Request /////////////////////////////////////////////////////
+ 
+     reg [CCI_ADDR_WIDTH-1:0] cci_mem_wr_req_ctr;
+@@ -1093,7 +1126,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+     wire state_changed   = (state != state_prev);
+     wire vx_mem_req_fire = vx_mem_req_valid[0] && vx_mem_req_ready[0];
+     wire vx_mem_rsp_fire = vx_mem_rsp_valid[0] && vx_mem_rsp_ready[0];
+-    wire avs_req_fire    = (avs_write[0] || avs_read[0]) && ~avs_waitrequest[0];
++    wire avs_req_fire    = (avs_writeL[0] || avs_readL[0]) && ~avs_waitrequestL[0];
+     wire reset_negedge;
+     `NEG_EDGE (reset_negedge, reset);
+     `SCOPE_TAP (0, 0, {
+@@ -1103,9 +1136,9 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+             vx_mem_req_ready[0],
+             vx_mem_rsp_valid[0],
+             vx_mem_rsp_ready[0],
+-            avs_read[0],
+-            avs_write[0],
+-            avs_waitrequest[0],
++            avs_readL[0],
++            avs_writeL[0],
++            avs_waitrequestL[0],
+             cp2af_sRxPort.c0.rspValid,
+             cp2af_sRxPort.c1.rspValid,
+             af2cp_sTxPort.c0.valid,
+@@ -1115,7 +1148,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+         },{
+             state_changed,
+             vx_dcr_wr_valid, // ack-free
+-            avs_readdatavalid[0], // ack-free
++            avs_readdatavalidL[0], // ack-free
+             cp2af_sRxPort.c0.mmioRdValid, // ack-free
+             cp2af_sRxPort.c0.mmioWrValid, // ack-free
+             af2cp_sTxPort.c2.mmioRdValid, // ack-free
+@@ -1143,9 +1176,9 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+             af2cp_sTxPort.c0.hdr.address,
+             af2cp_sTxPort.c0.hdr.mdata,
+             af2cp_sTxPort.c1.hdr.address,
+-            avs_address[0],
+-            avs_byteenable[0],
+-            avs_burstcount[0],
++            avs_addressL[0],
++            avs_byteenableL[0],
++            avs_burstcountL[0],
+             cci_mem_rd_req_ctr,
+             cci_mem_wr_req_ctr,
+             cci_rd_req_ctr,
+@@ -1163,14 +1196,14 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
+ `ifdef DBG_TRACE_AFU
+     always @(posedge clk) begin
+         for (integer i = 0; i < NUM_LOCAL_MEM_BANKS; ++i) begin
+-            if (avs_write[i] && ~avs_waitrequest[i]) begin
+-                `TRACE(2, ("%t: AVS Wr Req[%0d]: addr=0x%0h, byteen=0x%0h, burst=0x%0h, data=0x%h\n", $time, i, `TO_FULL_ADDR(avs_address[i]), avs_byteenable[i], avs_burstcount[i], avs_writedata[i]))
++            if (avs_writeL[i] && ~avs_waitrequestL[i]) begin
++                `TRACE(2, ("%t: AVS Wr Req[%0d]: addr=0x%0h, byteen=0x%0h, burst=0x%0h, data=0x%h\n", $time, i, `TO_FULL_ADDR(avs_addressL[i]), avs_byteenableL[i], avs_burstcountL[i], avs_writedataL[i]))
+             end
+-            if (avs_read[i] && ~avs_waitrequest[i]) begin
+-                `TRACE(2, ("%t: AVS Rd Req[%0d]: addr=0x%0h, byteen=0x%0h,  burst=0x%0h\n", $time, i, `TO_FULL_ADDR(avs_address[i]), avs_byteenable[i], avs_burstcount[i]))
++            if (avs_readL[i] && ~avs_waitrequestL[i]) begin
++                `TRACE(2, ("%t: AVS Rd Req[%0d]: addr=0x%0h, byteen=0x%0h,  burst=0x%0h\n", $time, i, `TO_FULL_ADDR(avs_addressL[i]), avs_byteenableL[i], avs_burstcountL[i]))
+             end
+-            if (avs_readdatavalid[i]) begin
+-                `TRACE(2, ("%t: AVS Rd Rsp[%0d]: data=0x%h\n", $time, i, avs_readdata[i]))
++            if (avs_readdatavalidL[i]) begin
++                `TRACE(2, ("%t: AVS Rd Rsp[%0d]: data=0x%h\n", $time, i, avs_readdataL[i]))
+             end
+         end
+     end
+diff --git a/hw/rtl/core/VX_core.sv b/hw/rtl/core/VX_core.sv
+index 0e41934..f7386a3 100644
+--- a/hw/rtl/core/VX_core.sv
++++ b/hw/rtl/core/VX_core.sv
+@@ -67,12 +67,14 @@ module VX_core import VX_gpu_pkg::*; #(
+ 
+ `ifdef PERF_ENABLE
+     lmem_perf_t lmem_perf;
++    tmem_perf_t tmem_perf;
+     coalescer_perf_t coalescer_perf;
+     pipeline_perf_t pipeline_perf;
+     sysmem_perf_t sysmem_perf_tmp;
+     always @(*) begin
+         sysmem_perf_tmp = sysmem_perf;
+         sysmem_perf_tmp.lmem = lmem_perf;
++        sysmem_perf_tmp.tmem = tmem_perf;
+         sysmem_perf_tmp.coalescer = coalescer_perf;
+     end
+ `endif
+@@ -205,6 +207,7 @@ module VX_core import VX_gpu_pkg::*; #(
+         .reset         (reset),
+     `ifdef PERF_ENABLE
+         .lmem_perf     (lmem_perf),
++        .tmem_perf     (tmem_perf),
+         .coalescer_perf(coalescer_perf),
+     `endif
+         .lsu_mem_if    (lsu_mem_if),
+diff --git a/hw/rtl/core/VX_core_top.sv b/hw/rtl/core/VX_core_top.sv
+index 6b68c99..ca7daea 100644
+--- a/hw/rtl/core/VX_core_top.sv
++++ b/hw/rtl/core/VX_core_top.sv
+@@ -133,6 +133,7 @@ module VX_core_top import VX_gpu_pkg::*; #(
+     assign mem_perf.l2cache = '0;
+     assign mem_perf.l3cache = '0;
+     assign mem_perf.lmem    = '0;
++    assign mem_perf.tmem    = '0;
+     assign mem_perf.mem     = '0;
+ `endif
+ 
+diff --git a/hw/rtl/core/VX_csr_data.sv b/hw/rtl/core/VX_csr_data.sv
+index 96c2973..918c066 100644
+--- a/hw/rtl/core/VX_csr_data.sv
++++ b/hw/rtl/core/VX_csr_data.sv
+@@ -183,6 +183,7 @@ import VX_fpu_pkg::*;
+             `VX_CSR_NUM_WARPS  : read_data_ro_w = `XLEN'(`NUM_WARPS);
+             `VX_CSR_NUM_CORES  : read_data_ro_w = `XLEN'(`NUM_CORES * `NUM_CLUSTERS);
+             `VX_CSR_LOCAL_MEM_BASE: read_data_ro_w = `XLEN'(`LMEM_BASE_ADDR);
++            `VX_CSR_TENSOR_MEM_BASE: read_data_ro_w = `XLEN'(`TMEM_BASE_ADDR);
+ 
+             `CSR_READ_64(`VX_CSR_MCYCLE, read_data_ro_w, cycles);
+ 
+@@ -254,6 +255,10 @@ import VX_fpu_pkg::*;
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_READS, read_data_ro_w, sysmem_perf.lmem.reads);
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_WRITES, read_data_ro_w, sysmem_perf.lmem.writes);
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_BANK_ST, read_data_ro_w, sysmem_perf.lmem.bank_stalls);
++                        // PERF: tmem
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_READS, read_data_ro_w, sysmem_perf.tmem.reads);
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_WRITES, read_data_ro_w, sysmem_perf.tmem.writes);
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_BANK_ST, read_data_ro_w, sysmem_perf.tmem.bank_stalls);
+                         // PERF: l2cache
+                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_READS, read_data_ro_w, sysmem_perf.l2cache.reads);
+                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_WRITES, read_data_ro_w, sysmem_perf.l2cache.writes);
+@@ -295,6 +300,7 @@ import VX_fpu_pkg::*;
+ `ifdef PERF_ENABLE
+     `UNUSED_VAR (sysmem_perf.icache);
+     `UNUSED_VAR (sysmem_perf.lmem);
++    `UNUSED_VAR (sysmem_perf.tmem);
+ `endif
+ 
+ endmodule
+diff --git a/hw/rtl/core/VX_lsu_slice.sv b/hw/rtl/core/VX_lsu_slice.sv
+index 1fad7d8..1e56f55 100644
+--- a/hw/rtl/core/VX_lsu_slice.sv
++++ b/hw/rtl/core/VX_lsu_slice.sv
+@@ -70,13 +70,35 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
+         // is I/O address
+         wire [MEM_ADDRW-1:0] io_addr_start = MEM_ADDRW'(`XLEN'(`IO_BASE_ADDR) >> MEM_ASHIFT);
+         wire [MEM_ADDRW-1:0] io_addr_end = MEM_ADDRW'(`XLEN'(`IO_END_ADDR) >> MEM_ASHIFT);
+-        assign mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
+-        assign mem_req_flags[i][MEM_REQ_FLAG_IO] = (block_addr >= io_addr_start) && (block_addr < io_addr_end);
++        wire is_io = (block_addr >= io_addr_start) && (block_addr < io_addr_end);
+     `ifdef LMEM_ENABLE
+         // is local memory address
+         wire [MEM_ADDRW-1:0] lmem_addr_start = MEM_ADDRW'(`XLEN'(`LMEM_BASE_ADDR) >> MEM_ASHIFT);
+         wire [MEM_ADDRW-1:0] lmem_addr_end = MEM_ADDRW'((`XLEN'(`LMEM_BASE_ADDR) + `XLEN'(1 << `LMEM_LOG_SIZE)) >> MEM_ASHIFT);
+-        assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
++        /* verilator lint_off UNSIGNED */
++        wire is_lmem = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
++        /* verilator lint_on UNSIGNED */
++        // is tensor memory address
++        wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
++        wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);
++        /* verilator lint_off UNSIGNED */
++        wire is_tmem = (tmem_addr_start < tmem_addr_end) && (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
++        /* verilator lint_on UNSIGNED */
++
++        // Assign flags - all bits must be assigned to avoid MULTIDRIVEN warnings
++        always_comb begin
++            mem_req_flags[i] = '0;
++            mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
++            mem_req_flags[i][MEM_REQ_FLAG_IO] = is_io;
++            mem_req_flags[i][MEM_REQ_FLAG_LMEM] = is_lmem;
++            mem_req_flags[i][MEM_REQ_FLAG_TMEM] = is_tmem;
++        end
++    `else
++        always_comb begin
++            mem_req_flags[i] = '0;
++            mem_req_flags[i][MEM_REQ_FLAG_FLUSH] = req_is_fence;
++            mem_req_flags[i][MEM_REQ_FLAG_IO] = is_io;
++        end
+     `endif
+     end
+ 
+diff --git a/hw/rtl/core/VX_mem_unit.sv b/hw/rtl/core/VX_mem_unit.sv
+index dbae0c4..6eb94ad 100644
+--- a/hw/rtl/core/VX_mem_unit.sv
++++ b/hw/rtl/core/VX_mem_unit.sv
+@@ -21,6 +21,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+ 
+ `ifdef PERF_ENABLE
+     output lmem_perf_t      lmem_perf,
++    output tmem_perf_t      tmem_perf,
+     output coalescer_perf_t coalescer_perf,
+ `endif
+ 
+@@ -40,6 +41,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+ 
+     localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
+ 
++    `STATIC_ASSERT(`IS_DIVISBLE((1 << `TMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
++    `STATIC_ASSERT(0 == (`TMEM_BASE_ADDR % (1 << `TMEM_LOG_SIZE)), ("invalid parameter"))
++
++    localparam TMEM_ADDR_WIDTH = `TMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
++
+     VX_lsu_mem_if #(
+         .NUM_LANES (`NUM_LSU_LANES),
+         .DATA_SIZE (LSU_WORD_SIZE),
+@@ -84,6 +90,58 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+         .bus_out_if (lmem_arb_if)
+     );
+ 
++    VX_lsu_mem_if #(
++        .NUM_LANES (`NUM_LSU_LANES),
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (LMEM_TAG_WIDTH)
++    ) lmem_adapter_if[1]();
++
++    VX_lsu_mem_if #(
++        .NUM_LANES (`NUM_LSU_LANES),
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tmem_adapter_if[1]();
++
++    // Separate local and tensor memory requests based on flags
++    wire [`NUM_LSU_LANES-1:0] is_lmem_mask;
++    wire [`NUM_LSU_LANES-1:0] is_tmem_mask;
++    for (genvar i = 0; i < `NUM_LSU_LANES; ++i) begin : g_mem_type_sep
++        assign is_lmem_mask[i] = lmem_arb_if[0].req_data.flags[i][MEM_REQ_FLAG_LMEM];
++        assign is_tmem_mask[i] = lmem_arb_if[0].req_data.flags[i][MEM_REQ_FLAG_TMEM];
++    end
++
++    wire has_lmem_req = lmem_arb_if[0].req_valid && |(lmem_arb_if[0].req_data.mask & is_lmem_mask);
++    wire has_tmem_req = lmem_arb_if[0].req_valid && |(lmem_arb_if[0].req_data.mask & is_tmem_mask);
++
++    // Local memory path
++    assign lmem_adapter_if[0].req_valid = has_lmem_req;
++    assign lmem_adapter_if[0].req_data.mask = lmem_arb_if[0].req_data.mask & is_lmem_mask;
++    assign lmem_adapter_if[0].req_data.rw = lmem_arb_if[0].req_data.rw;
++    assign lmem_adapter_if[0].req_data.addr = lmem_arb_if[0].req_data.addr;
++    assign lmem_adapter_if[0].req_data.data = lmem_arb_if[0].req_data.data;
++    assign lmem_adapter_if[0].req_data.byteen = lmem_arb_if[0].req_data.byteen;
++    assign lmem_adapter_if[0].req_data.flags = lmem_arb_if[0].req_data.flags;
++    assign lmem_adapter_if[0].req_data.tag = lmem_arb_if[0].req_data.tag;
++
++    // Tensor memory path
++    assign tmem_adapter_if[0].req_valid = has_tmem_req;
++    assign tmem_adapter_if[0].req_data.mask = lmem_arb_if[0].req_data.mask & is_tmem_mask;
++    assign tmem_adapter_if[0].req_data.rw = lmem_arb_if[0].req_data.rw;
++    assign tmem_adapter_if[0].req_data.addr = lmem_arb_if[0].req_data.addr;
++    assign tmem_adapter_if[0].req_data.data = lmem_arb_if[0].req_data.data;
++    assign tmem_adapter_if[0].req_data.byteen = lmem_arb_if[0].req_data.byteen;
++    assign tmem_adapter_if[0].req_data.flags = lmem_arb_if[0].req_data.flags;
++    assign tmem_adapter_if[0].req_data.tag = lmem_arb_if[0].req_data.tag;
++
++    assign lmem_arb_if[0].req_ready = (has_lmem_req ? lmem_adapter_if[0].req_ready : 1'b1) &&
++                                      (has_tmem_req ? tmem_adapter_if[0].req_ready : 1'b1);
++
++    // Response arbitration - prioritize local memory, then tensor memory
++    assign lmem_arb_if[0].rsp_valid = lmem_adapter_if[0].rsp_valid || tmem_adapter_if[0].rsp_valid;
++    assign lmem_arb_if[0].rsp_data = lmem_adapter_if[0].rsp_valid ? lmem_adapter_if[0].rsp_data : tmem_adapter_if[0].rsp_data;
++    assign lmem_adapter_if[0].rsp_ready = lmem_arb_if[0].rsp_ready && lmem_adapter_if[0].rsp_valid;
++    assign tmem_adapter_if[0].rsp_ready = lmem_arb_if[0].rsp_ready && ~lmem_adapter_if[0].rsp_valid && tmem_adapter_if[0].rsp_valid;
++
+     VX_mem_bus_if #(
+         .DATA_SIZE (LSU_WORD_SIZE),
+         .TAG_WIDTH (LMEM_TAG_WIDTH)
+@@ -100,7 +158,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+     ) lmem_adapter (
+         .clk        (clk),
+         .reset      (reset),
+-        .lsu_mem_if (lmem_arb_if[0]),
++        .lsu_mem_if (lmem_adapter_if[0]),
+         .mem_bus_if (lmem_adapt_if)
+     );
+ 
+@@ -122,10 +180,49 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+         .mem_bus_if (lmem_adapt_if)
+     );
+ 
++    VX_mem_bus_if #(
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tmem_adapt_if[`NUM_LSU_LANES]();
++
++    VX_lsu_adapter #(
++        .NUM_LANES    (`NUM_LSU_LANES),
++        .DATA_SIZE    (LSU_WORD_SIZE),
++        .TAG_WIDTH    (TMEM_TAG_WIDTH),
++        .TAG_SEL_BITS (TMEM_TAG_WIDTH - UUID_WIDTH),
++        .ARBITER      ("P"),
++        .REQ_OUT_BUF  (3),
++        .RSP_OUT_BUF  (0)
++    ) tmem_adapter (
++        .clk        (clk),
++        .reset      (reset),
++        .lsu_mem_if (tmem_adapter_if[0]),
++        .mem_bus_if (tmem_adapt_if)
++    );
++
++    VX_tensor_mem #(
++        .INSTANCE_ID(`SFORMATF(("%s-tmem", INSTANCE_ID))),
++        .SIZE       (1 << `TMEM_LOG_SIZE),
++        .NUM_REQS   (`NUM_LSU_LANES),
++        .NUM_BANKS  (`TMEM_NUM_BANKS),
++        .WORD_SIZE  (LSU_WORD_SIZE),
++        .ADDR_WIDTH (TMEM_ADDR_WIDTH),
++        .TAG_WIDTH  (TMEM_TAG_WIDTH),
++        .OUT_BUF    (3)
++    ) tensor_mem (
++        .clk        (clk),
++        .reset      (reset),
++    `ifdef PERF_ENABLE
++        .tmem_perf  (tmem_perf),
++    `endif
++        .mem_bus_if (tmem_adapt_if)
++    );
++
+ `else
+ 
+ `ifdef PERF_ENABLE
+     assign lmem_perf = '0;
++    assign tmem_perf = '0;
+ `endif
+ 
+     for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lsu_dcache_if
+diff --git a/hw/rtl/core/VX_mem_unit_top.sv b/hw/rtl/core/VX_mem_unit_top.sv
+index 6a322f8..5a1de8b 100644
+--- a/hw/rtl/core/VX_mem_unit_top.sv
++++ b/hw/rtl/core/VX_mem_unit_top.sv
+@@ -110,6 +110,7 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
+ 
+ `ifdef PERF_ENABLE
+     VX_cache_pkg::cache_perf_t lmem_perf = '0;
++    VX_cache_pkg::cache_perf_t tmem_perf = '0;
+ `endif
+ 
+     VX_mem_unit #(
+@@ -119,6 +120,7 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
+         .reset         (reset),
+     `ifdef PERF_ENABLE
+         .lmem_perf     (lmem_perf),
++        .tmem_perf     (tmem_perf),
+     `endif
+         .lsu_mem_if    (lsu_mem_if),
+         .dcache_bus_if (mem_bus_if)
+diff --git a/hw/rtl/mem/VX_lmem_switch.sv b/hw/rtl/mem/VX_lmem_switch.sv
+index c8a4ee6..632933c 100644
+--- a/hw/rtl/mem/VX_lmem_switch.sv
++++ b/hw/rtl/mem/VX_lmem_switch.sv
+@@ -33,7 +33,11 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
+     wire req_local_ready;
+ 
+     for (genvar i = 0; i < `NUM_LSU_LANES; ++i) begin : g_is_addr_local_mask
+-        assign is_addr_local_mask[i] = lsu_in_if.req_data.flags[i][MEM_REQ_FLAG_LOCAL];
++    `ifdef LMEM_ENABLE
++        assign is_addr_local_mask[i] = lsu_in_if.req_data.flags[i][MEM_REQ_FLAG_LMEM] || lsu_in_if.req_data.flags[i][MEM_REQ_FLAG_TMEM];
++    `else
++        assign is_addr_local_mask[i] = 1'b0;
++    `endif
+     end
+ 
+     wire is_addr_global = | (lsu_in_if.req_data.mask & ~is_addr_local_mask);
+diff --git a/hw/rtl/mem/VX_tensor_mem.sv b/hw/rtl/mem/VX_tensor_mem.sv
+new file mode 100644
+index 0000000..20ae89f
+--- /dev/null
++++ b/hw/rtl/mem/VX_tensor_mem.sv
+@@ -0,0 +1,350 @@
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_define.vh"
++
++module VX_tensor_mem import VX_gpu_pkg::*; #(
++    parameter `STRING  INSTANCE_ID = "",
++
++    // Size of cache in bytes
++    parameter SIZE              = (1024*16*8),
++
++    // Number of Word requests per cycle
++    parameter NUM_REQS          = 4,
++    // Number of banks
++    parameter NUM_BANKS         = 4,
++
++    // Address width
++    parameter ADDR_WIDTH        = `CLOG2(SIZE),
++    // Size of a word in bytes
++    parameter WORD_SIZE         = `XLEN/8,
++
++    // Request tag size
++    parameter TAG_WIDTH         = 16,
++
++    // Response buffer
++    parameter OUT_BUF           = 0
++ ) (
++    input wire clk,
++    input wire reset,
++
++    // PERF
++`ifdef PERF_ENABLE
++    output tmem_perf_t tmem_perf,
++`endif
++
++    VX_mem_bus_if.slave mem_bus_if [NUM_REQS]
++);
++    `UNUSED_SPARAM (INSTANCE_ID)
++
++    localparam REQ_SEL_BITS    = `CLOG2(NUM_REQS);
++    localparam REQ_SEL_WIDTH   = `UP(REQ_SEL_BITS);
++    localparam WORD_WIDTH      = WORD_SIZE * 8;
++    localparam NUM_WORDS       = SIZE / WORD_SIZE;
++    localparam WORDS_PER_BANK  = NUM_WORDS / NUM_BANKS;
++    localparam BANK_ADDR_WIDTH = `CLOG2(WORDS_PER_BANK);
++    localparam BANK_SEL_BITS   = `CLOG2(NUM_BANKS);
++    localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
++    localparam REQ_DATAW       = 1 + BANK_ADDR_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH;
++    localparam RSP_DATAW       = WORD_WIDTH + TAG_WIDTH;
++
++    `STATIC_ASSERT(ADDR_WIDTH == (BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)), ("invalid parameter"))
++
++    // bank selection
++
++    wire [NUM_REQS-1:0][BANK_SEL_WIDTH-1:0] req_bank_idx;
++    if (NUM_BANKS > 1) begin : g_req_bank_idx
++        for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_idxs
++            assign req_bank_idx[i] = mem_bus_if[i].req_data.addr[0 +: BANK_SEL_BITS];
++        end
++    end else begin : g_req_bank_idx_0
++        assign req_bank_idx = 0;
++    end
++
++    // bank addressing
++
++    wire [NUM_REQS-1:0][BANK_ADDR_WIDTH-1:0] req_bank_addr;
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_addr
++        assign req_bank_addr[i] = mem_bus_if[i].req_data.addr[BANK_SEL_BITS +: BANK_ADDR_WIDTH];
++        `UNUSED_VAR (mem_bus_if[i].req_data.flags)
++    end
++
++    // bank requests dispatch
++
++    wire [NUM_BANKS-1:0]                    per_bank_req_valid;
++    wire [NUM_BANKS-1:0]                    per_bank_req_rw;
++    wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] per_bank_req_addr;
++    wire [NUM_BANKS-1:0][WORD_SIZE-1:0]     per_bank_req_byteen;
++    wire [NUM_BANKS-1:0][WORD_WIDTH-1:0]    per_bank_req_data;
++    wire [NUM_BANKS-1:0][TAG_WIDTH-1:0]     per_bank_req_tag;
++    wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_req_idx;
++    wire [NUM_BANKS-1:0]                    per_bank_req_ready;
++
++    wire [NUM_BANKS-1:0][REQ_DATAW-1:0]     per_bank_req_data_aos;
++
++    wire [NUM_REQS-1:0]                 req_valid_in;
++    wire [NUM_REQS-1:0][REQ_DATAW-1:0]  req_data_in;
++    wire [NUM_REQS-1:0]                 req_ready_in;
++
++`ifdef PERF_ENABLE
++    wire [PERF_CTR_BITS-1:0] perf_collisions;
++`endif
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_data_in
++        assign req_valid_in[i] = mem_bus_if[i].req_valid;
++        assign req_data_in[i] = {
++            mem_bus_if[i].req_data.rw,
++            req_bank_addr[i],
++            mem_bus_if[i].req_data.data,
++            mem_bus_if[i].req_data.byteen,
++            mem_bus_if[i].req_data.tag
++        };
++        assign mem_bus_if[i].req_ready = req_ready_in[i];
++    end
++
++    VX_stream_xbar #(
++        .NUM_INPUTS  (NUM_REQS),
++        .NUM_OUTPUTS (NUM_BANKS),
++        .DATAW       (REQ_DATAW),
++        .PERF_CTR_BITS (PERF_CTR_BITS),
++        .ARBITER     ("P"),
++        .OUT_BUF     (3) // output should be registered for the data_store addressing
++    ) req_xbar (
++        .clk       (clk),
++        .reset     (reset),
++    `ifdef PERF_ENABLE
++        .collisions (perf_collisions),
++    `else
++        `UNUSED_PIN (collisions),
++    `endif
++        .valid_in  (req_valid_in),
++        .data_in   (req_data_in),
++        .sel_in    (req_bank_idx),
++        .ready_in  (req_ready_in),
++        .valid_out (per_bank_req_valid),
++        .data_out  (per_bank_req_data_aos),
++        .sel_out   (per_bank_req_idx),
++        .ready_out (per_bank_req_ready)
++    );
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_data_soa
++        assign {
++            per_bank_req_rw[i],
++            per_bank_req_addr[i],
++            per_bank_req_data[i],
++            per_bank_req_byteen[i],
++            per_bank_req_tag[i]
++        } = per_bank_req_data_aos[i];
++    end
++
++    // banks access
++
++    wire [NUM_BANKS-1:0]                per_bank_rsp_valid;
++    wire [NUM_BANKS-1:0][WORD_WIDTH-1:0] per_bank_rsp_data;
++    wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_rsp_idx;
++    wire [NUM_BANKS-1:0][TAG_WIDTH-1:0] per_bank_rsp_tag;
++    wire [NUM_BANKS-1:0]                per_bank_rsp_ready;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_data_store
++        wire bank_rsp_valid, bank_rsp_ready;
++
++        VX_sp_ram #(
++            .DATAW (WORD_WIDTH),
++            .SIZE  (WORDS_PER_BANK),
++            .WRENW (WORD_SIZE),
++            .OUT_REG (1),
++            .RDW_MODE ("R")
++        ) tmem_store (
++            .clk   (clk),
++            .reset (reset),
++            .read  (per_bank_req_valid[i] && per_bank_req_ready[i] && ~per_bank_req_rw[i]),
++            .write (per_bank_req_valid[i] && per_bank_req_ready[i] && per_bank_req_rw[i]),
++            .wren  (per_bank_req_byteen[i]),
++            .addr  (per_bank_req_addr[i]),
++            .wdata (per_bank_req_data[i]),
++            .rdata (per_bank_rsp_data[i])
++        );
++
++        // read-during-write hazard detection
++        reg [BANK_ADDR_WIDTH-1:0] last_wr_addr;
++        reg last_wr_valid;
++        always @(posedge clk) begin
++            if (reset) begin
++                last_wr_valid <= 0;
++            end else begin
++                last_wr_valid <= per_bank_req_valid[i] && per_bank_req_ready[i] && per_bank_req_rw[i];
++            end
++            last_wr_addr <= per_bank_req_addr[i];
++        end
++        wire is_rdw_hazard = last_wr_valid && ~per_bank_req_rw[i] && (per_bank_req_addr[i] == last_wr_addr);
++
++        // drop write response
++        assign bank_rsp_valid = per_bank_req_valid[i] && ~per_bank_req_rw[i] && ~is_rdw_hazard;
++        assign per_bank_req_ready[i] = (bank_rsp_ready || per_bank_req_rw[i]) && ~is_rdw_hazard;
++
++        // register BRAM output
++        VX_pipe_buffer #(
++            .DATAW (REQ_SEL_WIDTH + TAG_WIDTH)
++        ) bram_buf (
++            .clk       (clk),
++            .reset     (reset),
++            .valid_in  (bank_rsp_valid),
++            .ready_in  (bank_rsp_ready),
++            .data_in   ({per_bank_req_idx[i], per_bank_req_tag[i]}),
++            .data_out  ({per_bank_rsp_idx[i], per_bank_rsp_tag[i]}),
++            .valid_out (per_bank_rsp_valid[i]),
++            .ready_out (per_bank_rsp_ready[i])
++        );
++    end
++
++    // bank responses gather
++
++    wire [NUM_BANKS-1:0][RSP_DATAW-1:0] per_bank_rsp_data_aos;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_rsp_data_aos
++        assign per_bank_rsp_data_aos[i] = {per_bank_rsp_data[i], per_bank_rsp_tag[i]};
++    end
++
++    wire [NUM_REQS-1:0]                 rsp_valid_out;
++    wire [NUM_REQS-1:0][RSP_DATAW-1:0]  rsp_data_out;
++    wire [NUM_REQS-1:0]                 rsp_ready_out;
++
++    VX_stream_xbar #(
++        .NUM_INPUTS  (NUM_BANKS),
++        .NUM_OUTPUTS (NUM_REQS),
++        .DATAW       (RSP_DATAW),
++        .ARBITER     ("P"), // this priority arbiter has negligeable impact om performance
++        .OUT_BUF     (OUT_BUF)
++    ) rsp_xbar (
++        .clk       (clk),
++        .reset     (reset),
++        `UNUSED_PIN (collisions),
++        .sel_in    (per_bank_rsp_idx),
++        .valid_in  (per_bank_rsp_valid),
++        .data_in   (per_bank_rsp_data_aos),
++        .ready_in  (per_bank_rsp_ready),
++        .valid_out (rsp_valid_out),
++        .data_out  (rsp_data_out),
++        .ready_out (rsp_ready_out),
++        `UNUSED_PIN (sel_out)
++    );
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_mem_bus_if
++        assign mem_bus_if[i].rsp_valid = rsp_valid_out[i];
++        assign mem_bus_if[i].rsp_data  = rsp_data_out[i];
++        assign rsp_ready_out[i] = mem_bus_if[i].rsp_ready;
++    end
++
++`ifdef PERF_ENABLE
++    // per cycle: reads, writes
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_reads_per_cycle;
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_writes_per_cycle;
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_crsp_stall_per_cycle;
++
++    wire [NUM_REQS-1:0] req_rw;
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_rw
++        assign req_rw[i] = mem_bus_if[i].req_data.rw;
++    end
++
++    wire [NUM_REQS-1:0] perf_reads_per_req, perf_writes_per_req;
++    wire [NUM_REQS-1:0] perf_crsp_stall_per_req = rsp_valid_out & ~rsp_ready_out;
++
++    `BUFFER(perf_reads_per_req, req_valid_in & req_ready_in & ~req_rw);
++    `BUFFER(perf_writes_per_req, req_valid_in & req_ready_in & req_rw);
++
++    `POP_COUNT(perf_reads_per_cycle, perf_reads_per_req);
++    `POP_COUNT(perf_writes_per_cycle, perf_writes_per_req);
++    `POP_COUNT(perf_crsp_stall_per_cycle, perf_crsp_stall_per_req);
++
++    reg [PERF_CTR_BITS-1:0] perf_reads;
++    reg [PERF_CTR_BITS-1:0] perf_writes;
++    reg [PERF_CTR_BITS-1:0] perf_crsp_stalls;
++
++    always @(posedge clk) begin
++        if (reset) begin
++            perf_reads       <= '0;
++            perf_writes      <= '0;
++            perf_crsp_stalls <= '0;
++        end else begin
++            perf_reads       <= perf_reads  + PERF_CTR_BITS'(perf_reads_per_cycle);
++            perf_writes      <= perf_writes + PERF_CTR_BITS'(perf_writes_per_cycle);
++            perf_crsp_stalls <= perf_crsp_stalls + PERF_CTR_BITS'(perf_crsp_stall_per_cycle);
++        end
++    end
++
++    assign tmem_perf.reads       = perf_reads;
++    assign tmem_perf.writes      = perf_writes;
++    assign tmem_perf.bank_stalls = perf_collisions;
++    assign tmem_perf.crsp_stalls = perf_crsp_stalls;
++
++`endif
++
++`ifdef DBG_TRACE_MEM
++
++    wire [NUM_BANKS-1:0][TAG_WIDTH-UUID_WIDTH-1:0] per_bank_req_tag_value;
++    wire [NUM_BANKS-1:0][`UP(UUID_WIDTH)-1:0] per_bank_req_uuid;
++
++    wire [NUM_BANKS-1:0][TAG_WIDTH-UUID_WIDTH-1:0] per_bank_rsp_tag_value;
++    wire [NUM_BANKS-1:0][`UP(UUID_WIDTH)-1:0] per_bank_rsp_uuid;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_uuid
++        assign per_bank_req_tag_value[i] = per_bank_req_tag[i][TAG_WIDTH-UUID_WIDTH-1:0];
++        assign per_bank_rsp_tag_value[i] = per_bank_rsp_tag[i][TAG_WIDTH-UUID_WIDTH-1:0];
++        if (UUID_WIDTH != 0) begin : g_uuid
++            assign per_bank_req_uuid[i] = per_bank_req_tag[i][TAG_WIDTH-1 -: UUID_WIDTH];
++            assign per_bank_rsp_uuid[i] = per_bank_rsp_tag[i][TAG_WIDTH-1 -: UUID_WIDTH];
++        end else begin : g_no_uuid
++            assign per_bank_req_uuid[i] = 0;
++            assign per_bank_rsp_uuid[i] = 0;
++        end
++    end
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_trace
++        always @(posedge clk) begin
++            if (mem_bus_if[i].req_valid && mem_bus_if[i].req_ready) begin
++                if (mem_bus_if[i].req_data.rw) begin
++                    `TRACE(2, ("%t: %s core-wr-req[%0d]: addr=0x%0h, byteen=0x%h, data=0x%h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, mem_bus_if[i].req_data.addr, mem_bus_if[i].req_data.byteen, mem_bus_if[i].req_data.data, mem_bus_if[i].req_data.tag.value, mem_bus_if[i].req_data.tag.uuid))
++                end else begin
++                    `TRACE(2, ("%t: %s core-rd-req[%0d]: addr=0x%0h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, mem_bus_if[i].req_data.addr, mem_bus_if[i].req_data.tag.value, mem_bus_if[i].req_data.tag.uuid))
++                end
++            end
++            if (mem_bus_if[i].rsp_valid && mem_bus_if[i].rsp_ready) begin
++                `TRACE(2, ("%t: %s core-rd-rsp[%0d]: data=0x%h, tag=0x%0h (#%0d)\n",
++                    $time, INSTANCE_ID, i, mem_bus_if[i].rsp_data.data, mem_bus_if[i].rsp_data.tag.value, mem_bus_if[i].rsp_data.tag.uuid))
++            end
++        end
++    end
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_bank_trace
++        always @(posedge clk) begin
++            if (per_bank_req_valid[i] && per_bank_req_ready[i]) begin
++                if (per_bank_req_rw[i]) begin
++                    `TRACE(2, ("%t: %s bank-wr-req[%0d]: addr=0x%0h, byteen=0x%h, data=0x%h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, per_bank_req_addr[i], per_bank_req_byteen[i], per_bank_req_data[i], per_bank_req_tag_value[i], per_bank_req_uuid[i]))
++                end else begin
++                    `TRACE(2, ("%t: %s bank-rd-req[%0d]: addr=0x%0h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, per_bank_req_addr[i], per_bank_req_tag_value[i], per_bank_req_uuid[i]))
++                end
++            end
++            if (per_bank_rsp_valid[i] && per_bank_rsp_ready[i]) begin
++                `TRACE(2, ("%t: %s bank-rd-rsp[%0d]: data=0x%h, tag=0x%0h (#%0d)\n",
++                    $time, INSTANCE_ID, i, per_bank_rsp_data[i], per_bank_rsp_tag_value[i], per_bank_rsp_uuid[i]))
++            end
++        end
++    end
++
++`endif
++
++endmodule
+diff --git a/hw/rtl/mem/VX_tensor_mem_top.sv b/hw/rtl/mem/VX_tensor_mem_top.sv
+new file mode 100644
+index 0000000..d7bc862
+--- /dev/null
++++ b/hw/rtl/mem/VX_tensor_mem_top.sv
+@@ -0,0 +1,99 @@
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_define.vh"
++
++module VX_tensor_mem_top import VX_gpu_pkg::*; #(
++    parameter `STRING  INSTANCE_ID = "",
++
++    // Size of cache in bytes
++    parameter SIZE              = (1024*16*8),
++
++    // Number of Word requests per cycle
++    parameter NUM_REQS          = 4,
++    // Number of banks
++    parameter NUM_BANKS         = 4,
++
++    // Size of a word in bytes
++    parameter WORD_SIZE         = `XLEN/8,
++
++    // Request tag size
++    parameter TAG_WIDTH         = 16,
++
++    // Address width
++    parameter NUM_WORDS         = SIZE / WORD_SIZE,
++    parameter WORDS_PER_BANK    = NUM_WORDS / NUM_BANKS,
++    parameter BANK_ADDR_WIDTH   = `CLOG2(WORDS_PER_BANK),
++    parameter ADDR_WIDTH        = BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)
++ ) (
++    input wire clk,
++    input wire reset,
++
++    // Core request
++    input  wire [NUM_REQS-1:0]                 mem_req_valid,
++    input  wire [NUM_REQS-1:0]                 mem_req_rw,
++    input  wire [NUM_REQS-1:0][WORD_SIZE-1:0]  mem_req_byteen,
++    input  wire [NUM_REQS-1:0][ADDR_WIDTH-1:0] mem_req_addr,
++    input  wire [NUM_REQS-1:0][MEM_FLAGS_WIDTH-1:0] mem_req_flags,
++    input  wire [NUM_REQS-1:0][WORD_SIZE*8-1:0] mem_req_data,
++    input  wire [NUM_REQS-1:0][TAG_WIDTH-1:0]  mem_req_tag,
++    output wire [NUM_REQS-1:0]                 mem_req_ready,
++
++    // Core response
++    output wire [NUM_REQS-1:0]                 mem_rsp_valid,
++    output wire [NUM_REQS-1:0][WORD_SIZE*8-1:0] mem_rsp_data,
++    output wire [NUM_REQS-1:0][TAG_WIDTH-1:0]  mem_rsp_tag,
++    input  wire [NUM_REQS-1:0]                 mem_rsp_ready
++);
++    VX_mem_bus_if #(
++        .DATA_SIZE (WORD_SIZE),
++        .TAG_WIDTH (TAG_WIDTH),
++        .ADDR_WIDTH(ADDR_WIDTH)
++    ) mem_bus_if[NUM_REQS]();
++
++     // memory request
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign mem_bus_if[i].req_valid = mem_req_valid[i];
++        assign mem_bus_if[i].req_data.rw = mem_req_rw[i];
++        assign mem_bus_if[i].req_data.byteen = mem_req_byteen[i];
++        assign mem_bus_if[i].req_data.addr = mem_req_addr[i];
++        assign mem_bus_if[i].req_data.flags = mem_req_flags[i];
++        assign mem_bus_if[i].req_data.data = mem_req_data[i];
++        assign mem_bus_if[i].req_data.tag = mem_req_tag[i];
++        assign mem_req_ready[i] = mem_bus_if[i].req_ready;
++    end
++
++    // memory response
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign mem_rsp_valid[i] = mem_bus_if[i].rsp_valid;
++        assign mem_rsp_data[i] = mem_bus_if[i].rsp_data.data;
++        assign mem_rsp_tag[i] = mem_bus_if[i].rsp_data.tag;
++        assign mem_bus_if[i].rsp_ready = mem_rsp_ready[i];
++    end
++
++    VX_tensor_mem #(
++        .INSTANCE_ID(INSTANCE_ID),
++        .SIZE       (SIZE),
++        .NUM_REQS   (NUM_REQS),
++        .NUM_BANKS  (NUM_BANKS),
++        .WORD_SIZE  (WORD_SIZE),
++        .ADDR_WIDTH (ADDR_WIDTH),
++        .TAG_WIDTH  (TAG_WIDTH),
++        .OUT_BUF    (3)
++    ) tensor_mem (
++        .clk        (clk),
++        .reset      (reset),
++        .mem_bus_if (mem_bus_if)
++    );
++
++endmodule
+diff --git a/hw/rtl/tcu/VX_tcu_pkg.sv b/hw/rtl/tcu/VX_tcu_pkg.sv
+index 5ad4713..ee94a47 100644
+--- a/hw/rtl/tcu/VX_tcu_pkg.sv
++++ b/hw/rtl/tcu/VX_tcu_pkg.sv
+@@ -110,6 +110,12 @@ package VX_tcu_pkg;
+                 trace_fmt(level, op_args.tcu.fmt_d);
+                 `TRACE(level, (".%0d.%0d", op_args.tcu.step_m, op_args.tcu.step_n));
+             end
++            INST_TCU_UMMA: begin
++                `TRACE(level, ("UMMA."));
++                trace_fmt(level, op_args.tcu.fmt_s);
++                `TRACE(level, ("."));
++                trace_fmt(level, op_args.tcu.fmt_d);
++            end
+             default: `TRACE(level, ("?"))
+         endcase
+     endtask
+diff --git a/kernel/include/vx_spawn.h b/kernel/include/vx_spawn.h
+index ff25de6..a054840 100644
+--- a/kernel/include/vx_spawn.h
++++ b/kernel/include/vx_spawn.h
+@@ -45,6 +45,9 @@ typedef void (*vx_serial_cb)(void *arg);
+ #define __local_mem(size) \
+   (void*)((int8_t*)csr_read(VX_CSR_LOCAL_MEM_BASE) + __local_group_id * size)
+ 
++#define __tensor_mem(size) \
++  (void*)((int8_t*)csr_read(VX_CSR_TENSOR_MEM_BASE) + __local_group_id * size)
++
+ #define __syncthreads() \
+   vx_barrier(__local_group_id, __warps_per_group)
+ 
+diff --git a/sim/opaesim/vortex_afu_shim.sv b/sim/opaesim/vortex_afu_shim.sv
+index 3c2ef27..2a0ed26 100644
+--- a/sim/opaesim/vortex_afu_shim.sv
++++ b/sim/opaesim/vortex_afu_shim.sv
+@@ -92,22 +92,53 @@ module vortex_afu_shim import local_mem_cfg_pkg::*; import ccip_if_pkg::*; (
+ t_if_ccip_Rx cp2af_sRxPort;
+ t_if_ccip_Tx af2cp_sTxPort;
+ 
++// Dummy wires for tensor memory interface (not used in shim)
++/* verilator lint_off UNUSEDSIGNAL */
++t_tensor_mem_data     avs_writedataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_data     avs_readdataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_addr     avs_addressT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_waitrequestT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_writeT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_readT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_byte_mask avs_byteenableT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_burst_cnt avs_burstcountT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_readdatavalidT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++/* verilator lint_on UNUSEDSIGNAL */
++
++// Initialize unpacked arrays properly
++for (genvar i = 0; i < `PLATFORM_MEMORY_NUM_BANKS; ++i) begin : g_tmem_dummy
++    assign avs_readdataT_dummy[i] = '0;
++    assign avs_waitrequestT_dummy[i] = 1'b0;
++    assign avs_readdatavalidT_dummy[i] = 1'b0;
++end
++
+ vortex_afu #(
+-  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
++  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS),
++  .NUM_TENSOR_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
+ ) afu (
+     .clk(clk),
+     .reset(reset),
+     .cp2af_sRxPort(cp2af_sRxPort),
+     .af2cp_sTxPort(af2cp_sTxPort),
+-    .avs_writedata(avs_writedata),
+-    .avs_readdata(avs_readdata),
+-    .avs_address(avs_address),
+-    .avs_waitrequest(avs_waitrequest),
+-    .avs_write(avs_write),
+-    .avs_read(avs_read),
+-    .avs_byteenable(avs_byteenable),
+-    .avs_burstcount(avs_burstcount),
+-    .avs_readdatavalid(avs_readdatavalid)
++    .avs_writedataL(avs_writedata),
++    .avs_readdataL(avs_readdata),
++    .avs_addressL(avs_address),
++    .avs_waitrequestL(avs_waitrequest),
++    .avs_writeL(avs_write),
++    .avs_readL(avs_read),
++    .avs_byteenableL(avs_byteenable),
++    .avs_burstcountL(avs_burstcount),
++    .avs_readdatavalidL(avs_readdatavalid),
++    // Tensor memory pins - connect to dummy for now
++    .avs_writedataT(avs_writedataT_dummy),
++    .avs_readdataT(avs_readdataT_dummy),
++    .avs_addressT(avs_addressT_dummy),
++    .avs_waitrequestT(avs_waitrequestT_dummy),
++    .avs_writeT(avs_writeT_dummy),
++    .avs_readT(avs_readT_dummy),
++    .avs_byteenableT(avs_byteenableT_dummy),
++    .avs_burstcountT(avs_burstcountT_dummy),
++    .avs_readdatavalidT(avs_readdatavalidT_dummy)
+ );
+ 
+ t_if_ccip_c0_RxHdr c0_RxHdr;
+diff --git a/sim/simx/arch.h b/sim/simx/arch.h
+index 6becf5c..09a4996 100644
+--- a/sim/simx/arch.h
++++ b/sim/simx/arch.h
+@@ -31,6 +31,7 @@ private:
+   uint16_t socket_size_;
+   uint16_t num_barriers_;
+   uint64_t local_mem_base_;
++  uint64_t tensor_mem_base_;
+ 
+ public:
+   Arch(uint16_t num_threads, uint16_t num_warps, uint16_t num_cores)   
+@@ -41,6 +42,7 @@ public:
+     , socket_size_(SOCKET_SIZE)
+     , num_barriers_(NUM_BARRIERS)
+     , local_mem_base_(LMEM_BASE_ADDR)
++    , tensor_mem_base_(TMEM_BASE_ADDR)
+   {}
+ 
+   uint16_t num_barriers() const {
+@@ -51,6 +53,10 @@ public:
+     return local_mem_base_;
+   }
+ 
++  uint64_t tensor_mem_base() const {
++    return tensor_mem_base_;
++  }
++
+   uint16_t num_threads() const {
+     return num_threads_;
+   }
+diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
+index 0b7633e..82d96b6 100644
+--- a/sim/simx/emulator.cpp
++++ b/sim/simx/emulator.cpp
+@@ -470,6 +470,7 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
+   case VX_CSR_NUM_WARPS:  return arch_.num_warps();
+   case VX_CSR_NUM_CORES:  return uint32_t(arch_.num_cores()) * arch_.num_clusters();
+   case VX_CSR_LOCAL_MEM_BASE: return arch_.local_mem_base();
++  case VX_CSR_TENSOR_MEM_BASE: return arch_.tensor_mem_base();
+   case VX_CSR_MSCRATCH:   return csr_mscratch_;
+ 
+   CSR_READ_64(VX_CSR_MCYCLE, core_perf.cycles);
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index d3b730d..840bae0 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -92,6 +92,7 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
+             << ", num_clusters=" << arch.num_clusters()
+             << ", socket_size=" << arch.socket_size()
+             << ", local_mem_base=0x" << std::hex << arch.local_mem_base() << std::dec
++            << ", tensor_mem_base=0x" << std::hex << arch.tensor_mem_base() << std::dec
+             << ", num_barriers=" << arch.num_barriers()
+             << std::endl;
+ #endif

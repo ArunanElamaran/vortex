@@ -64,7 +64,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
 
     // address type calculation
 
-    wire [NUM_LANES-1:0][MEM_FLAGS_WIDTH-1:0] mem_req_flags;
+    logic [NUM_LANES-1:0][MEM_FLAGS_WIDTH-1:0] mem_req_flags;
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_mem_req_flags
         wire [MEM_ADDRW-1:0] block_addr = full_addr[i][MEM_ASHIFT +: MEM_ADDRW];
         // is I/O address
