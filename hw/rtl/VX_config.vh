@@ -223,16 +223,21 @@
 `define LMEM_LOG_SIZE   14
 `endif
 
-`ifndef LMEM_BASE_ADDR
-`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
-`endif
-
 `ifndef TMEM_LOG_SIZE
 `define TMEM_LOG_SIZE   16  // 64KB tensor memory
 `endif
 
+`ifndef LMEM_BASE_ADDR
+`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+`endif
+
 `ifndef TMEM_BASE_ADDR
-`define TMEM_BASE_ADDR  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
+// TMEM starts after LMEM, aligned to TMEM boundary
+// Use standard alignment formula for both 32-bit and 64-bit
+// For 32-bit near top of address space, the result may wrap but the check in VX_lsu_slice.sv handles it
+`define _LMEM_END  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
+`define _TMEM_ALIGN_MASK  ((1 << `TMEM_LOG_SIZE) - 1)
+`define TMEM_BASE_ADDR  ((`_LMEM_END + `_TMEM_ALIGN_MASK) & ~`_TMEM_ALIGN_MASK)
 `endif
 
 `define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
@@ -676,7 +681,9 @@
 // LMEM Configurable Knobs ////////////////////////////////////////////////////
 
 `ifndef LMEM_DISABLE
+`ifndef LMEM_ENABLE
 `define LMEM_ENABLE
+`endif
 `endif
 
 `ifndef LMEM_ENABLE

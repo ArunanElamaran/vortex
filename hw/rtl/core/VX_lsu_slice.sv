@@ -79,7 +79,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // is tensor memory address
         wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);
-        wire is_tmem = (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
+        /* verilator lint_off UNSIGNED */
+        wire is_tmem = (tmem_addr_start < tmem_addr_end) && (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
+        /* verilator lint_on UNSIGNED */
 
         // Assign flags - all bits must be assigned to avoid MULTIDRIVEN warnings
         always_comb begin
