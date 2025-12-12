@@ -31,6 +31,7 @@ private:
   uint16_t socket_size_;
   uint16_t num_barriers_;
   uint64_t local_mem_base_;
+  uint64_t tensor_mem_base_;
 
 public:
   Arch(uint16_t num_threads, uint16_t num_warps, uint16_t num_cores)   
@@ -41,6 +42,7 @@ public:
     , socket_size_(SOCKET_SIZE)
     , num_barriers_(NUM_BARRIERS)
     , local_mem_base_(LMEM_BASE_ADDR)
+    , tensor_mem_base_(TMEM_BASE_ADDR)
   {}
 
   uint16_t num_barriers() const {
@@ -49,6 +51,10 @@ public:
 
   uint64_t local_mem_base() const {
     return local_mem_base_;
+  }
+
+  uint64_t tensor_mem_base() const {
+    return tensor_mem_base_;
   }
 
   uint16_t num_threads() const {
