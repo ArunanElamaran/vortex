@@ -108,6 +108,12 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
     end
 
+    // TCU tensor memory bus (single port)
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (TMEM_TAG_WIDTH)
+    ) tcu_tmem_bus_if();
+
 `ifdef PERF_ENABLE
     lmem_perf_t lmem_perf;
     tmem_perf_t tmem_perf;
@@ -123,7 +129,8 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .tmem_perf     (tmem_perf),
     `endif
         .lsu_mem_if    (lsu_mem_if),
-        .dcache_bus_if (mem_bus_if)
+        .dcache_bus_if (mem_bus_if),
+        .tcu_tmem_bus_if(tcu_tmem_bus_if)
     );
 
 `ifdef PERF_ENABLE

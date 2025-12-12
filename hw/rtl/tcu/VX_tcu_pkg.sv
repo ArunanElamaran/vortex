@@ -81,6 +81,22 @@ package VX_tcu_pkg;
 
     localparam TCU_UOPS = TCU_M_STEPS * TCU_N_STEPS * TCU_K_STEPS;
 
+    // Helper: bytes per format id (matches simx UMMA mapping)
+    function automatic int unsigned tcu_type_bytes(input [3:0] fmt);
+        case (fmt)
+            TCU_FP32_ID: tcu_type_bytes = 4;
+            TCU_TF32_ID: tcu_type_bytes = 4;
+            TCU_FP16_ID: tcu_type_bytes = 2;
+            TCU_BF16_ID: tcu_type_bytes = 2;
+            TCU_I32_ID:  tcu_type_bytes = 4;
+            TCU_I8_ID,
+            TCU_U8_ID:   tcu_type_bytes = 1;
+            TCU_I4_ID,
+            TCU_U4_ID:   tcu_type_bytes = 1; // packed, but treat as byte for TMEM
+            default:     tcu_type_bytes = 4;
+        endcase
+    endfunction
+
     // Tracing info
 `ifdef SIMULATION
     task trace_fmt(input int level, input [3:0] fmt);

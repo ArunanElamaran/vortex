@@ -157,7 +157,8 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
         end
     end
 
-    assign result_if.data.wb  = 1;
+    // WMMA writes back register results; UMMA does not.
+    assign result_if.data.wb  = (execute_if.data.op_type == INST_TCU_WMMA);
     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
     assign result_if.data.data  = d_val;
     assign result_if.data.pid = 0;

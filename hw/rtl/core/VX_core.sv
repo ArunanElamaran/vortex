@@ -65,6 +65,12 @@ module VX_core import VX_gpu_pkg::*; #(
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) lsu_mem_if[`NUM_LSU_BLOCKS]();
 
+    // TCU tensor memory bus (single port)
+    VX_mem_bus_if #(
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (TMEM_TAG_WIDTH)
+    ) tcu_tmem_bus_if();
+
 `ifdef PERF_ENABLE
     lmem_perf_t lmem_perf;
     tmem_perf_t tmem_perf;
@@ -176,6 +182,8 @@ module VX_core import VX_gpu_pkg::*; #(
 
         .lsu_mem_if     (lsu_mem_if),
 
+        .tcu_tmem_bus_if(tcu_tmem_bus_if),
+
         .dispatch_if    (dispatch_if),
         .commit_if      (commit_if),
 
@@ -211,7 +219,8 @@ module VX_core import VX_gpu_pkg::*; #(
         .coalescer_perf(coalescer_perf),
     `endif
         .lsu_mem_if    (lsu_mem_if),
-        .dcache_bus_if (dcache_bus_if)
+        .dcache_bus_if (dcache_bus_if),
+        .tcu_tmem_bus_if(tcu_tmem_bus_if)
     );
 
 `ifdef PERF_ENABLE

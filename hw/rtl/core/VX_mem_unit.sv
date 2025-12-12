@@ -26,7 +26,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 `endif
 
     VX_lsu_mem_if.slave     lsu_mem_if [`NUM_LSU_BLOCKS],
-    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS]
+    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
+    VX_mem_bus_if.master    tcu_tmem_bus_if
 );
     VX_lsu_mem_if #(
         .NUM_LANES (`NUM_LSU_LANES),
@@ -207,10 +208,13 @@ endgenerate
         .bus_out_if (tmem_arb_if)
     );
 
+    // TMEM adapter: LSU lanes + 1 extra port for TCU
+    localparam TMEM_PORTS = `NUM_LSU_LANES + 1;
+
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (TMEM_TAG_WIDTH)
-    ) tmem_adapt_if[`NUM_LSU_LANES]();
+    ) tmem_adapt_if[TMEM_PORTS]();
 
     VX_lsu_adapter #(
         .NUM_LANES    (`NUM_LSU_LANES),
@@ -224,13 +228,16 @@ endgenerate
         .clk        (clk),
         .reset      (reset),
         .lsu_mem_if (tmem_arb_if[0]),
-        .mem_bus_if (tmem_adapt_if)
+        .mem_bus_if (tmem_adapt_if[0 +: `NUM_LSU_LANES])
     );
+
+    // TCU gets a dedicated TMEM port (single lane) exposed to the core
+    `ASSIGN_VX_MEM_BUS_IF (tcu_tmem_bus_if, tmem_adapt_if[`NUM_LSU_LANES]);
 
     VX_tensor_mem #(
         .INSTANCE_ID(`SFORMATF(("%s-tmem", INSTANCE_ID))),
         .SIZE       (1 << `TMEM_LOG_SIZE),
-        .NUM_REQS   (`NUM_LSU_LANES),
+        .NUM_REQS   (TMEM_PORTS),
         .NUM_BANKS  (`TMEM_NUM_BANKS),
         .WORD_SIZE  (LSU_WORD_SIZE),
         .ADDR_WIDTH (TMEM_ADDR_WIDTH),
