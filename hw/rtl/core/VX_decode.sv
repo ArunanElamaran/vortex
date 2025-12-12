@@ -533,7 +533,7 @@ module VX_decode import VX_gpu_pkg::*; #(
                             default:;
                         endcase
                         case (funct3)
-                            3'h0: begin // UMMA
+                            3'h1: begin // UMMA
                                 ex_type = EX_TCU;
                                 op_type = INST_OP_BITS'(INST_TCU_UMMA);
                                 op_args.tcu.fmt_s  = rs1[3:0];
