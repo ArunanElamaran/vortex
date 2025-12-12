@@ -110,6 +110,12 @@ package VX_tcu_pkg;
                 trace_fmt(level, op_args.tcu.fmt_d);
                 `TRACE(level, (".%0d.%0d", op_args.tcu.step_m, op_args.tcu.step_n));
             end
+            INST_TCU_UMMA: begin
+                `TRACE(level, ("UMMA."));
+                trace_fmt(level, op_args.tcu.fmt_s);
+                `TRACE(level, ("."));
+                trace_fmt(level, op_args.tcu.fmt_d);
+            end
             default: `TRACE(level, ("?"))
         endcase
     endtask
