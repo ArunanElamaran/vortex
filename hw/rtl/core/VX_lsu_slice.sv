@@ -75,7 +75,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // is local memory address
         wire [MEM_ADDRW-1:0] lmem_addr_start = MEM_ADDRW'(`XLEN'(`LMEM_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] lmem_addr_end = MEM_ADDRW'((`XLEN'(`LMEM_BASE_ADDR) + `XLEN'(1 << `LMEM_LOG_SIZE)) >> MEM_ASHIFT);
+        /* verilator lint_off UNSIGNED */
         wire is_lmem = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
+        /* verilator lint_on UNSIGNED */
         // is tensor memory address
         wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
         wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);

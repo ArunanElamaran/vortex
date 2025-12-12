@@ -228,16 +228,42 @@
 `endif
 
 `ifndef LMEM_BASE_ADDR
+`ifdef XLEN_32
+`ifdef LMEM_ENABLE
+`ifndef TMEM_BASE_ADDR
+// For 32-bit with both LMEM and TMEM: Place TMEM before LMEM to avoid overflow
+// Align STACK_BASE_ADDR down to TMEM boundary, then place TMEM there, LMEM after
+`define _STACK_ALIGNED  (`STACK_BASE_ADDR & ~((1 << `TMEM_LOG_SIZE) - 1))
+`define TMEM_BASE_ADDR  `_STACK_ALIGNED
+`define LMEM_BASE_ADDR  (`_STACK_ALIGNED + (1 << `TMEM_LOG_SIZE))
+`else
+// TMEM_BASE_ADDR already defined, place LMEM after it
+`define LMEM_BASE_ADDR  (`TMEM_BASE_ADDR + (1 << `TMEM_LOG_SIZE))
+`endif
+`else
+// No LMEM, use standard
 `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+`endif
+`else
+// 64-bit: standard placement
+`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+`endif
 `endif
 
 `ifndef TMEM_BASE_ADDR
 // TMEM starts after LMEM, aligned to TMEM boundary
-// Use standard alignment formula for both 32-bit and 64-bit
-// For 32-bit near top of address space, the result may wrap but the check in VX_lsu_slice.sv handles it
+`ifdef XLEN_32
+// For 32-bit: If LMEM_BASE_ADDR wasn't adjusted above, calculate normally
+// This handles the case when LMEM_ENABLE is not defined
 `define _LMEM_END  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
 `define _TMEM_ALIGN_MASK  ((1 << `TMEM_LOG_SIZE) - 1)
 `define TMEM_BASE_ADDR  ((`_LMEM_END + `_TMEM_ALIGN_MASK) & ~`_TMEM_ALIGN_MASK)
+`else
+// For 64-bit: Standard alignment formula
+`define _LMEM_END  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
+`define _TMEM_ALIGN_MASK  ((1 << `TMEM_LOG_SIZE) - 1)
+`define TMEM_BASE_ADDR  ((`_LMEM_END + `_TMEM_ALIGN_MASK) & ~`_TMEM_ALIGN_MASK)
+`endif
 `endif
 
 `define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
