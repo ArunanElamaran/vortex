@@ -66,13 +66,4 @@ package local_mem_cfg_pkg;
     // Byte-level mask of a data line
     typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_local_mem_byte_mask;
 
-    // Tensor memory types (using same parameters as local memory)
-    typedef logic [LOCAL_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
-    typedef logic [LOCAL_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
-
-    typedef logic [LOCAL_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
-
-    // Byte-level mask of a data line
-    typedef logic [LOCAL_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
-
 endpackage // local_mem_cfg_pkg

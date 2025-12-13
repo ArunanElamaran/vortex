@@ -25,7 +25,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
     VX_dispatch_if.slave    dispatch_if [`ISSUE_WIDTH],
 
     // Outputs
-    VX_commit_if.master     commit_if [`ISSUE_WIDTH]
+    VX_commit_if.master     commit_if [`ISSUE_WIDTH],
+
+    // Tensor memory interface (single port)
+    VX_mem_bus_if.master    tcu_tmem_bus_if
 );
     localparam BLOCK_SIZE = `NUM_TCU_BLOCKS;
     localparam NUM_LANES  = `NUM_TCU_LANES;
@@ -87,7 +90,8 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
             .clk        (clk),
             .reset      (reset),
             .execute_if (pe_execute_if[0]),
-            .result_if  (pe_result_if[0])
+            .result_if  (pe_result_if[0]),
+            .tcu_tmem_bus_if (tcu_tmem_bus_if)
         );
 
         VX_tcu_int #(

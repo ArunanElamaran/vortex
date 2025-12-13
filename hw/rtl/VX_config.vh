@@ -223,16 +223,22 @@
 `define LMEM_LOG_SIZE   14
 `endif
 
-`ifndef LMEM_BASE_ADDR
-`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
-`endif
-
 `ifndef TMEM_LOG_SIZE
 `define TMEM_LOG_SIZE   16  // 64KB tensor memory
 `endif
 
+`ifndef LMEM_BASE_ADDR
+`define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+`endif
+
+// Default TMEM placement
+// For 32-bit, place TMEM below LMEM to avoid overflow when adding TMEM size
 `ifndef TMEM_BASE_ADDR
+`ifdef XLEN_32
+`define TMEM_BASE_ADDR  (`STACK_BASE_ADDR - (1 << `TMEM_LOG_SIZE))
+`else
 `define TMEM_BASE_ADDR  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
+`endif
 `endif
 
 `define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
@@ -689,7 +695,11 @@
 `endif
 
 // TMEM Configurable Knobs ////////////////////////////////////////////////////
-`ifndef LMEM_ENABLE
+`ifndef TMEM_DISABLE
+`define TMEM_ENABLE
+`endif
+
+`ifndef TMEM_ENABLE
     `define TMEM_NUM_BANKS 1
 `endif
 
@@ -862,7 +872,7 @@
     `define LMEM_ENABLED 0
 `endif
 
-`ifdef LMEM_ENABLE
+`ifdef TMEM_ENABLE
     `define TMEM_ENABLED 1
 `else
     `define TMEM_ENABLED 0

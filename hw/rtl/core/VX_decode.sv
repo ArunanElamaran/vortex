@@ -530,6 +530,20 @@ module VX_decode import VX_gpu_pkg::*; #(
                                 `USED_IREG (rs2);
                                 `USED_IREG (rs3);
                             end
+                            3'h1: begin // UMMA
+                                ex_type = EX_TCU;
+                                op_type = INST_OP_BITS'(INST_TCU_UMMA);
+                                op_args.tcu.fmt_s  = rs1[3:0];
+                                op_args.tcu.fmt_d  = rd[3:0];
+                                op_args.tcu.step_m = '0;
+                                op_args.tcu.step_n = '0;
+                                // UMMA uses rd field as fmt_d; no register writeback.
+                                use_rd  = 0;
+                                `USED_IREG (rd);
+                                `USED_IREG (rs1);
+                                `USED_IREG (rs2);
+                                `USED_IREG (rs3);
+                            end
                             default:;
                         endcase
                     end

@@ -10,11 +10,9 @@
 `include "platform_if.vh"
 
 import local_mem_cfg_pkg::*;
-import tensor_mem_cfg_pkg::*;
 
 module ccip_std_afu #(
-    parameter NUM_LOCAL_MEM_BANKS = 2,
-    parameter NUM_TENSOR_MEM_BANKS = 2
+    parameter NUM_LOCAL_MEM_BANKS = 2
 ) (
     // CCI-P Clocks and Resets
     input  logic        pClk,                 // Primary CCI-P interface clock.
@@ -32,8 +30,7 @@ module ccip_std_afu #(
     output t_if_ccip_Tx pck_af2cp_sTx,        // CCI-P Tx Port
 
     // Local memory interface
-    avalon_mem_if.to_fiu local_mem[NUM_LOCAL_MEM_BANKS],
-    avalon_mem_if.to_fiu tensor_mem[NUM_TENSOR_MEM_BANKS]
+    avalon_mem_if.to_fiu local_mem[NUM_LOCAL_MEM_BANKS]
 );
 
     // ====================================================================
@@ -81,51 +78,27 @@ module ccip_std_afu #(
     // User AFU goes here
     // ====================================================================
 
-    t_local_mem_byte_mask avs_byteenableL [NUM_LOCAL_MEM_BANKS];
-    logic                 avs_waitrequestL [NUM_LOCAL_MEM_BANKS];
-    t_local_mem_data      avs_readdataL [NUM_LOCAL_MEM_BANKS];
-    logic                 avs_readdatavalidL [NUM_LOCAL_MEM_BANKS];
-    t_local_mem_burst_cnt avs_burstcountL [NUM_LOCAL_MEM_BANKS];
-    t_local_mem_data      avs_writedataL [NUM_LOCAL_MEM_BANKS];
-    t_local_mem_addr      avs_addressL [NUM_LOCAL_MEM_BANKS];
-    logic                 avs_writeL [NUM_LOCAL_MEM_BANKS];
-    logic                 avs_readL [NUM_LOCAL_MEM_BANKS];
-
-
-    t_tensor_mem_byte_mask avs_byteenableT [NUM_TENSOR_MEM_BANKS];
-    logic                 avs_waitrequestT [NUM_TENSOR_MEM_BANKS];
-    t_tensor_mem_data      avs_readdataT [NUM_TENSOR_MEM_BANKS];
-    logic                 avs_readdatavalidT [NUM_TENSOR_MEM_BANKS];
-    t_tensor_mem_burst_cnt avs_burstcountT [NUM_TENSOR_MEM_BANKS];
-    t_tensor_mem_data      avs_writedataT [NUM_TENSOR_MEM_BANKS];
-    t_tensor_mem_addr      avs_addressT [NUM_TENSOR_MEM_BANKS];
-    logic                 avs_writeT [NUM_TENSOR_MEM_BANKS];
-    logic                 avs_readT [NUM_TENSOR_MEM_BANKS];
+    t_local_mem_byte_mask avs_byteenable [NUM_LOCAL_MEM_BANKS];
+    logic                 avs_waitrequest [NUM_LOCAL_MEM_BANKS];
+    t_local_mem_data      avs_readdata [NUM_LOCAL_MEM_BANKS];
+    logic                 avs_readdatavalid [NUM_LOCAL_MEM_BANKS];
+    t_local_mem_burst_cnt avs_burstcount [NUM_LOCAL_MEM_BANKS];
+    t_local_mem_data      avs_writedata [NUM_LOCAL_MEM_BANKS];
+    t_local_mem_addr      avs_address [NUM_LOCAL_MEM_BANKS];
+    logic                 avs_write [NUM_LOCAL_MEM_BANKS];
+    logic                 avs_read [NUM_LOCAL_MEM_BANKS];
 
     for (genvar b = 0; b < NUM_LOCAL_MEM_BANKS; b++) begin
-        assign local_mem[b].burstcount = avs_burstcountL[b];
-        assign local_mem[b].writedata  = avs_writedataL[b];
-        assign local_mem[b].address    = avs_addressL[b];
-        assign local_mem[b].byteenable = avs_byteenableL[b];
-        assign local_mem[b].write      = avs_writeL[b];
-        assign local_mem[b].read       = avs_readL[b];
+        assign local_mem[b].burstcount = avs_burstcount[b];
+        assign local_mem[b].writedata  = avs_writedata[b];
+        assign local_mem[b].address    = avs_address[b];
+        assign local_mem[b].byteenable = avs_byteenable[b];
+        assign local_mem[b].write      = avs_write[b];
+        assign local_mem[b].read       = avs_read[b];
 
-        assign avs_waitrequestL[b]   = local_mem[b].waitrequest;
-        assign avs_readdataL[b]      = local_mem[b].readdata;
-        assign avs_readdatavalidL[b] = local_mem[b].readdatavalid;
-    end
-
-    for (genvar b = 0; b < NUM_TENSOR_MEM_BANKS; b++) begin
-        assign tensor_mem[b].burstcount = avs_burstcountT[b];
-        assign tensor_mem[b].writedata  = avs_writedataT[b];
-        assign tensor_mem[b].address    = avs_addressT[b];
-        assign tensor_mem[b].byteenable = avs_byteenableT[b];
-        assign tensor_mem[b].write      = avs_writeT[b];
-        assign tensor_mem[b].read       = avs_readT[b];
-
-        assign avs_waitrequestT[b]   = tensor_mem[b].waitrequest;
-        assign avs_readdataT[b]      = tensor_mem[b].readdata;
-        assign avs_readdatavalidT[b] = tensor_mem[b].readdatavalid;
+        assign avs_waitrequest[b]   = local_mem[b].waitrequest;
+        assign avs_readdata[b]      = local_mem[b].readdata;
+        assign avs_readdatavalid[b] = local_mem[b].readdatavalid;
     end
 
     vortex_afu #(
@@ -137,26 +110,15 @@ module ccip_std_afu #(
         .cp2af_sRxPort       (cp2af_sRx_T1),
         .af2cp_sTxPort       (af2cp_sTx_T0),
 
-        .avs_writedataL       (avs_writedataL),
-        .avs_readdataL        (avs_readdataL),
-        .avs_addressL         (avs_addressL),
-        .avs_waitrequestL     (avs_waitrequestL),
-        .avs_writeL           (avs_writeL),
-        .avs_readL            (avs_readL),
-        .avs_byteenableL      (avs_byteenableL),
-        .avs_burstcountL      (avs_burstcountL),
-        .avs_readdatavalidL   (avs_readdatavalidL),
-
-
-        .avs_writedataT       (avs_writedataT),
-        .avs_readdataT        (avs_readdataT),
-        .avs_addressT         (avs_addressT),
-        .avs_waitrequestT     (avs_waitrequestT),
-        .avs_writeT           (avs_writeT),
-        .avs_readT            (avs_readT),
-        .avs_byteenableT      (avs_byteenableT),
-        .avs_burstcountT      (avs_burstcountT),
-        .avs_readdatavalidT   (avs_readdatavalidT),
+        .avs_writedata       (avs_writedata),
+        .avs_readdata        (avs_readdata),
+        .avs_address         (avs_address),
+        .avs_waitrequest     (avs_waitrequest),
+        .avs_write           (avs_write),
+        .avs_read            (avs_read),
+        .avs_byteenable      (avs_byteenable),
+        .avs_burstcount      (avs_burstcount),
+        .avs_readdatavalid   (avs_readdatavalid)
     );
 
 endmodule

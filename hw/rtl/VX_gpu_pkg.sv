@@ -99,14 +99,10 @@ package VX_gpu_pkg;
 	localparam NUM_SOCKETS = `UP(`NUM_CORES / `SOCKET_SIZE);
 
     localparam MEM_REQ_FLAG_FLUSH =  0;
-    localparam MEM_REQ_FLAG_IO =     1;
-    localparam MEM_REQ_FLAG_LOCAL =  2; // shoud be last since optional
-
-    // Per-local-type flags
-    localparam MEM_REQ_FLAG_LMEM  = MEM_REQ_FLAG_LOCAL;                    // 2
-    localparam MEM_REQ_FLAG_TMEM  = MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED;    // 2 or 3
-
-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED + 1); // +1 for TMEM when LMEM enabled
+    localparam MEM_REQ_FLAG_IO    =  1;
+    localparam MEM_REQ_FLAG_LOCAL =  2; // should be last since optional
+    localparam MEM_REQ_FLAG_TMEM  = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED); // optional
+    localparam MEM_FLAGS_WIDTH    = (MEM_REQ_FLAG_TMEM + `TMEM_ENABLED);
 
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = 32;
@@ -445,6 +441,7 @@ package VX_gpu_pkg;
 `ifdef EXT_TCU_ENABLE
 
     localparam INST_TCU_WMMA = 4'h0;
+    localparam INST_TCU_UMMA = 4'h1;
     localparam INST_TCU_BITS = 4;
 
 `endif

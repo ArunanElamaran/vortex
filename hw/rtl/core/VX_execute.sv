@@ -32,6 +32,9 @@ module VX_execute import VX_gpu_pkg::*; #(
     // Dcache interface
     VX_lsu_mem_if.master    lsu_mem_if [`NUM_LSU_BLOCKS],
 
+    // TCU tensor memory interface
+    VX_mem_bus_if.master    tcu_tmem_bus_if,
+
     // dispatch interface
     VX_dispatch_if.slave    dispatch_if [NUM_EX_UNITS * `ISSUE_WIDTH],
 
@@ -93,7 +96,8 @@ module VX_execute import VX_gpu_pkg::*; #(
         .clk            (clk),
         .reset          (reset),
         .dispatch_if    (dispatch_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
-        .commit_if      (commit_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH])
+        .commit_if      (commit_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
+        .tcu_tmem_bus_if(tcu_tmem_bus_if)
     );
 `endif
 

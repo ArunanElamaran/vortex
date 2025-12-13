@@ -26,7 +26,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 `endif
 
     VX_lsu_mem_if.slave     lsu_mem_if [`NUM_LSU_BLOCKS],
-    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS]
+    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
+    VX_mem_bus_if.master    tcu_tmem_bus_if
 );
     VX_lsu_mem_if #(
         .NUM_LANES (`NUM_LSU_LANES),
@@ -34,38 +35,79 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) lsu_dcache_if[`NUM_LSU_BLOCKS]();
 
-`ifdef LMEM_ENABLE
-
-    `STATIC_ASSERT(`IS_DIVISBLE((1 << `LMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
-    `STATIC_ASSERT(0 == (`LMEM_BASE_ADDR % (1 << `LMEM_LOG_SIZE)), ("invalid parameter"))
-
-    localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
-
-    `STATIC_ASSERT(`IS_DIVISBLE((1 << `TMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
-    `STATIC_ASSERT(0 == (`TMEM_BASE_ADDR % (1 << `TMEM_LOG_SIZE)), ("invalid parameter"))
-
-    localparam TMEM_ADDR_WIDTH = `TMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
-
     VX_lsu_mem_if #(
         .NUM_LANES (`NUM_LSU_LANES),
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (LSU_TAG_WIDTH)
     ) lsu_lmem_if[`NUM_LSU_BLOCKS]();
 
-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lmem_switches
-        VX_lmem_switch #(
-            .GLOBAL_OUT_BUF(1),
-            .LOCAL_OUT_BUF(1),
-            .RSP_OUT_BUF  (1),
-            .ARBITER      ("P")
-        ) lmem_switch (
-            .clk          (clk),
-            .reset        (reset),
-            .lsu_in_if    (lsu_mem_if[i]),
-            .global_out_if(lsu_dcache_if[i]),
-            .local_out_if (lsu_lmem_if[i])
-        );
+`ifdef TMEM_ENABLE
+    VX_lsu_mem_if #(
+        .NUM_LANES (`NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (LSU_TAG_WIDTH)
+    ) lsu_tmem_if[`NUM_LSU_BLOCKS]();
+`endif
+
+    // Switch LSU traffic to global/local/tensor memories when enabled.
+    localparam MEM_SWITCH_ENABLE =
+`ifdef LMEM_ENABLE
+        1;
+`elsif TMEM_ENABLE
+        1;
+`else
+        0;
+`endif
+
+    generate
+        if (MEM_SWITCH_ENABLE) begin : g_mem_switches_block
+            for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_mem_switches
+                VX_lmem_switch #(
+                    .GLOBAL_OUT_BUF(1),
+                    .LOCAL_OUT_BUF (1),
+                `ifdef TMEM_ENABLE
+                    .TENSOR_OUT_BUF(1),
+                `else
+                    .TENSOR_OUT_BUF(0),
+                `endif
+                    .RSP_OUT_BUF  (1),
+                    .ARBITER      ("P")
+                ) mem_switch (
+                    .clk          (clk),
+                    .reset        (reset),
+                    .lsu_in_if    (lsu_mem_if[i]),
+                    .global_out_if(lsu_dcache_if[i]),
+                    .local_out_if (lsu_lmem_if[i])
+                `ifdef TMEM_ENABLE
+                    ,.tensor_out_if(lsu_tmem_if[i])
+                `endif
+                );
+            end
+        end else begin : g_lsu_dcache_if
+            for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_passthru
+                `ASSIGN_VX_MEM_BUS_IF (lsu_dcache_if[i], lsu_mem_if[i]);
+            end
+        end
+    endgenerate
+
+`ifndef LMEM_ENABLE
+generate
+if (`TMEM_ENABLE) begin : g_stub_lmem
+    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_stub_local_if
+        assign lsu_lmem_if[i].req_ready = 1'b1;
+        assign lsu_lmem_if[i].rsp_valid = 1'b0;
+        assign lsu_lmem_if[i].rsp_data  = '0;
     end
+end
+endgenerate
+`endif
+
+`ifdef LMEM_ENABLE
+
+    `STATIC_ASSERT(`IS_DIVISBLE((1 << `LMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
+    `STATIC_ASSERT(0 == (`LMEM_BASE_ADDR % (1 << `LMEM_LOG_SIZE)), ("invalid parameter"))
+
+    localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
 
     VX_lsu_mem_if #(
         .NUM_LANES (`NUM_LSU_LANES),
@@ -90,58 +132,6 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .bus_out_if (lmem_arb_if)
     );
 
-    VX_lsu_mem_if #(
-        .NUM_LANES (`NUM_LSU_LANES),
-        .DATA_SIZE (LSU_WORD_SIZE),
-        .TAG_WIDTH (LMEM_TAG_WIDTH)
-    ) lmem_adapter_if[1]();
-
-    VX_lsu_mem_if #(
-        .NUM_LANES (`NUM_LSU_LANES),
-        .DATA_SIZE (LSU_WORD_SIZE),
-        .TAG_WIDTH (TMEM_TAG_WIDTH)
-    ) tmem_adapter_if[1]();
-
-    // Separate local and tensor memory requests based on flags
-    wire [`NUM_LSU_LANES-1:0] is_lmem_mask;
-    wire [`NUM_LSU_LANES-1:0] is_tmem_mask;
-    for (genvar i = 0; i < `NUM_LSU_LANES; ++i) begin : g_mem_type_sep
-        assign is_lmem_mask[i] = lmem_arb_if[0].req_data.flags[i][MEM_REQ_FLAG_LMEM];
-        assign is_tmem_mask[i] = lmem_arb_if[0].req_data.flags[i][MEM_REQ_FLAG_TMEM];
-    end
-
-    wire has_lmem_req = lmem_arb_if[0].req_valid && |(lmem_arb_if[0].req_data.mask & is_lmem_mask);
-    wire has_tmem_req = lmem_arb_if[0].req_valid && |(lmem_arb_if[0].req_data.mask & is_tmem_mask);
-
-    // Local memory path
-    assign lmem_adapter_if[0].req_valid = has_lmem_req;
-    assign lmem_adapter_if[0].req_data.mask = lmem_arb_if[0].req_data.mask & is_lmem_mask;
-    assign lmem_adapter_if[0].req_data.rw = lmem_arb_if[0].req_data.rw;
-    assign lmem_adapter_if[0].req_data.addr = lmem_arb_if[0].req_data.addr;
-    assign lmem_adapter_if[0].req_data.data = lmem_arb_if[0].req_data.data;
-    assign lmem_adapter_if[0].req_data.byteen = lmem_arb_if[0].req_data.byteen;
-    assign lmem_adapter_if[0].req_data.flags = lmem_arb_if[0].req_data.flags;
-    assign lmem_adapter_if[0].req_data.tag = lmem_arb_if[0].req_data.tag;
-
-    // Tensor memory path
-    assign tmem_adapter_if[0].req_valid = has_tmem_req;
-    assign tmem_adapter_if[0].req_data.mask = lmem_arb_if[0].req_data.mask & is_tmem_mask;
-    assign tmem_adapter_if[0].req_data.rw = lmem_arb_if[0].req_data.rw;
-    assign tmem_adapter_if[0].req_data.addr = lmem_arb_if[0].req_data.addr;
-    assign tmem_adapter_if[0].req_data.data = lmem_arb_if[0].req_data.data;
-    assign tmem_adapter_if[0].req_data.byteen = lmem_arb_if[0].req_data.byteen;
-    assign tmem_adapter_if[0].req_data.flags = lmem_arb_if[0].req_data.flags;
-    assign tmem_adapter_if[0].req_data.tag = lmem_arb_if[0].req_data.tag;
-
-    assign lmem_arb_if[0].req_ready = (has_lmem_req ? lmem_adapter_if[0].req_ready : 1'b1) &&
-                                      (has_tmem_req ? tmem_adapter_if[0].req_ready : 1'b1);
-
-    // Response arbitration - prioritize local memory, then tensor memory
-    assign lmem_arb_if[0].rsp_valid = lmem_adapter_if[0].rsp_valid || tmem_adapter_if[0].rsp_valid;
-    assign lmem_arb_if[0].rsp_data = lmem_adapter_if[0].rsp_valid ? lmem_adapter_if[0].rsp_data : tmem_adapter_if[0].rsp_data;
-    assign lmem_adapter_if[0].rsp_ready = lmem_arb_if[0].rsp_ready && lmem_adapter_if[0].rsp_valid;
-    assign tmem_adapter_if[0].rsp_ready = lmem_arb_if[0].rsp_ready && ~lmem_adapter_if[0].rsp_valid && tmem_adapter_if[0].rsp_valid;
-
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (LMEM_TAG_WIDTH)
@@ -158,7 +148,7 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     ) lmem_adapter (
         .clk        (clk),
         .reset      (reset),
-        .lsu_mem_if (lmem_adapter_if[0]),
+        .lsu_mem_if (lmem_arb_if[0]),
         .mem_bus_if (lmem_adapt_if)
     );
 
@@ -180,10 +170,51 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .mem_bus_if (lmem_adapt_if)
     );
 
+`else
+
+`ifdef PERF_ENABLE
+    assign lmem_perf = '0;
+`endif
+
+`endif
+
+`ifdef TMEM_ENABLE
+
+    `STATIC_ASSERT(`IS_DIVISBLE((1 << `TMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
+    `STATIC_ASSERT(0 == (`TMEM_BASE_ADDR % (1 << `TMEM_LOG_SIZE)), ("invalid parameter"))
+
+    localparam TMEM_ADDR_WIDTH = `TMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
+
+    VX_lsu_mem_if #(
+        .NUM_LANES (`NUM_LSU_LANES),
+        .DATA_SIZE (LSU_WORD_SIZE),
+        .TAG_WIDTH (TMEM_TAG_WIDTH)
+    ) tmem_arb_if[1]();
+
+    VX_lsu_mem_arb #(
+        .NUM_INPUTS (`NUM_LSU_BLOCKS),
+        .NUM_OUTPUTS(1),
+        .NUM_LANES  (`NUM_LSU_LANES),
+        .DATA_SIZE  (LSU_WORD_SIZE),
+        .TAG_WIDTH  (LSU_TAG_WIDTH),
+        .TAG_SEL_IDX(0),
+        .ARBITER    ("R"),
+        .REQ_OUT_BUF(0),
+        .RSP_OUT_BUF(2)
+    ) tmem_arb (
+        .clk        (clk),
+        .reset      (reset),
+        .bus_in_if  (lsu_tmem_if),
+        .bus_out_if (tmem_arb_if)
+    );
+
+    // TMEM adapter: LSU lanes + 1 extra port for TCU
+    localparam TMEM_PORTS = `NUM_LSU_LANES + 1;
+
     VX_mem_bus_if #(
         .DATA_SIZE (LSU_WORD_SIZE),
         .TAG_WIDTH (TMEM_TAG_WIDTH)
-    ) tmem_adapt_if[`NUM_LSU_LANES]();
+    ) tmem_adapt_if[TMEM_PORTS]();
 
     VX_lsu_adapter #(
         .NUM_LANES    (`NUM_LSU_LANES),
@@ -196,14 +227,17 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
     ) tmem_adapter (
         .clk        (clk),
         .reset      (reset),
-        .lsu_mem_if (tmem_adapter_if[0]),
-        .mem_bus_if (tmem_adapt_if)
+        .lsu_mem_if (tmem_arb_if[0]),
+        .mem_bus_if (tmem_adapt_if[0 +: `NUM_LSU_LANES])
     );
+
+    // TCU gets a dedicated TMEM port (single lane) exposed to the core
+    `ASSIGN_VX_MEM_BUS_IF (tcu_tmem_bus_if, tmem_adapt_if[`NUM_LSU_LANES]);
 
     VX_tensor_mem #(
         .INSTANCE_ID(`SFORMATF(("%s-tmem", INSTANCE_ID))),
         .SIZE       (1 << `TMEM_LOG_SIZE),
-        .NUM_REQS   (`NUM_LSU_LANES),
+        .NUM_REQS   (TMEM_PORTS),
         .NUM_BANKS  (`TMEM_NUM_BANKS),
         .WORD_SIZE  (LSU_WORD_SIZE),
         .ADDR_WIDTH (TMEM_ADDR_WIDTH),
@@ -221,13 +255,8 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 `else
 
 `ifdef PERF_ENABLE
-    assign lmem_perf = '0;
     assign tmem_perf = '0;
 `endif
-
-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lsu_dcache_if
-        `ASSIGN_VX_MEM_BUS_IF (lsu_dcache_if[i], lsu_mem_if[i]);
-    end
 
 `endif
 
