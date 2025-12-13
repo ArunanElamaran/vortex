@@ -448,11 +448,11 @@ public:
   // This writes zeros directly to tensor memory at the given address
   static __attribute__((always_inline)) void fill_fragment(fragment_acc &frag, output_t value) {
     auto ptr = reinterpret_cast<volatile output_t*>(frag.addr);
-    // Each thread writes its portion
     uint32_t lane = vx_thread_id();
-    uint32_t elements_per_thread = (tileM * tileN) / NT; // MxN bc this is for C/D accumulator arrays
+    constexpr uint32_t elements_per_thread = (tileM * tileN) / NT;
+    uint32_t base_idx = lane * elements_per_thread;
     for (uint32_t i = 0; i < elements_per_thread; ++i) {
-      ptr[lane * elements_per_thread + i] = value;
+      ptr[base_idx + i] = value;
     }
   }
 
@@ -470,32 +470,44 @@ public:
 
     // If loading Matrix A (M x K)
     if constexpr (Frag::use == matrix_a) {
-      uint32_t total_elements = tileM * tileK;
-      uint32_t elements_per_thread = total_elements / NT;
+      constexpr uint32_t total_elements = tileM * tileK;
+      constexpr uint32_t elements_per_thread = total_elements / NT;
+
+      // Compute initial row/col once using div/mod, then increment
+      uint32_t idx = lane * elements_per_thread;
+      uint32_t row = idx / tileK;
+      uint32_t col = idx % tileK;
 
       for (uint32_t i = 0; i < elements_per_thread; ++i) {
-        uint32_t idx = lane * elements_per_thread + i;
-        uint32_t row = idx / tileK;
-        uint32_t col = idx % tileK;
         if constexpr (src_layout == row_major) {
           dst_ptr[idx] = src_ptr[row * ldm + col];
         } else {
           dst_ptr[idx] = src_ptr[col * ldm + row];
         }
+        // Increment with wrap-around (avoids div/mod in loop)
+        idx++;
+        col++;
+        if (col >= tileK) { col = 0; row++; }
       }
     } else if constexpr (Frag::use == matrix_b) { // If loading Matrix B (K x N)
-      uint32_t total_elements = tileK * tileN;
-      uint32_t elements_per_thread = total_elements / NT;
+      constexpr uint32_t total_elements = tileK * tileN;
+      constexpr uint32_t elements_per_thread = total_elements / NT;
+
+      // Compute initial row/col once using div/mod, then increment
+      uint32_t idx = lane * elements_per_thread;
+      uint32_t row = idx / tileN;
+      uint32_t col = idx % tileN;
 
       for (uint32_t i = 0; i < elements_per_thread; ++i) {
-        uint32_t idx = lane * elements_per_thread + i;
-        uint32_t row = idx / tileN;
-        uint32_t col = idx % tileN;
         if constexpr (src_layout == row_major) {
           dst_ptr[idx] = src_ptr[row * ldm + col];
         } else {
           dst_ptr[idx] = src_ptr[col * ldm + row];
         }
+        // Increment with wrap-around (avoids div/mod in loop)
+        idx++;
+        col++;
+        if (col >= tileN) { col = 0; row++; }
       }
     }
   }
@@ -507,18 +519,24 @@ public:
     auto dst_ptr = reinterpret_cast<output_t*>(dst);
 
     uint32_t lane = vx_thread_id();
-    uint32_t total_elements = tileM * tileN;
-    uint32_t elements_per_thread = total_elements / NT;
+    constexpr uint32_t total_elements = tileM * tileN;
+    constexpr uint32_t elements_per_thread = total_elements / NT;
+
+    // Compute initial row/col once using div/mod, then increment
+    uint32_t idx = lane * elements_per_thread;
+    uint32_t row = idx / tileN;
+    uint32_t col = idx % tileN;
 
     for (uint32_t i = 0; i < elements_per_thread; ++i) {
-      uint32_t idx = lane * elements_per_thread + i;
-      uint32_t row = idx / tileN;
-      uint32_t col = idx % tileN;
       if constexpr (dst_layout == row_major) {
         dst_ptr[row * ldm + col] = src[idx];
       } else {
         dst_ptr[col * ldm + row] = src[idx];
       }
+      // Increment with wrap-around (avoids div/mod in loop)
+      idx++;
+      col++;
+      if (col >= tileN) { col = 0; row++; }
     }
   }
 
