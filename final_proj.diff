@@ -1,0 +1,4676 @@
+diff --git a/docs/umma_implementation.md b/docs/umma_implementation.md
+new file mode 100644
+index 0000000..db81591
+--- /dev/null
++++ b/docs/umma_implementation.md
+@@ -0,0 +1,248 @@
++# UMMA (Unified Matrix Multiply-Accumulate) Implementation
++
++## Overview
++
++UMMA is a tensor unit instruction that performs matrix multiplication and accumulation using **tensor memory (TMEM)** instead of register files. Unlike WMMA (which uses register-packed data), UMMA operates on contiguous memory regions in TMEM, simplifying the programming model while leveraging specialized tensor memory.
++
++## Architecture
++
++```
++┌─────────────────────────────────────────────────────────────┐
++│                        Kernel Code                          │
++│  ctx::mma_sync(tmemC, tmemA, tmemB, tmemC)                 │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│                    UMMA Instruction                         │
++│  Registers contain TMEM addresses: a0=A, a1=B, a2=C        │
++│  Format encoded in instruction: fmt_s (input), fmt_d (out) │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│               Tensor Unit (tensor_unit.cpp)                 │
++│  1. Read tiles from TMEM                                    │
++│  2. Compute D = C + A × B                                   │
++│  3. Write result back to TMEM                               │
++└─────────────────────────────────────────────────────────────┘
++                              │
++                              ▼
++┌─────────────────────────────────────────────────────────────┐
++│               Tensor Memory (tensor_mem.cpp)                │
++│  Per-core scratchpad memory for tensor operations           │
++│  Direct read/write access (no cache hierarchy)              │
++└─────────────────────────────────────────────────────────────┘
++```
++
++## Tile Dimensions
++
++The UMMA tile dimensions are derived from the base configuration and input type:
++
++| Parameter | Formula | Example (fp16→fp32) |
++|-----------|---------|---------------------|
++| `tileM` | `xtileM` | 8 |
++| `tileN` | `xtileN` | 4 |
++| `tileK` | `xtileK × i_ratio` | 4 × 2 = 8 |
++
++Where:
++- `xtileM`, `xtileN`, `xtileK` are base tile dimensions (8, 4, 4 for 4 threads)
++- `i_ratio = 4 / sizeof(input_type)` (e.g., 2 for fp16, 4 for int8)
++
++## Memory Layout
++
++All tiles are stored in **row-major** order in tensor memory:
++
++```
++Tensor Memory Layout:
++┌────────────────────────────────────────┐
++│ A tile: tileM × tileK elements         │
++│ [a00, a01, ..., a0K, a10, a11, ...]   │
++├────────────────────────────────────────┤
++│ B tile: tileK × tileN elements         │
++│ [b00, b01, ..., b0N, b10, b11, ...]   │
++├────────────────────────────────────────┤
++│ C tile: tileM × tileN elements         │
++│ [c00, c01, ..., c0N, c10, c11, ...]   │
++└────────────────────────────────────────┘
++```
++
++## Implementation Details
++
++### 1. Instruction Decoding (`decode.cpp`)
++
++The UMMA instruction is encoded as:
++```
++R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
++- opcode = RISCV_CUSTOM0 (0x0b)
++- funct3 = 1 (distinguishes from WMMA which uses funct3=0)
++- funct7 = 2
++- rd = output format ID (fmt_d)
++- rs1 = input format ID (fmt_s)
++```
++
++### 2. Execution Flow (`execute.cpp` → `tensor_unit.cpp`)
++
++```cpp
++case TcuType::UMMA: {
++    tensor_unit_->umma(wid, fmt_s, fmt_d, step_m, step_n,
++                       rs1_data, rs2_data, rs3_data, rd_data, trace_data);
++}
++```
++
++### 3. UMMA Function (`tensor_unit.cpp`)
++
++The `umma()` function:
++
++1. **Extract addresses** from registers (thread 0's values):
++   ```cpp
++   uint64_t addr_a = rs1_data[0].u32;  // A tile address in TMEM
++   uint64_t addr_b = rs2_data[0].u32;  // B tile address in TMEM
++   uint64_t addr_c = rs3_data[0].u32;  // C tile address in TMEM
++   ```
++
++2. **Calculate tile dimensions** based on format:
++   ```cpp
++   uint32_t input_bytes = get_type_bytes(fmt_s);
++   uint32_t i_ratio = 4 / input_bytes;
++   uint32_t tileK = xtileK * i_ratio;
++   ```
++
++3. **Dispatch to appropriate executor**:
++   ```cpp
++   auto umma_fn = select_UMMA(fmt_s, fmt_d);
++   umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
++   ```
++
++4. **Return address to ALL threads**:
++   ```cpp
++   for (size_t t = 0; t < rd_data.size(); ++t) {
++       rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++   }
++   ```
++
++### 4. Matrix Computation (`execute_umma<It, Ot>`)
++
++```cpp
++template <typename It, typename Ot>
++static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
++                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
++                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
++    // Read tiles from TMEM
++    tensor_mem->read(a_tile.data(), addr_a, a_bytes);
++    tensor_mem->read(b_tile.data(), addr_b, b_bytes);
++    tensor_mem->read(c_tile.data(), addr_c, c_bytes);
++
++    // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
++    for (uint32_t m = 0; m < tileM; ++m) {
++        for (uint32_t n = 0; n < tileN; ++n) {
++            otype acc = c_tile[m * tileN + n];
++            for (uint32_t k = 0; k < tileK; ++k) {
++                acc = FMA<It, Ot>::eval(a_tile[m * tileK + k],
++                                        b_tile[k * tileN + n], acc);
++            }
++            d_tile[m * tileN + n] = acc;
++        }
++    }
++
++    // Write result back to TMEM
++    tensor_mem->write(d_tile.data(), addr_c, c_bytes);
++}
++```
++
++## Supported Format Combinations
++
++| Input Type (`fmt_s`) | Output Type (`fmt_d`) | `i_ratio` | `tileK` |
++|---------------------|----------------------|-----------|---------|
++| fp16 (id=1) | fp32 (id=0) | 2 | 8 |
++| bf16 (id=2) | fp32 (id=0) | 2 | 8 |
++| tf32 (id=3) | fp32 (id=0) | 1 | 4 |
++| fp16 (id=1) | fp16 (id=1) | 2 | 8 |
++| bf16 (id=2) | bf16 (id=2) | 2 | 8 |
++| int8 (id=9) | int32 (id=8) | 4 | 16 |
++| uint8 (id=10) | int32 (id=8) | 4 | 16 |
++
++## FMA (Fused Multiply-Add) Templates
++
++Each format combination has a specialized FMA template for proper type conversion:
++
++```cpp
++// Example: fp16 → fp32
++template <>
++struct FMA<vt::fp16, vt::fp32> {
++    static float eval(uint16_t a, uint16_t b, float c) {
++        auto xa = rv_htof_s(a, 0, nullptr);  // Convert fp16 to fp32
++        auto xb = rv_htof_s(b, 0, nullptr);
++        auto xab = rv_fmul_s(xa, xb, 0, nullptr);  // Multiply in fp32
++        auto xc = bit_cast<uint32_t>(c);
++        auto xd = rv_fadd_s(xab, xc, 0, nullptr);  // Add accumulator
++        return bit_cast<float>(xd);
++    }
++};
++```
++
++## Tensor Memory Addressing
++
++TMEM uses a simple linear addressing scheme:
++
++```cpp
++uint64_t to_local_addr(uint64_t addr) {
++    uint64_t local = addr - TMEM_BASE_ADDR;
++    return local & (config_.capacity - 1);  // Wrap within capacity
++}
++```
++
++- `TMEM_BASE_ADDR` = 0xC0000000 (3GB mark)
++- Capacity = 64KB per core (configurable via `TMEM_LOG_SIZE`)
++
++## Key Differences: UMMA vs WMMA
++
++| Aspect | WMMA | UMMA |
++|--------|------|------|
++| Data Location | Register file | Tensor memory |
++| Data Layout | Packed in registers (complex) | Contiguous row-major (simple) |
++| Addressing | Register indices | Memory addresses |
++| Steps | Multiple (step_m, step_n) | Single instruction |
++| Memory Access | Via loads/stores | Direct TMEM read/write |
++
++## Critical Implementation Notes
++
++### 1. All Threads Need Return Value
++
++The UMMA instruction returns the output address, and **all threads** must receive this value:
++
++```cpp
++// CRITICAL: Set rd for ALL threads, not just thread 0
++for (size_t t = 0; t < rd_data.size(); ++t) {
++    rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++}
++```
++
++This is because `store_matrix_sync` uses this address, and each thread reads from its own register.
++
++### 2. Per-Core TMEM
++
++Tensor memory is **per-core**, not shared across cores. Each core has its own 64KB TMEM starting at the same base address (0xC0000000). The kernel must use warp-local offsets:
++
++```cpp
++uint32_t warp_id = vx_warp_id();
++uint64_t block_tmem_base = TMEM_BASE_ADDR + warp_id * tile_size;
++```
++
++### 3. Type-Specific tileK
++
++The K dimension varies based on input type due to packing:
++- fp32/tf32: `tileK = 4`
++- fp16/bf16: `tileK = 8`
++- int8/uint8: `tileK = 16`
++
++This is automatically calculated using `i_ratio = 4 / sizeof(input_type)`.
++
++## File References
++
++- **Instruction Decode**: `sim/simx/decode.cpp`
++- **Instruction Execute**: `sim/simx/execute.cpp`
++- **Tensor Unit**: `sim/simx/tensor_unit.cpp`
++- **Tensor Memory**: `sim/simx/tensor_mem.cpp`
++- **Type Definitions**: `sim/common/tensor_cfg.h`
++- **Kernel API**: `kernel/include/vx_tensor.h`
+diff --git a/hw/rtl/VX_config.vh b/hw/rtl/VX_config.vh
+index 730382b..2cd43cc 100644
+--- a/hw/rtl/VX_config.vh
++++ b/hw/rtl/VX_config.vh
+@@ -223,10 +223,27 @@
+ `define LMEM_LOG_SIZE   14
+ `endif
+ 
++`ifndef TMEM_LOG_SIZE
++`define TMEM_LOG_SIZE   16  // 64KB tensor memory
++`endif
++
+ `ifndef LMEM_BASE_ADDR
+ `define LMEM_BASE_ADDR  `STACK_BASE_ADDR
+ `endif
+ 
++// Default TMEM placement
++// For 32-bit, place TMEM below LMEM to avoid overflow when adding TMEM size
++`ifndef TMEM_BASE_ADDR
++`ifdef XLEN_32
++`define TMEM_BASE_ADDR  (`STACK_BASE_ADDR - (1 << `TMEM_LOG_SIZE))
++`else
++`define TMEM_BASE_ADDR  (`LMEM_BASE_ADDR + (1 << `LMEM_LOG_SIZE))
++`endif
++`endif
++
++`define TMEM_SIZE       (1 << `TMEM_LOG_SIZE)
++`define TMEM_END_ADDR   (`TMEM_BASE_ADDR + `TMEM_SIZE)
++
+ `ifndef IO_COUT_ADDR
+ `define IO_COUT_ADDR    `IO_BASE_ADDR
+ `endif
+@@ -677,6 +694,20 @@
+ `define LMEM_NUM_BANKS `NUM_LSU_LANES
+ `endif
+ 
++// TMEM Configurable Knobs ////////////////////////////////////////////////////
++`ifndef TMEM_DISABLE
++`define TMEM_ENABLE
++`endif
++
++`ifndef TMEM_ENABLE
++    `define TMEM_NUM_BANKS 1
++`endif
++
++// Number of Banks
++`ifndef TMEM_NUM_BANKS
++`define TMEM_NUM_BANKS `NUM_LSU_LANES
++`endif
++
+ // L2cache Configurable Knobs /////////////////////////////////////////////////
+ 
+ // Cache Size
+@@ -841,6 +872,12 @@
+     `define LMEM_ENABLED 0
+ `endif
+ 
++`ifdef TMEM_ENABLE
++    `define TMEM_ENABLED 1
++`else
++    `define TMEM_ENABLED 0
++`endif
++
+ `ifdef GBAR_ENABLE
+     `define GBAR_ENABLED 1
+ `else
+@@ -926,6 +963,7 @@
+ `define ISA_EXT_LMEM        4
+ `define ISA_EXT_ZICOND      5
+ `define ISA_EXT_TCU         6
++`define ISA_EXT_TMEM        7
+ 
+ `define MISA_EXT  (`ICACHE_ENABLED  << `ISA_EXT_ICACHE) \
+                 | (`DCACHE_ENABLED  << `ISA_EXT_DCACHE) \
+@@ -934,6 +972,7 @@
+                 | (`LMEM_ENABLED    << `ISA_EXT_LMEM) \
+                 | (`EXT_ZICOND_ENABLED << `ISA_EXT_ZICOND) \
+                 | (`EXT_TCU_ENABLED << `ISA_EXT_TCU) \
++                | (`TMEM_ENABLED    << `ISA_EXT_TMEM) \
+ 
+ `define MISA_STD  (`EXT_A_ENABLED <<  0) /* A - Atomic Instructions extension */ \
+                 | (0 <<  1) /* B - Tentatively reserved for Bit operations extension */ \
+diff --git a/hw/rtl/VX_gpu_pkg.sv b/hw/rtl/VX_gpu_pkg.sv
+index 2ef9ae2..1d76235 100644
+--- a/hw/rtl/VX_gpu_pkg.sv
++++ b/hw/rtl/VX_gpu_pkg.sv
+@@ -99,9 +99,10 @@ package VX_gpu_pkg;
+ 	localparam NUM_SOCKETS = `UP(`NUM_CORES / `SOCKET_SIZE);
+ 
+     localparam MEM_REQ_FLAG_FLUSH =  0;
+-    localparam MEM_REQ_FLAG_IO =     1;
+-    localparam MEM_REQ_FLAG_LOCAL =  2; // shoud be last since optional
+-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
++    localparam MEM_REQ_FLAG_IO    =  1;
++    localparam MEM_REQ_FLAG_LOCAL =  2; // should be last since optional
++    localparam MEM_REQ_FLAG_TMEM  = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED); // optional
++    localparam MEM_FLAGS_WIDTH    = (MEM_REQ_FLAG_TMEM + `TMEM_ENABLED);
+ 
+     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
+     localparam VX_DCR_DATA_WIDTH = 32;
+@@ -440,6 +441,7 @@ package VX_gpu_pkg;
+ `ifdef EXT_TCU_ENABLE
+ 
+     localparam INST_TCU_WMMA = 4'h0;
++    localparam INST_TCU_UMMA = 4'h1;
+     localparam INST_TCU_BITS = 4;
+ 
+ `endif
+@@ -707,6 +709,13 @@ package VX_gpu_pkg;
+         logic [PERF_CTR_BITS-1:0] crsp_stalls;
+     } lmem_perf_t;
+ 
++    typedef struct packed {
++        logic [PERF_CTR_BITS-1:0] reads;
++        logic [PERF_CTR_BITS-1:0] writes;
++        logic [PERF_CTR_BITS-1:0] bank_stalls;
++        logic [PERF_CTR_BITS-1:0] crsp_stalls;
++    } tmem_perf_t;
++
+     typedef struct packed {
+         logic [PERF_CTR_BITS-1:0] misses;
+     } coalescer_perf_t;
+@@ -736,6 +745,7 @@ package VX_gpu_pkg;
+         cache_perf_t l2cache;
+         cache_perf_t l3cache;
+         lmem_perf_t  lmem;
++        tmem_perf_t  tmem;
+         coalescer_perf_t coalescer;
+         mem_perf_t   mem;
+     } sysmem_perf_t;
+@@ -759,6 +769,7 @@ package VX_gpu_pkg;
+     localparam LSU_TAG_WIDTH        = (UUID_WIDTH + LSU_TAG_ID_BITS);
+     localparam LSU_NUM_REQS	        = `NUM_LSU_BLOCKS * `NUM_LSU_LANES;
+     localparam LMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
++    localparam TMEM_TAG_WIDTH       = LSU_TAG_WIDTH + `CLOG2(`NUM_LSU_BLOCKS);
+ 
+     ////////////////////////// Icache Parameters //////////////////////////////
+ 
+diff --git a/hw/rtl/VX_types.vh b/hw/rtl/VX_types.vh
+index 7ff3326..9a575b9 100644
+--- a/hw/rtl/VX_types.vh
++++ b/hw/rtl/VX_types.vh
+@@ -179,6 +179,13 @@
+ `define VX_CSR_MPM_LMEM_WRITES_H        12'hB9C
+ `define VX_CSR_MPM_LMEM_BANK_ST         12'hB1D     // bank conflicts
+ `define VX_CSR_MPM_LMEM_BANK_ST_H       12'hB9D
++// PERF: tmem
++`define VX_CSR_MPM_TMEM_READS           12'hB20     // memory reads
++`define VX_CSR_MPM_TMEM_READS_H         12'hBA0
++`define VX_CSR_MPM_TMEM_WRITES          12'hB21     // memory writes
++`define VX_CSR_MPM_TMEM_WRITES_H        12'hBA1
++`define VX_CSR_MPM_TMEM_BANK_ST         12'hB22     // bank conflicts
++`define VX_CSR_MPM_TMEM_BANK_ST_H       12'hBA2
+ // PERF: coalescer
+ `define VX_CSR_MPM_COALESCER_MISS       12'hB1F     // coalescer misses
+ `define VX_CSR_MPM_COALESCER_MISS_H     12'hB9F
+@@ -214,5 +221,6 @@
+ `define VX_CSR_NUM_WARPS                12'hFC1
+ `define VX_CSR_NUM_CORES                12'hFC2
+ `define VX_CSR_LOCAL_MEM_BASE           12'hFC3
++`define VX_CSR_TENSOR_MEM_BASE          12'hFC4
+ 
+ `endif // VX_TYPES_VH
+diff --git a/hw/rtl/Vortex.sv b/hw/rtl/Vortex.sv
+index eee08c7..c1afe9a 100644
+--- a/hw/rtl/Vortex.sv
++++ b/hw/rtl/Vortex.sv
+@@ -207,8 +207,8 @@ module Vortex import VX_gpu_pkg::*; (
+ 
+     // dump device configuration
+     initial begin
+-        `TRACE(0, ("CONFIGS: num_threads=%0d, num_warps=%0d, num_cores=%0d, num_clusters=%0d, socket_size=%0d, local_mem_base=0x%0h, num_barriers=%0d\n",
+-                    `NUM_THREADS, `NUM_WARPS, `NUM_CORES, `NUM_CLUSTERS, `SOCKET_SIZE, `LMEM_BASE_ADDR, `NUM_BARRIERS))
++        `TRACE(0, ("CONFIGS: num_threads=%0d, num_warps=%0d, num_cores=%0d, num_clusters=%0d, socket_size=%0d, local_mem_base=0x%0h, tensor_mem_base=0x%0h, num_barriers=%0d\n",
++                    `NUM_THREADS, `NUM_WARPS, `NUM_CORES, `NUM_CLUSTERS, `SOCKET_SIZE, `LMEM_BASE_ADDR, `TMEM_BASE_ADDR, `NUM_BARRIERS))
+     end
+ 
+ `ifdef DBG_TRACE_MEM
+diff --git a/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv b/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv
+new file mode 100644
+index 0000000..8f97c1c
+--- /dev/null
++++ b/hw/rtl/afu/opae/tensor_mem_cfg_pkg.sv
+@@ -0,0 +1,69 @@
++//
++// Copyright (c) 2017, Intel Corporation
++// All rights reserved.
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are met:
++//
++// Redistributions of source code must retain the above copyright notice, this
++// list of conditions and the following disclaimer.
++//
++// Redistributions in binary form must reproduce the above copyright notice,
++// this list of conditions and the following disclaimer in the documentation
++// and/or other materials provided with the distribution.
++//
++// Neither the name of the Intel Corporation nor the names of its contributors
++// may be used to endorse or promote products derived from this software
++// without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++// POSSIBILITY OF SUCH DAMAGE.
++
++`include "VX_define.vh"
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH ((`PLATFORM_MEMORY_ADDR_WIDTH - $clog2(`PLATFORM_MEMORY_NUM_BANKS)) - $clog2(`PLATFORM_MEMORY_DATA_SIZE))
++`endif
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH (`PLATFORM_MEMORY_DATA_SIZE * 8)
++`endif
++
++`ifndef PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH
++`define PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH 4
++`endif
++
++package tensor_mem_cfg_pkg;
++
++    parameter TENSOR_MEM_VERSION_NUMBER = 1;
++
++    parameter TENSOR_MEM_ADDR_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_ADDR_WIDTH;
++    parameter TENSOR_MEM_DATA_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_DATA_WIDTH;
++
++    parameter TENSOR_MEM_BURST_CNT_WIDTH = `PLATFORM_PARAM_TENSOR_MEMORY_BURST_CNT_WIDTH;
++
++    // Number of bytes in a data line
++    parameter TENSOR_MEM_DATA_N_BYTES = TENSOR_MEM_DATA_WIDTH / 8;
++
++
++    // Base types
++    // --------------------------------------------------------------------
++
++    typedef logic [TENSOR_MEM_ADDR_WIDTH-1:0] t_tensor_mem_addr;
++    typedef logic [TENSOR_MEM_DATA_WIDTH-1:0] t_tensor_mem_data;
++
++    typedef logic [TENSOR_MEM_BURST_CNT_WIDTH-1:0] t_tensor_mem_burst_cnt;
++
++    // Byte-level mask of a data line
++    typedef logic [TENSOR_MEM_DATA_N_BYTES-1:0] t_tensor_mem_byte_mask;
++
++endpackage // tensor_mem_cfg_pkg
+diff --git a/hw/rtl/core/VX_core.sv b/hw/rtl/core/VX_core.sv
+index 0e41934..abdacdb 100644
+--- a/hw/rtl/core/VX_core.sv
++++ b/hw/rtl/core/VX_core.sv
+@@ -1,292 +1,304 @@
+-// Copyright © 2019-2023
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-`include "VX_define.vh"
+-
+-`ifdef EXT_F_ENABLE
+-`include "VX_fpu_define.vh"
+-`endif
+-
+-module VX_core import VX_gpu_pkg::*; #(
+-    parameter CORE_ID = 0,
+-    parameter `STRING INSTANCE_ID = ""
+-) (
+-    `SCOPE_IO_DECL
+-
+-    // Clock
+-    input wire              clk,
+-    input wire              reset,
+-
+-`ifdef PERF_ENABLE
+-    input sysmem_perf_t     sysmem_perf,
+-`endif
+-
+-    VX_dcr_bus_if.slave     dcr_bus_if,
+-
+-    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
+-
+-    VX_mem_bus_if.master    icache_bus_if,
+-
+-`ifdef GBAR_ENABLE
+-    VX_gbar_bus_if.master   gbar_bus_if,
+-`endif
+-
+-    // Status
+-    output wire             busy
+-);
+-    VX_schedule_if      schedule_if();
+-    VX_fetch_if         fetch_if();
+-    VX_decode_if        decode_if();
+-    VX_sched_csr_if     sched_csr_if();
+-    VX_decode_sched_if  decode_sched_if();
+-    VX_issue_sched_if   issue_sched_if[`ISSUE_WIDTH]();
+-    VX_commit_sched_if  commit_sched_if();
+-    VX_commit_csr_if    commit_csr_if();
+-    VX_branch_ctl_if    branch_ctl_if[`NUM_ALU_BLOCKS]();
+-    VX_warp_ctl_if      warp_ctl_if();
+-
+-    VX_dispatch_if      dispatch_if[NUM_EX_UNITS * `ISSUE_WIDTH]();
+-    VX_commit_if        commit_if[NUM_EX_UNITS * `ISSUE_WIDTH]();
+-    VX_writeback_if     writeback_if[`ISSUE_WIDTH]();
+-
+-    VX_lsu_mem_if #(
+-        .NUM_LANES (`NUM_LSU_LANES),
+-        .DATA_SIZE (LSU_WORD_SIZE),
+-        .TAG_WIDTH (LSU_TAG_WIDTH)
+-    ) lsu_mem_if[`NUM_LSU_BLOCKS]();
+-
+-`ifdef PERF_ENABLE
+-    lmem_perf_t lmem_perf;
+-    coalescer_perf_t coalescer_perf;
+-    pipeline_perf_t pipeline_perf;
+-    sysmem_perf_t sysmem_perf_tmp;
+-    always @(*) begin
+-        sysmem_perf_tmp = sysmem_perf;
+-        sysmem_perf_tmp.lmem = lmem_perf;
+-        sysmem_perf_tmp.coalescer = coalescer_perf;
+-    end
+-`endif
+-
+-    base_dcrs_t base_dcrs;
+-
+-    VX_dcr_data dcr_data (
+-        .clk        (clk),
+-        .reset      (reset),
+-        .dcr_bus_if (dcr_bus_if),
+-        .base_dcrs  (base_dcrs)
+-    );
+-
+-    `SCOPE_IO_SWITCH (3);
+-
+-    VX_schedule #(
+-        .INSTANCE_ID (`SFORMATF(("%s-schedule", INSTANCE_ID))),
+-        .CORE_ID (CORE_ID)
+-    ) schedule (
+-        .clk            (clk),
+-        .reset          (reset),
+-
+-    `ifdef PERF_ENABLE
+-        .sched_perf     (pipeline_perf.sched),
+-    `endif
+-
+-        .base_dcrs      (base_dcrs),
+-
+-        .warp_ctl_if    (warp_ctl_if),
+-        .branch_ctl_if  (branch_ctl_if),
+-
+-        .decode_sched_if(decode_sched_if),
+-        .issue_sched_if (issue_sched_if),
+-        .commit_sched_if(commit_sched_if),
+-
+-        .schedule_if    (schedule_if),
+-    `ifdef GBAR_ENABLE
+-        .gbar_bus_if    (gbar_bus_if),
+-    `endif
+-        .sched_csr_if   (sched_csr_if),
+-
+-        .busy           (busy)
+-    );
+-
+-    VX_fetch #(
+-        .INSTANCE_ID (`SFORMATF(("%s-fetch", INSTANCE_ID)))
+-    ) fetch (
+-        `SCOPE_IO_BIND  (0)
+-        .clk            (clk),
+-        .reset          (reset),
+-        .icache_bus_if  (icache_bus_if),
+-        .schedule_if    (schedule_if),
+-        .fetch_if       (fetch_if)
+-    );
+-
+-    VX_decode #(
+-        .INSTANCE_ID (`SFORMATF(("%s-decode", INSTANCE_ID)))
+-    ) decode (
+-        .clk            (clk),
+-        .reset          (reset),
+-        .fetch_if       (fetch_if),
+-        .decode_if      (decode_if),
+-        .decode_sched_if(decode_sched_if)
+-    );
+-
+-    VX_issue #(
+-        .INSTANCE_ID (`SFORMATF(("%s-issue", INSTANCE_ID)))
+-    ) issue (
+-        `SCOPE_IO_BIND  (1)
+-
+-        .clk            (clk),
+-        .reset          (reset),
+-
+-    `ifdef PERF_ENABLE
+-        .issue_perf     (pipeline_perf.issue),
+-    `endif
+-
+-        .decode_if      (decode_if),
+-        .writeback_if   (writeback_if),
+-        .dispatch_if    (dispatch_if),
+-        .issue_sched_if (issue_sched_if)
+-    );
+-
+-    VX_execute #(
+-        .INSTANCE_ID (`SFORMATF(("%s-execute", INSTANCE_ID))),
+-        .CORE_ID (CORE_ID)
+-    ) execute (
+-        `SCOPE_IO_BIND  (2)
+-
+-        .clk            (clk),
+-        .reset          (reset),
+-
+-    `ifdef PERF_ENABLE
+-        .sysmem_perf    (sysmem_perf_tmp),
+-        .pipeline_perf  (pipeline_perf),
+-    `endif
+-
+-        .base_dcrs      (base_dcrs),
+-
+-        .lsu_mem_if     (lsu_mem_if),
+-
+-        .dispatch_if    (dispatch_if),
+-        .commit_if      (commit_if),
+-
+-        .commit_csr_if  (commit_csr_if),
+-        .sched_csr_if   (sched_csr_if),
+-
+-        .warp_ctl_if    (warp_ctl_if),
+-        .branch_ctl_if  (branch_ctl_if)
+-    );
+-
+-    VX_commit #(
+-        .INSTANCE_ID (`SFORMATF(("%s-commit", INSTANCE_ID)))
+-    ) commit (
+-        .clk            (clk),
+-        .reset          (reset),
+-
+-        .commit_if      (commit_if),
+-
+-        .writeback_if   (writeback_if),
+-
+-        .commit_csr_if  (commit_csr_if),
+-        .commit_sched_if(commit_sched_if)
+-    );
+-
+-    VX_mem_unit #(
+-        .INSTANCE_ID (INSTANCE_ID)
+-    ) mem_unit (
+-        .clk           (clk),
+-        .reset         (reset),
+-    `ifdef PERF_ENABLE
+-        .lmem_perf     (lmem_perf),
+-        .coalescer_perf(coalescer_perf),
+-    `endif
+-        .lsu_mem_if    (lsu_mem_if),
+-        .dcache_bus_if (dcache_bus_if)
+-    );
+-
+-`ifdef PERF_ENABLE
+-
+-    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_rd_req_per_cycle;
+-    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_wr_req_per_cycle;
+-    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_rsp_per_cycle;
+-
+-    wire [1:0] perf_icache_pending_read_cycle;
+-    wire [`CLOG2(LSU_NUM_REQS+1)+1-1:0] perf_dcache_pending_read_cycle;
+-
+-    reg [PERF_CTR_BITS-1:0] perf_icache_pending_reads;
+-    reg [PERF_CTR_BITS-1:0] perf_dcache_pending_reads;
+-
+-    reg [PERF_CTR_BITS-1:0] perf_ifetches;
+-    reg [PERF_CTR_BITS-1:0] perf_loads;
+-    reg [PERF_CTR_BITS-1:0] perf_stores;
+-
+-    wire perf_icache_req_fire = icache_bus_if.req_valid && icache_bus_if.req_ready;
+-    wire perf_icache_rsp_fire = icache_bus_if.rsp_valid && icache_bus_if.rsp_ready;
+-
+-    wire [LSU_NUM_REQS-1:0] perf_dcache_rd_req_fire, perf_dcache_rd_req_fire_r;
+-    wire [LSU_NUM_REQS-1:0] perf_dcache_wr_req_fire, perf_dcache_wr_req_fire_r;
+-    wire [LSU_NUM_REQS-1:0] perf_dcache_rsp_fire;
+-
+-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_perf_dcache
+-        for (genvar j = 0; j < `NUM_LSU_LANES; ++j) begin : g_j
+-            assign perf_dcache_rd_req_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].req_valid && lsu_mem_if[i].req_data.mask[j] && lsu_mem_if[i].req_ready && ~lsu_mem_if[i].req_data.rw;
+-            assign perf_dcache_wr_req_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].req_valid && lsu_mem_if[i].req_data.mask[j] && lsu_mem_if[i].req_ready && lsu_mem_if[i].req_data.rw;
+-            assign perf_dcache_rsp_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].rsp_valid && lsu_mem_if[i].rsp_data.mask[j] && lsu_mem_if[i].rsp_ready;
+-        end
+-    end
+-
+-    `BUFFER(perf_dcache_rd_req_fire_r, perf_dcache_rd_req_fire);
+-    `BUFFER(perf_dcache_wr_req_fire_r, perf_dcache_wr_req_fire);
+-
+-    `POP_COUNT(perf_dcache_rd_req_per_cycle, perf_dcache_rd_req_fire_r);
+-    `POP_COUNT(perf_dcache_wr_req_per_cycle, perf_dcache_wr_req_fire_r);
+-    `POP_COUNT(perf_dcache_rsp_per_cycle, perf_dcache_rsp_fire);
+-
+-    assign perf_icache_pending_read_cycle = perf_icache_req_fire - perf_icache_rsp_fire;
+-    assign perf_dcache_pending_read_cycle = perf_dcache_rd_req_per_cycle - perf_dcache_rsp_per_cycle;
+-
+-    always @(posedge clk) begin
+-        if (reset) begin
+-            perf_icache_pending_reads <= '0;
+-            perf_dcache_pending_reads <= '0;
+-        end else begin
+-            perf_icache_pending_reads <= $signed(perf_icache_pending_reads) + PERF_CTR_BITS'($signed(perf_icache_pending_read_cycle));
+-            perf_dcache_pending_reads <= $signed(perf_dcache_pending_reads) + PERF_CTR_BITS'($signed(perf_dcache_pending_read_cycle));
+-        end
+-    end
+-
+-    reg [PERF_CTR_BITS-1:0] perf_icache_lat;
+-    reg [PERF_CTR_BITS-1:0] perf_dcache_lat;
+-
+-    always @(posedge clk) begin
+-        if (reset) begin
+-            perf_ifetches   <= '0;
+-            perf_loads      <= '0;
+-            perf_stores     <= '0;
+-            perf_icache_lat <= '0;
+-            perf_dcache_lat <= '0;
+-        end else begin
+-            perf_ifetches   <= perf_ifetches   + PERF_CTR_BITS'(perf_icache_req_fire);
+-            perf_loads      <= perf_loads      + PERF_CTR_BITS'(perf_dcache_rd_req_per_cycle);
+-            perf_stores     <= perf_stores     + PERF_CTR_BITS'(perf_dcache_wr_req_per_cycle);
+-            perf_icache_lat <= perf_icache_lat + perf_icache_pending_reads;
+-            perf_dcache_lat <= perf_dcache_lat + perf_dcache_pending_reads;
+-        end
+-    end
+-
+-    assign pipeline_perf.ifetches = perf_ifetches;
+-    assign pipeline_perf.loads = perf_loads;
+-    assign pipeline_perf.stores = perf_stores;
+-    assign pipeline_perf.ifetch_latency = perf_icache_lat;
+-    assign pipeline_perf.load_latency = perf_dcache_lat;
+-
+-`endif
+-
+-endmodule
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_define.vh"
++
++`ifdef EXT_F_ENABLE
++`include "VX_fpu_define.vh"
++`endif
++
++module VX_core import VX_gpu_pkg::*; #(
++    parameter CORE_ID = 0,
++    parameter `STRING INSTANCE_ID = ""
++) (
++    `SCOPE_IO_DECL
++
++    // Clock
++    input wire              clk,
++    input wire              reset,
++
++`ifdef PERF_ENABLE
++    input sysmem_perf_t     sysmem_perf,
++`endif
++
++    VX_dcr_bus_if.slave     dcr_bus_if,
++
++    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
++
++    VX_mem_bus_if.master    icache_bus_if,
++
++`ifdef GBAR_ENABLE
++    VX_gbar_bus_if.master   gbar_bus_if,
++`endif
++
++    // Status
++    output wire             busy
++);
++    VX_schedule_if      schedule_if();
++    VX_fetch_if         fetch_if();
++    VX_decode_if        decode_if();
++    VX_sched_csr_if     sched_csr_if();
++    VX_decode_sched_if  decode_sched_if();
++    VX_issue_sched_if   issue_sched_if[`ISSUE_WIDTH]();
++    VX_commit_sched_if  commit_sched_if();
++    VX_commit_csr_if    commit_csr_if();
++    VX_branch_ctl_if    branch_ctl_if[`NUM_ALU_BLOCKS]();
++    VX_warp_ctl_if      warp_ctl_if();
++
++    VX_dispatch_if      dispatch_if[NUM_EX_UNITS * `ISSUE_WIDTH]();
++    VX_commit_if        commit_if[NUM_EX_UNITS * `ISSUE_WIDTH]();
++    VX_writeback_if     writeback_if[`ISSUE_WIDTH]();
++
++    VX_lsu_mem_if #(
++        .NUM_LANES (`NUM_LSU_LANES),
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (LSU_TAG_WIDTH)
++    ) lsu_mem_if[`NUM_LSU_BLOCKS]();
++
++    // TCU tensor memory bus (single port)
++    VX_mem_bus_if #(
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tcu_tmem_bus_if();
++
++`ifdef PERF_ENABLE
++    lmem_perf_t lmem_perf;
++    tmem_perf_t tmem_perf;
++    coalescer_perf_t coalescer_perf;
++    pipeline_perf_t pipeline_perf;
++    sysmem_perf_t sysmem_perf_tmp;
++    always @(*) begin
++        sysmem_perf_tmp = sysmem_perf;
++        sysmem_perf_tmp.lmem = lmem_perf;
++        sysmem_perf_tmp.tmem = tmem_perf;
++        sysmem_perf_tmp.coalescer = coalescer_perf;
++    end
++`endif
++
++    base_dcrs_t base_dcrs;
++
++    VX_dcr_data dcr_data (
++        .clk        (clk),
++        .reset      (reset),
++        .dcr_bus_if (dcr_bus_if),
++        .base_dcrs  (base_dcrs)
++    );
++
++    `SCOPE_IO_SWITCH (3);
++
++    VX_schedule #(
++        .INSTANCE_ID (`SFORMATF(("%s-schedule", INSTANCE_ID))),
++        .CORE_ID (CORE_ID)
++    ) schedule (
++        .clk            (clk),
++        .reset          (reset),
++
++    `ifdef PERF_ENABLE
++        .sched_perf     (pipeline_perf.sched),
++    `endif
++
++        .base_dcrs      (base_dcrs),
++
++        .warp_ctl_if    (warp_ctl_if),
++        .branch_ctl_if  (branch_ctl_if),
++
++        .decode_sched_if(decode_sched_if),
++        .issue_sched_if (issue_sched_if),
++        .commit_sched_if(commit_sched_if),
++
++        .schedule_if    (schedule_if),
++    `ifdef GBAR_ENABLE
++        .gbar_bus_if    (gbar_bus_if),
++    `endif
++        .sched_csr_if   (sched_csr_if),
++
++        .busy           (busy)
++    );
++
++    VX_fetch #(
++        .INSTANCE_ID (`SFORMATF(("%s-fetch", INSTANCE_ID)))
++    ) fetch (
++        `SCOPE_IO_BIND  (0)
++        .clk            (clk),
++        .reset          (reset),
++        .icache_bus_if  (icache_bus_if),
++        .schedule_if    (schedule_if),
++        .fetch_if       (fetch_if)
++    );
++
++    VX_decode #(
++        .INSTANCE_ID (`SFORMATF(("%s-decode", INSTANCE_ID)))
++    ) decode (
++        .clk            (clk),
++        .reset          (reset),
++        .fetch_if       (fetch_if),
++        .decode_if      (decode_if),
++        .decode_sched_if(decode_sched_if)
++    );
++
++    VX_issue #(
++        .INSTANCE_ID (`SFORMATF(("%s-issue", INSTANCE_ID)))
++    ) issue (
++        `SCOPE_IO_BIND  (1)
++
++        .clk            (clk),
++        .reset          (reset),
++
++    `ifdef PERF_ENABLE
++        .issue_perf     (pipeline_perf.issue),
++    `endif
++
++        .decode_if      (decode_if),
++        .writeback_if   (writeback_if),
++        .dispatch_if    (dispatch_if),
++        .issue_sched_if (issue_sched_if)
++    );
++
++    VX_execute #(
++        .INSTANCE_ID (`SFORMATF(("%s-execute", INSTANCE_ID))),
++        .CORE_ID (CORE_ID)
++    ) execute (
++        `SCOPE_IO_BIND  (2)
++
++        .clk            (clk),
++        .reset          (reset),
++
++    `ifdef PERF_ENABLE
++        .sysmem_perf    (sysmem_perf_tmp),
++        .pipeline_perf  (pipeline_perf),
++    `endif
++
++        .base_dcrs      (base_dcrs),
++
++        .lsu_mem_if     (lsu_mem_if),
++
++        .tcu_tmem_bus_if(tcu_tmem_bus_if),
++
++        .dispatch_if    (dispatch_if),
++        .commit_if      (commit_if),
++
++        .commit_csr_if  (commit_csr_if),
++        .sched_csr_if   (sched_csr_if),
++
++        .warp_ctl_if    (warp_ctl_if),
++        .branch_ctl_if  (branch_ctl_if)
++    );
++
++    VX_commit #(
++        .INSTANCE_ID (`SFORMATF(("%s-commit", INSTANCE_ID)))
++    ) commit (
++        .clk            (clk),
++        .reset          (reset),
++
++        .commit_if      (commit_if),
++
++        .writeback_if   (writeback_if),
++
++        .commit_csr_if  (commit_csr_if),
++        .commit_sched_if(commit_sched_if)
++    );
++
++    VX_mem_unit #(
++        .INSTANCE_ID (INSTANCE_ID)
++    ) mem_unit (
++        .clk           (clk),
++        .reset         (reset),
++    `ifdef PERF_ENABLE
++        .lmem_perf     (lmem_perf),
++        .tmem_perf     (tmem_perf),
++        .coalescer_perf(coalescer_perf),
++    `endif
++        .lsu_mem_if    (lsu_mem_if),
++        .dcache_bus_if (dcache_bus_if),
++        .tcu_tmem_bus_if(tcu_tmem_bus_if)
++    );
++
++`ifdef PERF_ENABLE
++
++    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_rd_req_per_cycle;
++    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_wr_req_per_cycle;
++    wire [`CLOG2(LSU_NUM_REQS+1)-1:0] perf_dcache_rsp_per_cycle;
++
++    wire [1:0] perf_icache_pending_read_cycle;
++    wire [`CLOG2(LSU_NUM_REQS+1)+1-1:0] perf_dcache_pending_read_cycle;
++
++    reg [PERF_CTR_BITS-1:0] perf_icache_pending_reads;
++    reg [PERF_CTR_BITS-1:0] perf_dcache_pending_reads;
++
++    reg [PERF_CTR_BITS-1:0] perf_ifetches;
++    reg [PERF_CTR_BITS-1:0] perf_loads;
++    reg [PERF_CTR_BITS-1:0] perf_stores;
++
++    wire perf_icache_req_fire = icache_bus_if.req_valid && icache_bus_if.req_ready;
++    wire perf_icache_rsp_fire = icache_bus_if.rsp_valid && icache_bus_if.rsp_ready;
++
++    wire [LSU_NUM_REQS-1:0] perf_dcache_rd_req_fire, perf_dcache_rd_req_fire_r;
++    wire [LSU_NUM_REQS-1:0] perf_dcache_wr_req_fire, perf_dcache_wr_req_fire_r;
++    wire [LSU_NUM_REQS-1:0] perf_dcache_rsp_fire;
++
++    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_perf_dcache
++        for (genvar j = 0; j < `NUM_LSU_LANES; ++j) begin : g_j
++            assign perf_dcache_rd_req_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].req_valid && lsu_mem_if[i].req_data.mask[j] && lsu_mem_if[i].req_ready && ~lsu_mem_if[i].req_data.rw;
++            assign perf_dcache_wr_req_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].req_valid && lsu_mem_if[i].req_data.mask[j] && lsu_mem_if[i].req_ready && lsu_mem_if[i].req_data.rw;
++            assign perf_dcache_rsp_fire[i * `NUM_LSU_LANES + j] = lsu_mem_if[i].rsp_valid && lsu_mem_if[i].rsp_data.mask[j] && lsu_mem_if[i].rsp_ready;
++        end
++    end
++
++    `BUFFER(perf_dcache_rd_req_fire_r, perf_dcache_rd_req_fire);
++    `BUFFER(perf_dcache_wr_req_fire_r, perf_dcache_wr_req_fire);
++
++    `POP_COUNT(perf_dcache_rd_req_per_cycle, perf_dcache_rd_req_fire_r);
++    `POP_COUNT(perf_dcache_wr_req_per_cycle, perf_dcache_wr_req_fire_r);
++    `POP_COUNT(perf_dcache_rsp_per_cycle, perf_dcache_rsp_fire);
++
++    assign perf_icache_pending_read_cycle = perf_icache_req_fire - perf_icache_rsp_fire;
++    assign perf_dcache_pending_read_cycle = perf_dcache_rd_req_per_cycle - perf_dcache_rsp_per_cycle;
++
++    always @(posedge clk) begin
++        if (reset) begin
++            perf_icache_pending_reads <= '0;
++            perf_dcache_pending_reads <= '0;
++        end else begin
++            perf_icache_pending_reads <= $signed(perf_icache_pending_reads) + PERF_CTR_BITS'($signed(perf_icache_pending_read_cycle));
++            perf_dcache_pending_reads <= $signed(perf_dcache_pending_reads) + PERF_CTR_BITS'($signed(perf_dcache_pending_read_cycle));
++        end
++    end
++
++    reg [PERF_CTR_BITS-1:0] perf_icache_lat;
++    reg [PERF_CTR_BITS-1:0] perf_dcache_lat;
++
++    always @(posedge clk) begin
++        if (reset) begin
++            perf_ifetches   <= '0;
++            perf_loads      <= '0;
++            perf_stores     <= '0;
++            perf_icache_lat <= '0;
++            perf_dcache_lat <= '0;
++        end else begin
++            perf_ifetches   <= perf_ifetches   + PERF_CTR_BITS'(perf_icache_req_fire);
++            perf_loads      <= perf_loads      + PERF_CTR_BITS'(perf_dcache_rd_req_per_cycle);
++            perf_stores     <= perf_stores     + PERF_CTR_BITS'(perf_dcache_wr_req_per_cycle);
++            perf_icache_lat <= perf_icache_lat + perf_icache_pending_reads;
++            perf_dcache_lat <= perf_dcache_lat + perf_dcache_pending_reads;
++        end
++    end
++
++    assign pipeline_perf.ifetches = perf_ifetches;
++    assign pipeline_perf.loads = perf_loads;
++    assign pipeline_perf.stores = perf_stores;
++    assign pipeline_perf.ifetch_latency = perf_icache_lat;
++    assign pipeline_perf.load_latency = perf_dcache_lat;
++
++`endif
++
++endmodule
+diff --git a/hw/rtl/core/VX_core_top.sv b/hw/rtl/core/VX_core_top.sv
+index 6b68c99..1082546 100644
+--- a/hw/rtl/core/VX_core_top.sv
++++ b/hw/rtl/core/VX_core_top.sv
+@@ -127,13 +127,15 @@ module VX_core_top import VX_gpu_pkg::*; #(
+     assign icache_rsp_ready = icache_bus_if.rsp_ready;
+ 
+ `ifdef PERF_ENABLE
+-    sysmem_perf_t mem_perf;
+-    assign mem_perf.icache  = '0;
+-    assign mem_perf.dcache  = '0;
+-    assign mem_perf.l2cache = '0;
+-    assign mem_perf.l3cache = '0;
+-    assign mem_perf.lmem    = '0;
+-    assign mem_perf.mem     = '0;
++    sysmem_perf_t sysmem_perf;
++    assign sysmem_perf.icache    = '0;
++    assign sysmem_perf.dcache    = '0;
++    assign sysmem_perf.l2cache   = '0;
++    assign sysmem_perf.l3cache   = '0;
++    assign sysmem_perf.lmem      = '0;
++    assign sysmem_perf.tmem      = '0;
++    assign sysmem_perf.coalescer = '0;
++    assign sysmem_perf.mem       = '0;
+ `endif
+ 
+ `ifdef SCOPE
+diff --git a/hw/rtl/core/VX_csr_data.sv b/hw/rtl/core/VX_csr_data.sv
+index 96c2973..918c066 100644
+--- a/hw/rtl/core/VX_csr_data.sv
++++ b/hw/rtl/core/VX_csr_data.sv
+@@ -183,6 +183,7 @@ import VX_fpu_pkg::*;
+             `VX_CSR_NUM_WARPS  : read_data_ro_w = `XLEN'(`NUM_WARPS);
+             `VX_CSR_NUM_CORES  : read_data_ro_w = `XLEN'(`NUM_CORES * `NUM_CLUSTERS);
+             `VX_CSR_LOCAL_MEM_BASE: read_data_ro_w = `XLEN'(`LMEM_BASE_ADDR);
++            `VX_CSR_TENSOR_MEM_BASE: read_data_ro_w = `XLEN'(`TMEM_BASE_ADDR);
+ 
+             `CSR_READ_64(`VX_CSR_MCYCLE, read_data_ro_w, cycles);
+ 
+@@ -254,6 +255,10 @@ import VX_fpu_pkg::*;
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_READS, read_data_ro_w, sysmem_perf.lmem.reads);
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_WRITES, read_data_ro_w, sysmem_perf.lmem.writes);
+                         `CSR_READ_64(`VX_CSR_MPM_LMEM_BANK_ST, read_data_ro_w, sysmem_perf.lmem.bank_stalls);
++                        // PERF: tmem
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_READS, read_data_ro_w, sysmem_perf.tmem.reads);
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_WRITES, read_data_ro_w, sysmem_perf.tmem.writes);
++                        `CSR_READ_64(`VX_CSR_MPM_TMEM_BANK_ST, read_data_ro_w, sysmem_perf.tmem.bank_stalls);
+                         // PERF: l2cache
+                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_READS, read_data_ro_w, sysmem_perf.l2cache.reads);
+                         `CSR_READ_64(`VX_CSR_MPM_L2CACHE_WRITES, read_data_ro_w, sysmem_perf.l2cache.writes);
+@@ -295,6 +300,7 @@ import VX_fpu_pkg::*;
+ `ifdef PERF_ENABLE
+     `UNUSED_VAR (sysmem_perf.icache);
+     `UNUSED_VAR (sysmem_perf.lmem);
++    `UNUSED_VAR (sysmem_perf.tmem);
+ `endif
+ 
+ endmodule
+diff --git a/hw/rtl/core/VX_decode.sv b/hw/rtl/core/VX_decode.sv
+index 243343a..fbc5c28 100644
+--- a/hw/rtl/core/VX_decode.sv
++++ b/hw/rtl/core/VX_decode.sv
+@@ -530,6 +530,20 @@ module VX_decode import VX_gpu_pkg::*; #(
+                                 `USED_IREG (rs2);
+                                 `USED_IREG (rs3);
+                             end
++                            3'h1: begin // UMMA
++                                ex_type = EX_TCU;
++                                op_type = INST_OP_BITS'(INST_TCU_UMMA);
++                                op_args.tcu.fmt_s  = rs1[3:0];
++                                op_args.tcu.fmt_d  = rd[3:0];
++                                op_args.tcu.step_m = '0;
++                                op_args.tcu.step_n = '0;
++                                // UMMA uses rd field as fmt_d; no register writeback.
++                                use_rd  = 0;
++                                `USED_IREG (rd);
++                                `USED_IREG (rs1);
++                                `USED_IREG (rs2);
++                                `USED_IREG (rs3);
++                            end
+                             default:;
+                         endcase
+                     end
+diff --git a/hw/rtl/core/VX_execute.sv b/hw/rtl/core/VX_execute.sv
+index 3cce1d5..aa121c9 100644
+--- a/hw/rtl/core/VX_execute.sv
++++ b/hw/rtl/core/VX_execute.sv
+@@ -32,6 +32,9 @@ module VX_execute import VX_gpu_pkg::*; #(
+     // Dcache interface
+     VX_lsu_mem_if.master    lsu_mem_if [`NUM_LSU_BLOCKS],
+ 
++    // TCU tensor memory interface
++    VX_mem_bus_if.master    tcu_tmem_bus_if,
++
+     // dispatch interface
+     VX_dispatch_if.slave    dispatch_if [NUM_EX_UNITS * `ISSUE_WIDTH],
+ 
+@@ -93,7 +96,8 @@ module VX_execute import VX_gpu_pkg::*; #(
+         .clk            (clk),
+         .reset          (reset),
+         .dispatch_if    (dispatch_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
+-        .commit_if      (commit_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH])
++        .commit_if      (commit_if[EX_TCU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
++        .tcu_tmem_bus_if(tcu_tmem_bus_if)
+     );
+ `endif
+ 
+diff --git a/hw/rtl/core/VX_lsu_slice.sv b/hw/rtl/core/VX_lsu_slice.sv
+index 1fad7d8..1fbca32 100644
+--- a/hw/rtl/core/VX_lsu_slice.sv
++++ b/hw/rtl/core/VX_lsu_slice.sv
+@@ -78,6 +78,12 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
+         wire [MEM_ADDRW-1:0] lmem_addr_end = MEM_ADDRW'((`XLEN'(`LMEM_BASE_ADDR) + `XLEN'(1 << `LMEM_LOG_SIZE)) >> MEM_ASHIFT);
+         assign mem_req_flags[i][MEM_REQ_FLAG_LOCAL] = (block_addr >= lmem_addr_start) && (block_addr < lmem_addr_end);
+     `endif
++    `ifdef TMEM_ENABLE
++        // is tensor memory address
++        wire [MEM_ADDRW-1:0] tmem_addr_start = MEM_ADDRW'(`XLEN'(`TMEM_BASE_ADDR) >> MEM_ASHIFT);
++        wire [MEM_ADDRW-1:0] tmem_addr_end = MEM_ADDRW'((`XLEN'(`TMEM_BASE_ADDR) + `XLEN'(1 << `TMEM_LOG_SIZE)) >> MEM_ASHIFT);
++        assign mem_req_flags[i][MEM_REQ_FLAG_TMEM] = (block_addr >= tmem_addr_start) && (block_addr < tmem_addr_end);
++    `endif
+     end
+ 
+     // schedule memory request
+diff --git a/hw/rtl/core/VX_mem_unit.sv b/hw/rtl/core/VX_mem_unit.sv
+index dbae0c4..25085a0 100644
+--- a/hw/rtl/core/VX_mem_unit.sv
++++ b/hw/rtl/core/VX_mem_unit.sv
+@@ -21,11 +21,13 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+ 
+ `ifdef PERF_ENABLE
+     output lmem_perf_t      lmem_perf,
++    output tmem_perf_t      tmem_perf,
+     output coalescer_perf_t coalescer_perf,
+ `endif
+ 
+     VX_lsu_mem_if.slave     lsu_mem_if [`NUM_LSU_BLOCKS],
+-    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS]
++    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
++    VX_mem_bus_if.master    tcu_tmem_bus_if
+ );
+     VX_lsu_mem_if #(
+         .NUM_LANES (`NUM_LSU_LANES),
+@@ -33,33 +35,79 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+         .TAG_WIDTH (LSU_TAG_WIDTH)
+     ) lsu_dcache_if[`NUM_LSU_BLOCKS]();
+ 
+-`ifdef LMEM_ENABLE
+-
+-    `STATIC_ASSERT(`IS_DIVISBLE((1 << `LMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
+-    `STATIC_ASSERT(0 == (`LMEM_BASE_ADDR % (1 << `LMEM_LOG_SIZE)), ("invalid parameter"))
+-
+-    localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
+-
+     VX_lsu_mem_if #(
+         .NUM_LANES (`NUM_LSU_LANES),
+         .DATA_SIZE (LSU_WORD_SIZE),
+         .TAG_WIDTH (LSU_TAG_WIDTH)
+     ) lsu_lmem_if[`NUM_LSU_BLOCKS]();
+ 
+-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lmem_switches
+-        VX_lmem_switch #(
+-            .GLOBAL_OUT_BUF(1),
+-            .LOCAL_OUT_BUF(1),
+-            .RSP_OUT_BUF  (1),
+-            .ARBITER      ("P")
+-        ) lmem_switch (
+-            .clk          (clk),
+-            .reset        (reset),
+-            .lsu_in_if    (lsu_mem_if[i]),
+-            .global_out_if(lsu_dcache_if[i]),
+-            .local_out_if (lsu_lmem_if[i])
+-        );
++`ifdef TMEM_ENABLE
++    VX_lsu_mem_if #(
++        .NUM_LANES (`NUM_LSU_LANES),
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (LSU_TAG_WIDTH)
++    ) lsu_tmem_if[`NUM_LSU_BLOCKS]();
++`endif
++
++    // Switch LSU traffic to global/local/tensor memories when enabled.
++    localparam MEM_SWITCH_ENABLE =
++`ifdef LMEM_ENABLE
++        1;
++`elsif TMEM_ENABLE
++        1;
++`else
++        0;
++`endif
++
++    generate
++        if (MEM_SWITCH_ENABLE) begin : g_mem_switches_block
++            for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_mem_switches
++                VX_lmem_switch #(
++                    .GLOBAL_OUT_BUF(1),
++                    .LOCAL_OUT_BUF (1),
++                `ifdef TMEM_ENABLE
++                    .TENSOR_OUT_BUF(1),
++                `else
++                    .TENSOR_OUT_BUF(0),
++                `endif
++                    .RSP_OUT_BUF  (1),
++                    .ARBITER      ("P")
++                ) mem_switch (
++                    .clk          (clk),
++                    .reset        (reset),
++                    .lsu_in_if    (lsu_mem_if[i]),
++                    .global_out_if(lsu_dcache_if[i]),
++                    .local_out_if (lsu_lmem_if[i])
++                `ifdef TMEM_ENABLE
++                    ,.tensor_out_if(lsu_tmem_if[i])
++                `endif
++                );
++            end
++        end else begin : g_lsu_dcache_if
++            for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_passthru
++                `ASSIGN_VX_MEM_BUS_IF (lsu_dcache_if[i], lsu_mem_if[i]);
++            end
++        end
++    endgenerate
++
++`ifndef LMEM_ENABLE
++generate
++if (`TMEM_ENABLE) begin : g_stub_lmem
++    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_stub_local_if
++        assign lsu_lmem_if[i].req_ready = 1'b1;
++        assign lsu_lmem_if[i].rsp_valid = 1'b0;
++        assign lsu_lmem_if[i].rsp_data  = '0;
+     end
++end
++endgenerate
++`endif
++
++`ifdef LMEM_ENABLE
++
++    `STATIC_ASSERT(`IS_DIVISBLE((1 << `LMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
++    `STATIC_ASSERT(0 == (`LMEM_BASE_ADDR % (1 << `LMEM_LOG_SIZE)), ("invalid parameter"))
++
++    localparam LMEM_ADDR_WIDTH = `LMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
+ 
+     VX_lsu_mem_if #(
+         .NUM_LANES (`NUM_LSU_LANES),
+@@ -128,9 +176,87 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
+     assign lmem_perf = '0;
+ `endif
+ 
+-    for (genvar i = 0; i < `NUM_LSU_BLOCKS; ++i) begin : g_lsu_dcache_if
+-        `ASSIGN_VX_MEM_BUS_IF (lsu_dcache_if[i], lsu_mem_if[i]);
+-    end
++`endif
++
++`ifdef TMEM_ENABLE
++
++    `STATIC_ASSERT(`IS_DIVISBLE((1 << `TMEM_LOG_SIZE), `MEM_BLOCK_SIZE), ("invalid parameter"))
++    `STATIC_ASSERT(0 == (`TMEM_BASE_ADDR % (1 << `TMEM_LOG_SIZE)), ("invalid parameter"))
++
++    localparam TMEM_ADDR_WIDTH = `TMEM_LOG_SIZE - `CLOG2(LSU_WORD_SIZE);
++
++    VX_lsu_mem_if #(
++        .NUM_LANES (`NUM_LSU_LANES),
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tmem_arb_if[1]();
++
++    VX_lsu_mem_arb #(
++        .NUM_INPUTS (`NUM_LSU_BLOCKS),
++        .NUM_OUTPUTS(1),
++        .NUM_LANES  (`NUM_LSU_LANES),
++        .DATA_SIZE  (LSU_WORD_SIZE),
++        .TAG_WIDTH  (LSU_TAG_WIDTH),
++        .TAG_SEL_IDX(0),
++        .ARBITER    ("R"),
++        .REQ_OUT_BUF(0),
++        .RSP_OUT_BUF(2)
++    ) tmem_arb (
++        .clk        (clk),
++        .reset      (reset),
++        .bus_in_if  (lsu_tmem_if),
++        .bus_out_if (tmem_arb_if)
++    );
++
++    // TMEM adapter: LSU lanes + 1 extra port for TCU
++    localparam TMEM_PORTS = `NUM_LSU_LANES + 1;
++
++    VX_mem_bus_if #(
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tmem_adapt_if[TMEM_PORTS]();
++
++    VX_lsu_adapter #(
++        .NUM_LANES    (`NUM_LSU_LANES),
++        .DATA_SIZE    (LSU_WORD_SIZE),
++        .TAG_WIDTH    (TMEM_TAG_WIDTH),
++        .TAG_SEL_BITS (TMEM_TAG_WIDTH - UUID_WIDTH),
++        .ARBITER      ("P"),
++        .REQ_OUT_BUF  (3),
++        .RSP_OUT_BUF  (0)
++    ) tmem_adapter (
++        .clk        (clk),
++        .reset      (reset),
++        .lsu_mem_if (tmem_arb_if[0]),
++        .mem_bus_if (tmem_adapt_if[0 +: `NUM_LSU_LANES])
++    );
++
++    // TCU gets a dedicated TMEM port (single lane) exposed to the core
++    `ASSIGN_VX_MEM_BUS_IF (tcu_tmem_bus_if, tmem_adapt_if[`NUM_LSU_LANES]);
++
++    VX_tensor_mem #(
++        .INSTANCE_ID(`SFORMATF(("%s-tmem", INSTANCE_ID))),
++        .SIZE       (1 << `TMEM_LOG_SIZE),
++        .NUM_REQS   (TMEM_PORTS),
++        .NUM_BANKS  (`TMEM_NUM_BANKS),
++        .WORD_SIZE  (LSU_WORD_SIZE),
++        .ADDR_WIDTH (TMEM_ADDR_WIDTH),
++        .TAG_WIDTH  (TMEM_TAG_WIDTH),
++        .OUT_BUF    (3)
++    ) tensor_mem (
++        .clk        (clk),
++        .reset      (reset),
++    `ifdef PERF_ENABLE
++        .tmem_perf  (tmem_perf),
++    `endif
++        .mem_bus_if (tmem_adapt_if)
++    );
++
++`else
++
++`ifdef PERF_ENABLE
++    assign tmem_perf = '0;
++`endif
+ 
+ `endif
+ 
+diff --git a/hw/rtl/core/VX_mem_unit_top.sv b/hw/rtl/core/VX_mem_unit_top.sv
+index 6a322f8..7021423 100644
+--- a/hw/rtl/core/VX_mem_unit_top.sv
++++ b/hw/rtl/core/VX_mem_unit_top.sv
+@@ -108,8 +108,15 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
+         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
+     end
+ 
++    // TCU tensor memory bus (single port)
++    VX_mem_bus_if #(
++        .DATA_SIZE (LSU_WORD_SIZE),
++        .TAG_WIDTH (TMEM_TAG_WIDTH)
++    ) tcu_tmem_bus_if();
++
+ `ifdef PERF_ENABLE
+-    VX_cache_pkg::cache_perf_t lmem_perf = '0;
++    lmem_perf_t lmem_perf;
++    tmem_perf_t tmem_perf;
+ `endif
+ 
+     VX_mem_unit #(
+@@ -119,9 +126,16 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
+         .reset         (reset),
+     `ifdef PERF_ENABLE
+         .lmem_perf     (lmem_perf),
++        .tmem_perf     (tmem_perf),
+     `endif
+         .lsu_mem_if    (lsu_mem_if),
+-        .dcache_bus_if (mem_bus_if)
++        .dcache_bus_if (mem_bus_if),
++        .tcu_tmem_bus_if(tcu_tmem_bus_if)
+     );
+ 
++`ifdef PERF_ENABLE
++    `UNUSED_VAR (lmem_perf);
++    `UNUSED_VAR (tmem_perf);
++`endif
++
+ endmodule
+diff --git a/hw/rtl/mem/VX_lmem_switch.sv b/hw/rtl/mem/VX_lmem_switch.sv
+index c8a4ee6..e7bfb42 100644
+--- a/hw/rtl/mem/VX_lmem_switch.sv
++++ b/hw/rtl/mem/VX_lmem_switch.sv
+@@ -17,6 +17,7 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
+     parameter GLOBAL_OUT_BUF = 0,
+     parameter LOCAL_OUT_BUF = 0,
+     parameter RSP_OUT_BUF = 0,
++    parameter TENSOR_OUT_BUF = 0,
+     parameter `STRING ARBITER = "R"
+ ) (
+     input wire              clk,
+@@ -24,23 +25,60 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
+     VX_lsu_mem_if.slave     lsu_in_if,
+     VX_lsu_mem_if.master    global_out_if,
+     VX_lsu_mem_if.master    local_out_if
++`ifdef TMEM_ENABLE
++   ,VX_lsu_mem_if.master    tensor_out_if
++`endif
+ );
+     localparam REQ_DATAW = `NUM_LSU_LANES + 1 + `NUM_LSU_LANES * (LSU_WORD_SIZE + LSU_ADDR_WIDTH + MEM_FLAGS_WIDTH + LSU_WORD_SIZE * 8) + LSU_TAG_WIDTH;
+     localparam RSP_DATAW = `NUM_LSU_LANES + `NUM_LSU_LANES * (LSU_WORD_SIZE * 8) + LSU_TAG_WIDTH;
+ 
+     wire [`NUM_LSU_LANES-1:0] is_addr_local_mask;
++`ifdef TMEM_ENABLE
++    wire [`NUM_LSU_LANES-1:0] is_addr_tensor_mask;
++`endif
+     wire req_global_ready;
+     wire req_local_ready;
++`ifdef TMEM_ENABLE
++    wire req_tensor_ready;
++`endif
+ 
++`ifdef LMEM_ENABLE
+     for (genvar i = 0; i < `NUM_LSU_LANES; ++i) begin : g_is_addr_local_mask
+         assign is_addr_local_mask[i] = lsu_in_if.req_data.flags[i][MEM_REQ_FLAG_LOCAL];
+     end
++`else
++    assign is_addr_local_mask = '0;
++`endif
+ 
+-    wire is_addr_global = | (lsu_in_if.req_data.mask & ~is_addr_local_mask);
++`ifdef TMEM_ENABLE
++    for (genvar i = 0; i < `NUM_LSU_LANES; ++i) begin : g_is_addr_tensor_mask
++        assign is_addr_tensor_mask[i] = lsu_in_if.req_data.flags[i][MEM_REQ_FLAG_TMEM];
++    end
++`endif
++
++`ifdef TMEM_ENABLE
++    wire is_addr_tensor = | (lsu_in_if.req_data.mask & is_addr_tensor_mask);
++`else
++    wire is_addr_tensor = 1'b0;
++`endif
+     wire is_addr_local  = | (lsu_in_if.req_data.mask & is_addr_local_mask);
++    wire is_addr_global = | (lsu_in_if.req_data.mask & ~(is_addr_local_mask
++    `ifdef TMEM_ENABLE
++                                                       | is_addr_tensor_mask
++    `endif
++                                                       ));
++
++`ifdef TMEM_ENABLE
++    `RUNTIME_ASSERT(~(is_addr_tensor && is_addr_local), ("%t: mixed TMEM/LMEM request", $time))
++    `RUNTIME_ASSERT(~(is_addr_tensor && is_addr_global), ("%t: mixed TMEM/global request", $time))
++`endif
+ 
+     assign lsu_in_if.req_ready = (req_global_ready && is_addr_global)
+-                              || (req_local_ready && is_addr_local);
++                              || (req_local_ready && is_addr_local)
++`ifdef TMEM_ENABLE
++                              || (req_tensor_ready && is_addr_tensor)
++`endif
++                              ;
+ 
+     VX_elastic_buffer #(
+         .DATAW   (REQ_DATAW),
+@@ -88,6 +126,62 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
+         .ready_out (local_out_if.req_ready)
+     );
+ 
++`ifdef TMEM_ENABLE
++
++    VX_elastic_buffer #(
++        .DATAW   (REQ_DATAW),
++        .SIZE    (`TO_OUT_BUF_SIZE(TENSOR_OUT_BUF)),
++        .OUT_REG (`TO_OUT_BUF_REG(TENSOR_OUT_BUF))
++    ) req_tensor_buf (
++        .clk       (clk),
++        .reset     (reset),
++        .valid_in  (lsu_in_if.req_valid && is_addr_tensor),
++        .data_in   ({
++            lsu_in_if.req_data.mask & is_addr_tensor_mask,
++            lsu_in_if.req_data.rw,
++            lsu_in_if.req_data.addr,
++            lsu_in_if.req_data.data,
++            lsu_in_if.req_data.byteen,
++            lsu_in_if.req_data.flags,
++            lsu_in_if.req_data.tag
++        }),
++        .ready_in  (req_tensor_ready),
++        .valid_out (tensor_out_if.req_valid),
++        .data_out  (tensor_out_if.req_data),
++        .ready_out (tensor_out_if.req_ready)
++    );
++
++    VX_stream_arb #(
++        .NUM_INPUTS (3),
++        .DATAW      (RSP_DATAW),
++        .ARBITER    (ARBITER),
++        .OUT_BUF    (RSP_OUT_BUF)
++    ) rsp_arb (
++        .clk       (clk),
++        .reset     (reset),
++        .valid_in  ({
++            tensor_out_if.rsp_valid,
++            local_out_if.rsp_valid,
++            global_out_if.rsp_valid
++        }),
++        .ready_in  ({
++            tensor_out_if.rsp_ready,
++            local_out_if.rsp_ready,
++            global_out_if.rsp_ready
++        }),
++        .data_in   ({
++            tensor_out_if.rsp_data,
++            local_out_if.rsp_data,
++            global_out_if.rsp_data
++        }),
++        .data_out  (lsu_in_if.rsp_data),
++        .valid_out (lsu_in_if.rsp_valid),
++        .ready_out (lsu_in_if.rsp_ready),
++        `UNUSED_PIN (sel_out)
++    );
++
++`else
++
+     VX_stream_arb #(
+         .NUM_INPUTS (2),
+         .DATAW      (RSP_DATAW),
+@@ -114,4 +208,6 @@ module VX_lmem_switch import VX_gpu_pkg::*; #(
+         `UNUSED_PIN (sel_out)
+     );
+ 
++`endif
++
+ endmodule
+diff --git a/hw/rtl/mem/VX_tensor_mem.sv b/hw/rtl/mem/VX_tensor_mem.sv
+new file mode 100644
+index 0000000..20ae89f
+--- /dev/null
++++ b/hw/rtl/mem/VX_tensor_mem.sv
+@@ -0,0 +1,350 @@
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_define.vh"
++
++module VX_tensor_mem import VX_gpu_pkg::*; #(
++    parameter `STRING  INSTANCE_ID = "",
++
++    // Size of cache in bytes
++    parameter SIZE              = (1024*16*8),
++
++    // Number of Word requests per cycle
++    parameter NUM_REQS          = 4,
++    // Number of banks
++    parameter NUM_BANKS         = 4,
++
++    // Address width
++    parameter ADDR_WIDTH        = `CLOG2(SIZE),
++    // Size of a word in bytes
++    parameter WORD_SIZE         = `XLEN/8,
++
++    // Request tag size
++    parameter TAG_WIDTH         = 16,
++
++    // Response buffer
++    parameter OUT_BUF           = 0
++ ) (
++    input wire clk,
++    input wire reset,
++
++    // PERF
++`ifdef PERF_ENABLE
++    output tmem_perf_t tmem_perf,
++`endif
++
++    VX_mem_bus_if.slave mem_bus_if [NUM_REQS]
++);
++    `UNUSED_SPARAM (INSTANCE_ID)
++
++    localparam REQ_SEL_BITS    = `CLOG2(NUM_REQS);
++    localparam REQ_SEL_WIDTH   = `UP(REQ_SEL_BITS);
++    localparam WORD_WIDTH      = WORD_SIZE * 8;
++    localparam NUM_WORDS       = SIZE / WORD_SIZE;
++    localparam WORDS_PER_BANK  = NUM_WORDS / NUM_BANKS;
++    localparam BANK_ADDR_WIDTH = `CLOG2(WORDS_PER_BANK);
++    localparam BANK_SEL_BITS   = `CLOG2(NUM_BANKS);
++    localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
++    localparam REQ_DATAW       = 1 + BANK_ADDR_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH;
++    localparam RSP_DATAW       = WORD_WIDTH + TAG_WIDTH;
++
++    `STATIC_ASSERT(ADDR_WIDTH == (BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)), ("invalid parameter"))
++
++    // bank selection
++
++    wire [NUM_REQS-1:0][BANK_SEL_WIDTH-1:0] req_bank_idx;
++    if (NUM_BANKS > 1) begin : g_req_bank_idx
++        for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_idxs
++            assign req_bank_idx[i] = mem_bus_if[i].req_data.addr[0 +: BANK_SEL_BITS];
++        end
++    end else begin : g_req_bank_idx_0
++        assign req_bank_idx = 0;
++    end
++
++    // bank addressing
++
++    wire [NUM_REQS-1:0][BANK_ADDR_WIDTH-1:0] req_bank_addr;
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_bank_addr
++        assign req_bank_addr[i] = mem_bus_if[i].req_data.addr[BANK_SEL_BITS +: BANK_ADDR_WIDTH];
++        `UNUSED_VAR (mem_bus_if[i].req_data.flags)
++    end
++
++    // bank requests dispatch
++
++    wire [NUM_BANKS-1:0]                    per_bank_req_valid;
++    wire [NUM_BANKS-1:0]                    per_bank_req_rw;
++    wire [NUM_BANKS-1:0][BANK_ADDR_WIDTH-1:0] per_bank_req_addr;
++    wire [NUM_BANKS-1:0][WORD_SIZE-1:0]     per_bank_req_byteen;
++    wire [NUM_BANKS-1:0][WORD_WIDTH-1:0]    per_bank_req_data;
++    wire [NUM_BANKS-1:0][TAG_WIDTH-1:0]     per_bank_req_tag;
++    wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_req_idx;
++    wire [NUM_BANKS-1:0]                    per_bank_req_ready;
++
++    wire [NUM_BANKS-1:0][REQ_DATAW-1:0]     per_bank_req_data_aos;
++
++    wire [NUM_REQS-1:0]                 req_valid_in;
++    wire [NUM_REQS-1:0][REQ_DATAW-1:0]  req_data_in;
++    wire [NUM_REQS-1:0]                 req_ready_in;
++
++`ifdef PERF_ENABLE
++    wire [PERF_CTR_BITS-1:0] perf_collisions;
++`endif
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_data_in
++        assign req_valid_in[i] = mem_bus_if[i].req_valid;
++        assign req_data_in[i] = {
++            mem_bus_if[i].req_data.rw,
++            req_bank_addr[i],
++            mem_bus_if[i].req_data.data,
++            mem_bus_if[i].req_data.byteen,
++            mem_bus_if[i].req_data.tag
++        };
++        assign mem_bus_if[i].req_ready = req_ready_in[i];
++    end
++
++    VX_stream_xbar #(
++        .NUM_INPUTS  (NUM_REQS),
++        .NUM_OUTPUTS (NUM_BANKS),
++        .DATAW       (REQ_DATAW),
++        .PERF_CTR_BITS (PERF_CTR_BITS),
++        .ARBITER     ("P"),
++        .OUT_BUF     (3) // output should be registered for the data_store addressing
++    ) req_xbar (
++        .clk       (clk),
++        .reset     (reset),
++    `ifdef PERF_ENABLE
++        .collisions (perf_collisions),
++    `else
++        `UNUSED_PIN (collisions),
++    `endif
++        .valid_in  (req_valid_in),
++        .data_in   (req_data_in),
++        .sel_in    (req_bank_idx),
++        .ready_in  (req_ready_in),
++        .valid_out (per_bank_req_valid),
++        .data_out  (per_bank_req_data_aos),
++        .sel_out   (per_bank_req_idx),
++        .ready_out (per_bank_req_ready)
++    );
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_data_soa
++        assign {
++            per_bank_req_rw[i],
++            per_bank_req_addr[i],
++            per_bank_req_data[i],
++            per_bank_req_byteen[i],
++            per_bank_req_tag[i]
++        } = per_bank_req_data_aos[i];
++    end
++
++    // banks access
++
++    wire [NUM_BANKS-1:0]                per_bank_rsp_valid;
++    wire [NUM_BANKS-1:0][WORD_WIDTH-1:0] per_bank_rsp_data;
++    wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] per_bank_rsp_idx;
++    wire [NUM_BANKS-1:0][TAG_WIDTH-1:0] per_bank_rsp_tag;
++    wire [NUM_BANKS-1:0]                per_bank_rsp_ready;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_data_store
++        wire bank_rsp_valid, bank_rsp_ready;
++
++        VX_sp_ram #(
++            .DATAW (WORD_WIDTH),
++            .SIZE  (WORDS_PER_BANK),
++            .WRENW (WORD_SIZE),
++            .OUT_REG (1),
++            .RDW_MODE ("R")
++        ) tmem_store (
++            .clk   (clk),
++            .reset (reset),
++            .read  (per_bank_req_valid[i] && per_bank_req_ready[i] && ~per_bank_req_rw[i]),
++            .write (per_bank_req_valid[i] && per_bank_req_ready[i] && per_bank_req_rw[i]),
++            .wren  (per_bank_req_byteen[i]),
++            .addr  (per_bank_req_addr[i]),
++            .wdata (per_bank_req_data[i]),
++            .rdata (per_bank_rsp_data[i])
++        );
++
++        // read-during-write hazard detection
++        reg [BANK_ADDR_WIDTH-1:0] last_wr_addr;
++        reg last_wr_valid;
++        always @(posedge clk) begin
++            if (reset) begin
++                last_wr_valid <= 0;
++            end else begin
++                last_wr_valid <= per_bank_req_valid[i] && per_bank_req_ready[i] && per_bank_req_rw[i];
++            end
++            last_wr_addr <= per_bank_req_addr[i];
++        end
++        wire is_rdw_hazard = last_wr_valid && ~per_bank_req_rw[i] && (per_bank_req_addr[i] == last_wr_addr);
++
++        // drop write response
++        assign bank_rsp_valid = per_bank_req_valid[i] && ~per_bank_req_rw[i] && ~is_rdw_hazard;
++        assign per_bank_req_ready[i] = (bank_rsp_ready || per_bank_req_rw[i]) && ~is_rdw_hazard;
++
++        // register BRAM output
++        VX_pipe_buffer #(
++            .DATAW (REQ_SEL_WIDTH + TAG_WIDTH)
++        ) bram_buf (
++            .clk       (clk),
++            .reset     (reset),
++            .valid_in  (bank_rsp_valid),
++            .ready_in  (bank_rsp_ready),
++            .data_in   ({per_bank_req_idx[i], per_bank_req_tag[i]}),
++            .data_out  ({per_bank_rsp_idx[i], per_bank_rsp_tag[i]}),
++            .valid_out (per_bank_rsp_valid[i]),
++            .ready_out (per_bank_rsp_ready[i])
++        );
++    end
++
++    // bank responses gather
++
++    wire [NUM_BANKS-1:0][RSP_DATAW-1:0] per_bank_rsp_data_aos;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_rsp_data_aos
++        assign per_bank_rsp_data_aos[i] = {per_bank_rsp_data[i], per_bank_rsp_tag[i]};
++    end
++
++    wire [NUM_REQS-1:0]                 rsp_valid_out;
++    wire [NUM_REQS-1:0][RSP_DATAW-1:0]  rsp_data_out;
++    wire [NUM_REQS-1:0]                 rsp_ready_out;
++
++    VX_stream_xbar #(
++        .NUM_INPUTS  (NUM_BANKS),
++        .NUM_OUTPUTS (NUM_REQS),
++        .DATAW       (RSP_DATAW),
++        .ARBITER     ("P"), // this priority arbiter has negligeable impact om performance
++        .OUT_BUF     (OUT_BUF)
++    ) rsp_xbar (
++        .clk       (clk),
++        .reset     (reset),
++        `UNUSED_PIN (collisions),
++        .sel_in    (per_bank_rsp_idx),
++        .valid_in  (per_bank_rsp_valid),
++        .data_in   (per_bank_rsp_data_aos),
++        .ready_in  (per_bank_rsp_ready),
++        .valid_out (rsp_valid_out),
++        .data_out  (rsp_data_out),
++        .ready_out (rsp_ready_out),
++        `UNUSED_PIN (sel_out)
++    );
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_mem_bus_if
++        assign mem_bus_if[i].rsp_valid = rsp_valid_out[i];
++        assign mem_bus_if[i].rsp_data  = rsp_data_out[i];
++        assign rsp_ready_out[i] = mem_bus_if[i].rsp_ready;
++    end
++
++`ifdef PERF_ENABLE
++    // per cycle: reads, writes
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_reads_per_cycle;
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_writes_per_cycle;
++    wire [`CLOG2(NUM_REQS+1)-1:0] perf_crsp_stall_per_cycle;
++
++    wire [NUM_REQS-1:0] req_rw;
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_rw
++        assign req_rw[i] = mem_bus_if[i].req_data.rw;
++    end
++
++    wire [NUM_REQS-1:0] perf_reads_per_req, perf_writes_per_req;
++    wire [NUM_REQS-1:0] perf_crsp_stall_per_req = rsp_valid_out & ~rsp_ready_out;
++
++    `BUFFER(perf_reads_per_req, req_valid_in & req_ready_in & ~req_rw);
++    `BUFFER(perf_writes_per_req, req_valid_in & req_ready_in & req_rw);
++
++    `POP_COUNT(perf_reads_per_cycle, perf_reads_per_req);
++    `POP_COUNT(perf_writes_per_cycle, perf_writes_per_req);
++    `POP_COUNT(perf_crsp_stall_per_cycle, perf_crsp_stall_per_req);
++
++    reg [PERF_CTR_BITS-1:0] perf_reads;
++    reg [PERF_CTR_BITS-1:0] perf_writes;
++    reg [PERF_CTR_BITS-1:0] perf_crsp_stalls;
++
++    always @(posedge clk) begin
++        if (reset) begin
++            perf_reads       <= '0;
++            perf_writes      <= '0;
++            perf_crsp_stalls <= '0;
++        end else begin
++            perf_reads       <= perf_reads  + PERF_CTR_BITS'(perf_reads_per_cycle);
++            perf_writes      <= perf_writes + PERF_CTR_BITS'(perf_writes_per_cycle);
++            perf_crsp_stalls <= perf_crsp_stalls + PERF_CTR_BITS'(perf_crsp_stall_per_cycle);
++        end
++    end
++
++    assign tmem_perf.reads       = perf_reads;
++    assign tmem_perf.writes      = perf_writes;
++    assign tmem_perf.bank_stalls = perf_collisions;
++    assign tmem_perf.crsp_stalls = perf_crsp_stalls;
++
++`endif
++
++`ifdef DBG_TRACE_MEM
++
++    wire [NUM_BANKS-1:0][TAG_WIDTH-UUID_WIDTH-1:0] per_bank_req_tag_value;
++    wire [NUM_BANKS-1:0][`UP(UUID_WIDTH)-1:0] per_bank_req_uuid;
++
++    wire [NUM_BANKS-1:0][TAG_WIDTH-UUID_WIDTH-1:0] per_bank_rsp_tag_value;
++    wire [NUM_BANKS-1:0][`UP(UUID_WIDTH)-1:0] per_bank_rsp_uuid;
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_req_uuid
++        assign per_bank_req_tag_value[i] = per_bank_req_tag[i][TAG_WIDTH-UUID_WIDTH-1:0];
++        assign per_bank_rsp_tag_value[i] = per_bank_rsp_tag[i][TAG_WIDTH-UUID_WIDTH-1:0];
++        if (UUID_WIDTH != 0) begin : g_uuid
++            assign per_bank_req_uuid[i] = per_bank_req_tag[i][TAG_WIDTH-1 -: UUID_WIDTH];
++            assign per_bank_rsp_uuid[i] = per_bank_rsp_tag[i][TAG_WIDTH-1 -: UUID_WIDTH];
++        end else begin : g_no_uuid
++            assign per_bank_req_uuid[i] = 0;
++            assign per_bank_rsp_uuid[i] = 0;
++        end
++    end
++
++    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_req_trace
++        always @(posedge clk) begin
++            if (mem_bus_if[i].req_valid && mem_bus_if[i].req_ready) begin
++                if (mem_bus_if[i].req_data.rw) begin
++                    `TRACE(2, ("%t: %s core-wr-req[%0d]: addr=0x%0h, byteen=0x%h, data=0x%h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, mem_bus_if[i].req_data.addr, mem_bus_if[i].req_data.byteen, mem_bus_if[i].req_data.data, mem_bus_if[i].req_data.tag.value, mem_bus_if[i].req_data.tag.uuid))
++                end else begin
++                    `TRACE(2, ("%t: %s core-rd-req[%0d]: addr=0x%0h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, mem_bus_if[i].req_data.addr, mem_bus_if[i].req_data.tag.value, mem_bus_if[i].req_data.tag.uuid))
++                end
++            end
++            if (mem_bus_if[i].rsp_valid && mem_bus_if[i].rsp_ready) begin
++                `TRACE(2, ("%t: %s core-rd-rsp[%0d]: data=0x%h, tag=0x%0h (#%0d)\n",
++                    $time, INSTANCE_ID, i, mem_bus_if[i].rsp_data.data, mem_bus_if[i].rsp_data.tag.value, mem_bus_if[i].rsp_data.tag.uuid))
++            end
++        end
++    end
++
++    for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_bank_trace
++        always @(posedge clk) begin
++            if (per_bank_req_valid[i] && per_bank_req_ready[i]) begin
++                if (per_bank_req_rw[i]) begin
++                    `TRACE(2, ("%t: %s bank-wr-req[%0d]: addr=0x%0h, byteen=0x%h, data=0x%h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, per_bank_req_addr[i], per_bank_req_byteen[i], per_bank_req_data[i], per_bank_req_tag_value[i], per_bank_req_uuid[i]))
++                end else begin
++                    `TRACE(2, ("%t: %s bank-rd-req[%0d]: addr=0x%0h, tag=0x%0h (#%0d)\n",
++                        $time, INSTANCE_ID, i, per_bank_req_addr[i], per_bank_req_tag_value[i], per_bank_req_uuid[i]))
++                end
++            end
++            if (per_bank_rsp_valid[i] && per_bank_rsp_ready[i]) begin
++                `TRACE(2, ("%t: %s bank-rd-rsp[%0d]: data=0x%h, tag=0x%0h (#%0d)\n",
++                    $time, INSTANCE_ID, i, per_bank_rsp_data[i], per_bank_rsp_tag_value[i], per_bank_rsp_uuid[i]))
++            end
++        end
++    end
++
++`endif
++
++endmodule
+diff --git a/hw/rtl/mem/VX_tensor_mem_top.sv b/hw/rtl/mem/VX_tensor_mem_top.sv
+new file mode 100644
+index 0000000..d7bc862
+--- /dev/null
++++ b/hw/rtl/mem/VX_tensor_mem_top.sv
+@@ -0,0 +1,99 @@
++// Copyright © 2019-2023
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++`include "VX_define.vh"
++
++module VX_tensor_mem_top import VX_gpu_pkg::*; #(
++    parameter `STRING  INSTANCE_ID = "",
++
++    // Size of cache in bytes
++    parameter SIZE              = (1024*16*8),
++
++    // Number of Word requests per cycle
++    parameter NUM_REQS          = 4,
++    // Number of banks
++    parameter NUM_BANKS         = 4,
++
++    // Size of a word in bytes
++    parameter WORD_SIZE         = `XLEN/8,
++
++    // Request tag size
++    parameter TAG_WIDTH         = 16,
++
++    // Address width
++    parameter NUM_WORDS         = SIZE / WORD_SIZE,
++    parameter WORDS_PER_BANK    = NUM_WORDS / NUM_BANKS,
++    parameter BANK_ADDR_WIDTH   = `CLOG2(WORDS_PER_BANK),
++    parameter ADDR_WIDTH        = BANK_ADDR_WIDTH + `CLOG2(NUM_BANKS)
++ ) (
++    input wire clk,
++    input wire reset,
++
++    // Core request
++    input  wire [NUM_REQS-1:0]                 mem_req_valid,
++    input  wire [NUM_REQS-1:0]                 mem_req_rw,
++    input  wire [NUM_REQS-1:0][WORD_SIZE-1:0]  mem_req_byteen,
++    input  wire [NUM_REQS-1:0][ADDR_WIDTH-1:0] mem_req_addr,
++    input  wire [NUM_REQS-1:0][MEM_FLAGS_WIDTH-1:0] mem_req_flags,
++    input  wire [NUM_REQS-1:0][WORD_SIZE*8-1:0] mem_req_data,
++    input  wire [NUM_REQS-1:0][TAG_WIDTH-1:0]  mem_req_tag,
++    output wire [NUM_REQS-1:0]                 mem_req_ready,
++
++    // Core response
++    output wire [NUM_REQS-1:0]                 mem_rsp_valid,
++    output wire [NUM_REQS-1:0][WORD_SIZE*8-1:0] mem_rsp_data,
++    output wire [NUM_REQS-1:0][TAG_WIDTH-1:0]  mem_rsp_tag,
++    input  wire [NUM_REQS-1:0]                 mem_rsp_ready
++);
++    VX_mem_bus_if #(
++        .DATA_SIZE (WORD_SIZE),
++        .TAG_WIDTH (TAG_WIDTH),
++        .ADDR_WIDTH(ADDR_WIDTH)
++    ) mem_bus_if[NUM_REQS]();
++
++     // memory request
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign mem_bus_if[i].req_valid = mem_req_valid[i];
++        assign mem_bus_if[i].req_data.rw = mem_req_rw[i];
++        assign mem_bus_if[i].req_data.byteen = mem_req_byteen[i];
++        assign mem_bus_if[i].req_data.addr = mem_req_addr[i];
++        assign mem_bus_if[i].req_data.flags = mem_req_flags[i];
++        assign mem_bus_if[i].req_data.data = mem_req_data[i];
++        assign mem_bus_if[i].req_data.tag = mem_req_tag[i];
++        assign mem_req_ready[i] = mem_bus_if[i].req_ready;
++    end
++
++    // memory response
++    for (genvar i = 0; i < NUM_REQS; ++i) begin
++        assign mem_rsp_valid[i] = mem_bus_if[i].rsp_valid;
++        assign mem_rsp_data[i] = mem_bus_if[i].rsp_data.data;
++        assign mem_rsp_tag[i] = mem_bus_if[i].rsp_data.tag;
++        assign mem_bus_if[i].rsp_ready = mem_rsp_ready[i];
++    end
++
++    VX_tensor_mem #(
++        .INSTANCE_ID(INSTANCE_ID),
++        .SIZE       (SIZE),
++        .NUM_REQS   (NUM_REQS),
++        .NUM_BANKS  (NUM_BANKS),
++        .WORD_SIZE  (WORD_SIZE),
++        .ADDR_WIDTH (ADDR_WIDTH),
++        .TAG_WIDTH  (TAG_WIDTH),
++        .OUT_BUF    (3)
++    ) tensor_mem (
++        .clk        (clk),
++        .reset      (reset),
++        .mem_bus_if (mem_bus_if)
++    );
++
++endmodule
+diff --git a/hw/rtl/tcu/VX_tcu_fp.sv b/hw/rtl/tcu/VX_tcu_fp.sv
+index 77a1a07..8e02844 100644
+--- a/hw/rtl/tcu/VX_tcu_fp.sv
++++ b/hw/rtl/tcu/VX_tcu_fp.sv
+@@ -25,8 +25,328 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+     VX_execute_if.slave execute_if,
+ 
+     // Outputs
+-    VX_result_if.master result_if
++    VX_result_if.master result_if,
++
++    // Tensor memory interface (single port)
++    VX_mem_bus_if.master tcu_tmem_bus_if
+ );
++
++    // -------------------------------------------------------------------------
++    // UMMA with TMEM backing (single in-flight op)
++    // -------------------------------------------------------------------------
++
++    localparam WORD_BYTES = LSU_WORD_SIZE;
++    localparam WORD_BITS  = WORD_BYTES * 8;
++    localparam TMEM_ADDRW = `MEM_ADDR_WIDTH - `CLOG2(LSU_WORD_SIZE);
++
++    typedef enum logic [2:0] {
++        S_IDLE,
++        S_READ_A,
++        S_READ_B,
++        S_READ_C,
++        S_COMPUTE,
++        S_WRITE_D,
++        S_RESP
++    } umma_state_t;
++
++    umma_state_t state;
++
++    // Latched instruction metadata
++    reg [3:0] umma_fmt_s, umma_fmt_d;
++    reg [TMEM_ADDRW-1:0] addr_b, addr_c;
++    reg [UUID_WIDTH-1:0] umma_uuid;
++    reg [NW_WIDTH-1:0]    umma_wid;
++    reg [PC_BITS-1:0]     umma_pc;
++
++    // Tile sizing
++    wire [31:0] tileM = TCU_TILE_M;
++    wire [31:0] tileN = TCU_TILE_N;
++    wire [31:0] tileK_base = TCU_TILE_K;
++    wire [31:0] itype_bytes = tcu_type_bytes(umma_fmt_s);
++    wire [31:0] ratio = (4 / itype_bytes);
++    wire [31:0] tileK = tileK_base * ratio;
++    wire [31:0] otype_bytes = tcu_type_bytes(umma_fmt_d);
++
++    // Buffer sizes in bytes
++    wire [31:0] a_bytes = tileM * tileK * itype_bytes;
++    wire [31:0] b_bytes = tileK * tileN * itype_bytes;
++    wire [31:0] c_bytes = tileM * tileN * otype_bytes;
++
++    // Max buffers (for current configs, tileM<=8, tileN<=4, tileK<=16)
++    localparam MAX_A_BYTES = 8 * 16 * 4;
++    localparam MAX_B_BYTES = 16 * 4 * 4;
++    localparam MAX_C_BYTES = 8 * 4 * 4;
++
++    reg [7:0] a_buf [0:MAX_A_BYTES-1];
++    reg [7:0] b_buf [0:MAX_B_BYTES-1];
++    reg [7:0] c_buf [0:MAX_C_BYTES-1];
++    reg [7:0] d_buf [0:MAX_C_BYTES-1];
++
++    // TMEM word transfer helpers
++    reg req_pending;
++    reg req_rw;
++    reg [TMEM_ADDRW-1:0] req_addr;
++    reg [WORD_BITS-1:0] req_wdata;
++    reg [WORD_BYTES-1:0] req_byteen;
++
++    wire rsp_fire = tcu_tmem_bus_if.rsp_valid && tcu_tmem_bus_if.rsp_ready;
++    wire req_fire = tcu_tmem_bus_if.req_valid && tcu_tmem_bus_if.req_ready;
++
++    assign tcu_tmem_bus_if.req_valid = req_pending;
++    assign tcu_tmem_bus_if.req_data.rw = req_rw;
++    assign tcu_tmem_bus_if.req_data.addr = req_addr;
++    assign tcu_tmem_bus_if.req_data.data = req_wdata;
++    assign tcu_tmem_bus_if.req_data.byteen = req_byteen;
++    assign tcu_tmem_bus_if.req_data.flags = '0;
++    assign tcu_tmem_bus_if.req_data.tag.value = '0;
++    assign tcu_tmem_bus_if.req_data.tag.uuid  = '0;
++    assign tcu_tmem_bus_if.rsp_ready = 1'b1;
++
++    // Word index counters
++    reg [31:0] word_idx;
++    reg [31:0] total_words;
++    reg [TMEM_ADDRW-1:0] base_addr_latched;
++
++    // Ready/valid gating
++    wire umma_req = execute_if.valid
++                 && (execute_if.data.op_type == INST_TCU_UMMA);
++    wire accept_op = (state == S_IDLE) && umma_req;
++    wire umma_active = (state != S_IDLE);
++
++    // UMMA result interface (only active when state == S_RESP)
++    wire umma_result_valid = (state == S_RESP);
++
++    // Byte pack/unpack helpers (buffer-specific to avoid SV array formals issues)
++    task automatic store_a(input integer off, input [WORD_BITS-1:0] wdata, input integer nbytes);
++        integer bi;
++        begin
++            for (bi = 0; bi < nbytes; bi = bi + 1)
++                a_buf[off + bi] <= wdata[8*bi +: 8];
++        end
++    endtask
++    task automatic store_b(input integer off, input [WORD_BITS-1:0] wdata, input integer nbytes);
++        integer bi;
++        begin
++            for (bi = 0; bi < nbytes; bi = bi + 1)
++                b_buf[off + bi] <= wdata[8*bi +: 8];
++        end
++    endtask
++    task automatic store_c(input integer off, input [WORD_BITS-1:0] wdata, input integer nbytes);
++        integer bi;
++        begin
++            for (bi = 0; bi < nbytes; bi = bi + 1)
++                c_buf[off + bi] <= wdata[8*bi +: 8];
++        end
++    endtask
++    task automatic store_d(input integer off, input [WORD_BITS-1:0] wdata, input integer nbytes);
++        integer bi;
++        begin
++            for (bi = 0; bi < nbytes; bi = bi + 1)
++                d_buf[off + bi] <= wdata[8*bi +: 8];
++        end
++    endtask
++
++    function automatic [WORD_BITS-1:0] load_d(input integer off, input integer nbytes);
++        integer bi;
++        reg [WORD_BITS-1:0] tmp;
++        begin
++            tmp = '0;
++            for (bi = 0; bi < nbytes; bi = bi + 1)
++                tmp[8*bi +: 8] = d_buf[off + bi];
++            load_d = tmp;
++        end
++    endfunction
++
++    // Float helpers
++    function automatic [31:0] load_a_word(input integer off);
++        load_a_word = {a_buf[off+3], a_buf[off+2], a_buf[off+1], a_buf[off+0]};
++    endfunction
++    function automatic [31:0] load_b_word(input integer off);
++        load_b_word = {b_buf[off+3], b_buf[off+2], b_buf[off+1], b_buf[off+0]};
++    endfunction
++    function automatic [31:0] load_c_word(input integer off);
++        load_c_word = {c_buf[off+3], c_buf[off+2], c_buf[off+1], c_buf[off+0]};
++    endfunction
++
++    function automatic real word_to_real(input [31:0] w);
++        word_to_real = $bitstoreal({32'b0, w}); // use real; upper bits zero
++    endfunction
++    function automatic [31:0] real_to_word(input real v);
++        real_to_word = $realtobits(v)[31:0];
++    endfunction
++
++    // Compute D = C + A*B
++    task automatic do_compute;
++        integer m, n, k;
++        integer a_off, b_off, c_off, d_off;
++        real acc;
++        real aval, bval;
++        begin
++            for (m = 0; m < tileM; m = m + 1) begin
++                for (n = 0; n < tileN; n = n + 1) begin
++                    c_off = (m*tileN + n)*otype_bytes;
++                    acc = word_to_real(load_c_word(c_off));
++                    for (k = 0; k < tileK; k = k + 1) begin
++                        a_off = (m*tileK + k)*itype_bytes;
++                        b_off = (k*tileN + n)*itype_bytes;
++                        aval = word_to_real(load_a_word(a_off));
++                        bval = word_to_real(load_b_word(b_off));
++                        acc = acc + (aval * bval);
++                    end
++                    d_off = (m*tileN + n)*otype_bytes;
++                    store_d(d_off, real_to_word(acc), otype_bytes);
++                end
++            end
++        end
++    endtask
++
++    // FSM
++    always @(posedge clk) begin
++        if (reset) begin
++            state <= S_IDLE;
++            req_pending <= 0;
++            req_rw <= 0;
++            req_addr <= '0;
++            req_wdata <= '0;
++            req_byteen <= '0;
++            word_idx <= 0;
++            total_words <= 0;
++            base_addr_latched <= 0;
++        end else begin
++            // clear issued requests when fired
++            if (req_fire)
++                req_pending <= 0;
++
++            case (state)
++            S_IDLE: begin
++                if (accept_op) begin
++                    umma_fmt_s <= execute_if.data.op_args.tcu.fmt_s;
++                    umma_fmt_d <= execute_if.data.op_args.tcu.fmt_d;
++                    addr_b <= execute_if.data.rs2_data[0][TMEM_ADDRW-1:0];
++                    addr_c <= execute_if.data.rs3_data[0][TMEM_ADDRW-1:0];
++                    umma_uuid <= execute_if.data.uuid;
++                    umma_wid  <= execute_if.data.wid;
++                    umma_pc   <= execute_if.data.PC;
++                    // prep A read
++                    base_addr_latched <= execute_if.data.rs1_data[0][TMEM_ADDRW-1:0];
++                    word_idx <= 0;
++                    total_words <= (a_bytes + WORD_BYTES - 1) / WORD_BYTES;
++                    state <= S_READ_A;
++                end
++            end
++
++            S_READ_A: begin
++                if (~req_pending && (word_idx < total_words)) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = a_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    req_rw <= 0;
++                    req_addr <= base_addr_latched[TMEM_ADDRW-1:0] + TMEM_ADDRW'(word_idx);
++                    req_byteen <= (1 << nbytes) - 1;
++                    req_pending <= 1;
++                end
++                if (rsp_fire) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = a_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    store_a(off, tcu_tmem_bus_if.rsp_data.data, nbytes);
++                    word_idx <= word_idx + 1;
++                    if (word_idx + 1 == total_words) begin
++                        // move to B
++                        base_addr_latched <= TMEM_ADDRW'(addr_b);
++                        word_idx <= 0;
++                        total_words <= (b_bytes + WORD_BYTES - 1) / WORD_BYTES;
++                        state <= S_READ_B;
++                    end
++                end
++            end
++
++            S_READ_B: begin
++                if (~req_pending && (word_idx < total_words)) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = b_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    req_rw <= 0;
++                    req_addr <= base_addr_latched[TMEM_ADDRW-1:0] + TMEM_ADDRW'(word_idx);
++                    req_byteen <= (1 << nbytes) - 1;
++                    req_pending <= 1;
++                end
++                if (rsp_fire) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = b_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    store_b(off, tcu_tmem_bus_if.rsp_data.data, nbytes);
++                    word_idx <= word_idx + 1;
++                    if (word_idx + 1 == total_words) begin
++                        // move to C
++                        base_addr_latched <= TMEM_ADDRW'(addr_c);
++                        word_idx <= 0;
++                        total_words <= (c_bytes + WORD_BYTES - 1) / WORD_BYTES;
++                        state <= S_READ_C;
++                    end
++                end
++            end
++
++            S_READ_C: begin
++                if (~req_pending && (word_idx < total_words)) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = c_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    req_rw <= 0;
++                    req_addr <= base_addr_latched[TMEM_ADDRW-1:0] + TMEM_ADDRW'(word_idx);
++                    req_byteen <= (1 << nbytes) - 1;
++                    req_pending <= 1;
++                end
++                if (rsp_fire) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = c_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    store_c(off, tcu_tmem_bus_if.rsp_data.data, nbytes);
++                    word_idx <= word_idx + 1;
++                    if (word_idx + 1 == total_words) begin
++                        state <= S_COMPUTE;
++                    end
++                end
++            end
++
++            S_COMPUTE: begin
++                do_compute();
++                // prep D write
++                base_addr_latched <= TMEM_ADDRW'(addr_c);
++                word_idx <= 0;
++                total_words <= (c_bytes + WORD_BYTES - 1) / WORD_BYTES;
++                state <= S_WRITE_D;
++            end
++
++            S_WRITE_D: begin
++                if (~req_pending && (word_idx < total_words)) begin
++                    integer off = word_idx * WORD_BYTES;
++                    integer rem = c_bytes - off;
++                    integer nbytes = (rem >= WORD_BYTES) ? WORD_BYTES : rem;
++                    req_rw <= 1;
++                    req_addr <= base_addr_latched[TMEM_ADDRW-1:0] + TMEM_ADDRW'(word_idx);
++                    req_byteen <= (1 << nbytes) - 1;
++                    req_wdata <= load_d(off, nbytes);
++                    req_pending <= 1;
++                end
++                if (req_fire) begin
++                    word_idx <= word_idx + 1;
++                    if (word_idx + 1 == total_words) begin
++                        state <= S_RESP;
++                    end
++                end
++            end
++
++            S_RESP: begin
++                if (result_if.ready) begin
++                    state <= S_IDLE;
++                end
++            end
++
++            default: state <= S_IDLE;
++            endcase
++        end
++    end
+     `UNUSED_SPARAM (INSTANCE_ID);
+ 
+     localparam MDATA_WIDTH = UUID_WIDTH + NW_WIDTH + PC_BITS + NUM_REGS_BITS;
+@@ -75,9 +395,12 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+     };
+ 
+     wire execute_fire = execute_if.valid && execute_if.ready;
+-    wire result_fire = result_if.valid && result_if.ready;
+     wire fedp_enable, fedp_done;
+ 
++    // Only use mdata_queue and FEDP for WMMA operations (UMMA uses latched metadata and direct TMEM access)
++    wire wmma_execute_fire = execute_fire && (execute_if.data.op_type == INST_TCU_WMMA);
++    wire wmma_result_fire = wmma_result_valid && result_if.ready;
++
+     // FEDP delay handling
+     reg [PIPE_LATENCY-1:0] fedp_delay_pipe;
+     always @(posedge clk) begin
+@@ -87,16 +410,20 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+             if (fedp_enable) begin
+                 fedp_delay_pipe <= fedp_delay_pipe >> 1;
+             end
+-            if (execute_fire) begin
++            if (wmma_execute_fire) begin
+                 fedp_delay_pipe[PIPE_LATENCY-1] <= 1;
+             end
+         end
+     end
+     assign fedp_done = fedp_delay_pipe[0];
+ 
+-    assign result_if.valid  = fedp_done;
+-    assign fedp_enable      = ~result_if.valid || result_if.ready;
+-    assign execute_if.ready = ~mdata_queue_full && fedp_enable;
++    // WMMA result valid (only when UMMA is not active)
++    wire wmma_result_valid = fedp_done && (state == S_IDLE);
++
++    assign fedp_enable      = (~umma_active) && (~wmma_result_valid || result_if.ready);
++    // execute_if.ready: When UMMA active (state != S_IDLE), block new ops; when idle, allow WMMA if no UMMA req, or accept UMMA if req
++    wire wmma_ready = ~mdata_queue_full && fedp_enable;
++    assign execute_if.ready = (state == S_IDLE) ? (~umma_req ? wmma_ready : accept_op) : 1'b0;
+ 
+     VX_fifo_queue #(
+         .DATAW (MDATA_WIDTH),
+@@ -105,8 +432,8 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+     ) mdata_queue (
+         .clk    (clk),
+         .reset  (reset),
+-        .push   (execute_fire),
+-        .pop    (result_fire),
++        .push   (wmma_execute_fire),
++        .pop    (wmma_result_fire),
+         .data_in(mdata_queue_din),
+         .data_out(mdata_queue_dout),
+         `UNUSED_PIN(empty),
+@@ -204,18 +531,24 @@ module VX_tcu_fp import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+         end
+     end
+ 
+-    assign result_if.data.wb  = 1;
++    // Result interface muxing: UMMA vs WMMA
++    assign result_if.valid = umma_result_valid || wmma_result_valid;
++
++    // UMMA result data
++    wire [UUID_WIDTH-1:0] result_uuid = umma_result_valid ? umma_uuid : mdata_queue_dout[MDATA_WIDTH-1:MDATA_WIDTH-UUID_WIDTH];
++    wire [NW_WIDTH-1:0] result_wid = umma_result_valid ? umma_wid : mdata_queue_dout[MDATA_WIDTH-UUID_WIDTH-1:MDATA_WIDTH-UUID_WIDTH-NW_WIDTH];
++    wire [PC_BITS-1:0] result_pc = umma_result_valid ? umma_pc : mdata_queue_dout[MDATA_WIDTH-UUID_WIDTH-NW_WIDTH-1:MDATA_WIDTH-UUID_WIDTH-NW_WIDTH-PC_BITS];
++    wire [NUM_REGS_BITS-1:0] result_rd = umma_result_valid ? '0 : mdata_queue_dout[NUM_REGS_BITS-1:0];
++
++    assign result_if.data.wb = umma_result_valid ? 1'b0 : (wmma_result_valid && (|result_rd));
+     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
+-    assign result_if.data.data  = d_val;
++    assign result_if.data.data = umma_result_valid ? '{default:32'b0} : d_val;
+     assign result_if.data.pid = 0;
+     assign result_if.data.sop = 1;
+     assign result_if.data.eop = 1;
+-
+-    assign {
+-        result_if.data.uuid,
+-        result_if.data.wid,
+-        result_if.data.PC,
+-        result_if.data.rd
+-    } = mdata_queue_dout;
++    assign result_if.data.rd = result_rd;
++    assign result_if.data.uuid = result_uuid;
++    assign result_if.data.wid = result_wid;
++    assign result_if.data.PC = result_pc;
+ 
+ endmodule
+diff --git a/hw/rtl/tcu/VX_tcu_int.sv b/hw/rtl/tcu/VX_tcu_int.sv
+index a9ad5f9..51dc726 100644
+--- a/hw/rtl/tcu/VX_tcu_int.sv
++++ b/hw/rtl/tcu/VX_tcu_int.sv
+@@ -157,7 +157,8 @@ module VX_tcu_int import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+         end
+     end
+ 
+-    assign result_if.data.wb  = 1;
++    // WMMA writes back register results; UMMA does not.
++    assign result_if.data.wb  = (execute_if.data.op_type == INST_TCU_WMMA);
+     assign result_if.data.tmask = {`NUM_THREADS{1'b1}};
+     assign result_if.data.data  = d_val;
+     assign result_if.data.pid = 0;
+diff --git a/hw/rtl/tcu/VX_tcu_pkg.sv b/hw/rtl/tcu/VX_tcu_pkg.sv
+index 5ad4713..6db57c6 100644
+--- a/hw/rtl/tcu/VX_tcu_pkg.sv
++++ b/hw/rtl/tcu/VX_tcu_pkg.sv
+@@ -81,6 +81,22 @@ package VX_tcu_pkg;
+ 
+     localparam TCU_UOPS = TCU_M_STEPS * TCU_N_STEPS * TCU_K_STEPS;
+ 
++    // Helper: bytes per format id (matches simx UMMA mapping)
++    function automatic int unsigned tcu_type_bytes(input [3:0] fmt);
++        case (fmt)
++            TCU_FP32_ID: tcu_type_bytes = 4;
++            TCU_TF32_ID: tcu_type_bytes = 4;
++            TCU_FP16_ID: tcu_type_bytes = 2;
++            TCU_BF16_ID: tcu_type_bytes = 2;
++            TCU_I32_ID:  tcu_type_bytes = 4;
++            TCU_I8_ID,
++            TCU_U8_ID:   tcu_type_bytes = 1;
++            TCU_I4_ID,
++            TCU_U4_ID:   tcu_type_bytes = 1; // packed, but treat as byte for TMEM
++            default:     tcu_type_bytes = 4;
++        endcase
++    endfunction
++
+     // Tracing info
+ `ifdef SIMULATION
+     task trace_fmt(input int level, input [3:0] fmt);
+diff --git a/hw/rtl/tcu/VX_tcu_unit.sv b/hw/rtl/tcu/VX_tcu_unit.sv
+index 79b8f0e..05a09b4 100644
+--- a/hw/rtl/tcu/VX_tcu_unit.sv
++++ b/hw/rtl/tcu/VX_tcu_unit.sv
+@@ -25,7 +25,10 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+     VX_dispatch_if.slave    dispatch_if [`ISSUE_WIDTH],
+ 
+     // Outputs
+-    VX_commit_if.master     commit_if [`ISSUE_WIDTH]
++    VX_commit_if.master     commit_if [`ISSUE_WIDTH],
++
++    // Tensor memory interface (single port)
++    VX_mem_bus_if.master    tcu_tmem_bus_if
+ );
+     localparam BLOCK_SIZE = `NUM_TCU_BLOCKS;
+     localparam NUM_LANES  = `NUM_TCU_LANES;
+@@ -87,7 +90,8 @@ module VX_tcu_unit import VX_gpu_pkg::*, VX_tcu_pkg::*; #(
+             .clk        (clk),
+             .reset      (reset),
+             .execute_if (pe_execute_if[0]),
+-            .result_if  (pe_result_if[0])
++            .result_if  (pe_result_if[0]),
++            .tcu_tmem_bus_if (tcu_tmem_bus_if)
+         );
+ 
+         VX_tcu_int #(
+diff --git a/hw/rtl/tcu/VX_tcu_uops.sv b/hw/rtl/tcu/VX_tcu_uops.sv
+index 101c3d8..7d24d9d 100644
+--- a/hw/rtl/tcu/VX_tcu_uops.sv
++++ b/hw/rtl/tcu/VX_tcu_uops.sv
+@@ -88,7 +88,10 @@ module VX_tcu_uops import
+     assign ibuf_out.op_args.tcu.fmt_d = ibuf_in.op_args.tcu.fmt_d;
+     assign ibuf_out.op_args.tcu.step_m = 4'(m_index);
+     assign ibuf_out.op_args.tcu.step_n = 4'(n_index);
+-    assign ibuf_out.wb        = 1;
++    wire is_umma = (ibuf_in.op_type == INST_TCU_UMMA);
++
++    // For UMMA we don't produce architectural register writeback.
++    assign ibuf_out.wb        = ~is_umma;
+     assign ibuf_out.used_rs   = ibuf_in.used_rs;
+     assign ibuf_out.rs1       = make_reg_num(REG_TYPE_F, rs1);
+     assign ibuf_out.rs2       = make_reg_num(REG_TYPE_F, rs2);
+diff --git a/kernel/include/vx_spawn.h b/kernel/include/vx_spawn.h
+index ff25de6..a054840 100644
+--- a/kernel/include/vx_spawn.h
++++ b/kernel/include/vx_spawn.h
+@@ -45,6 +45,9 @@ typedef void (*vx_serial_cb)(void *arg);
+ #define __local_mem(size) \
+   (void*)((int8_t*)csr_read(VX_CSR_LOCAL_MEM_BASE) + __local_group_id * size)
+ 
++#define __tensor_mem(size) \
++  (void*)((int8_t*)csr_read(VX_CSR_TENSOR_MEM_BASE) + __local_group_id * size)
++
+ #define __syncthreads() \
+   vx_barrier(__local_group_id, __warps_per_group)
+ 
+diff --git a/kernel/include/vx_tensor.h b/kernel/include/vx_tensor.h
+index e888310..7d44491 100644
+--- a/kernel/include/vx_tensor.h
++++ b/kernel/include/vx_tensor.h
+@@ -405,5 +405,188 @@ public:
+   }
+ };
+ 
++///////////////////////////////////////////////////////////////////////////////
++// UMMA - Unified MMA with Tensor Memory
++// Registers contain addresses pointing to data in tensor memory
++///////////////////////////////////////////////////////////////////////////////
++
++template <uint32_t NT, // number of threads per warp
++          typename It, // input type (A,B)
++          typename Ot> // output type (C,D)
++struct umma_context {
++private:
++  using cfg = wmma_config_t<NT, It, Ot>;  // Pass input/output types for correct i_ratio calculation
++
++  enum frag_use_t { matrix_a, matrix_b, accumulator };
++
++public:
++  using input_t  = typename It::dtype;
++  using output_t = typename Ot::dtype;
++
++  static constexpr uint32_t tileM = cfg::tileM;
++  static constexpr uint32_t tileN = cfg::tileN;
++  static constexpr uint32_t tileK = cfg::tileK;  // Already adjusted for input type size in wmma_config_t
++
++  // Fragment that holds an address to tensor memory instead of actual data
++  template <frag_use_t Use>
++  struct fragment_addr_t {
++    static constexpr frag_use_t use = Use;
++    uintptr_t addr;  // Address in tensor memory (32-bit on RV32, 64-bit on RV64)
++  };
++
++  using fragment_a   = fragment_addr_t<matrix_a>;
++  using fragment_b   = fragment_addr_t<matrix_b>;
++  using fragment_acc = fragment_addr_t<accumulator>;
++
++  // Set fragment address to point to tensor memory location
++  template <typename Frag>
++  static __attribute__((always_inline)) void set_fragment_addr(Frag &frag, void* ptr) {
++    frag.addr = reinterpret_cast<uintptr_t>(ptr);
++  }
++
++  // Initialize accumulator in tensor memory to zero
++  // This writes zeros directly to tensor memory at the given address
++  static __attribute__((always_inline)) void fill_fragment(fragment_acc &frag, output_t value) {
++    auto ptr = reinterpret_cast<volatile output_t*>(frag.addr);
++    uint32_t lane = vx_thread_id();
++    constexpr uint32_t elements_per_thread = (tileM * tileN) / NT;
++    uint32_t base_idx = lane * elements_per_thread;
++    for (uint32_t i = 0; i < elements_per_thread; ++i) {
++      ptr[base_idx + i] = value;
++    }
++  }
++
++  // Load matrix data from global memory into tensor memory
++  // Unlike WMMA which loads into registers with complex thread-to-register mapping,
++  // UMMA loads into tensor memory in simple row-major contiguous format.
++  // The tensor unit reads from tensor memory directly, so we just need the data
++  // laid out contiguously - no special register mapping required.
++  template <mem_layout src_layout = row_major, typename Frag>
++  static __attribute__((always_inline)) void load_matrix_sync(Frag &frag, const void *src, size_t ldm) {
++    auto dst_ptr = reinterpret_cast<volatile input_t*>(frag.addr);
++    auto src_ptr = reinterpret_cast<const input_t*>(src);
++
++    uint32_t lane = vx_thread_id();
++
++    // If loading Matrix A (M x K)
++    if constexpr (Frag::use == matrix_a) {
++      constexpr uint32_t total_elements = tileM * tileK;
++      constexpr uint32_t elements_per_thread = total_elements / NT;
++
++      // Compute initial row/col once using div/mod, then increment
++      uint32_t idx = lane * elements_per_thread;
++      uint32_t row = idx / tileK;
++      uint32_t col = idx % tileK;
++
++      for (uint32_t i = 0; i < elements_per_thread; ++i) {
++        if constexpr (src_layout == row_major) {
++          dst_ptr[idx] = src_ptr[row * ldm + col];
++        } else {
++          dst_ptr[idx] = src_ptr[col * ldm + row];
++        }
++        // Increment with wrap-around (avoids div/mod in loop)
++        idx++;
++        col++;
++        if (col >= tileK) { col = 0; row++; }
++      }
++    } else if constexpr (Frag::use == matrix_b) { // If loading Matrix B (K x N)
++      constexpr uint32_t total_elements = tileK * tileN;
++      constexpr uint32_t elements_per_thread = total_elements / NT;
++
++      // Compute initial row/col once using div/mod, then increment
++      uint32_t idx = lane * elements_per_thread;
++      uint32_t row = idx / tileN;
++      uint32_t col = idx % tileN;
++
++      for (uint32_t i = 0; i < elements_per_thread; ++i) {
++        if constexpr (src_layout == row_major) {
++          dst_ptr[idx] = src_ptr[row * ldm + col];
++        } else {
++          dst_ptr[idx] = src_ptr[col * ldm + row];
++        }
++        // Increment with wrap-around (avoids div/mod in loop)
++        idx++;
++        col++;
++        if (col >= tileN) { col = 0; row++; }
++      }
++    }
++  }
++
++  // Store accumulator from tensor memory to global memory
++  template <mem_layout dst_layout = row_major>
++  static __attribute__((always_inline)) void store_matrix_sync(void *dst, const fragment_acc &frag, size_t ldm) {
++    auto src = reinterpret_cast<const volatile output_t*>(frag.addr);
++    auto dst_ptr = reinterpret_cast<output_t*>(dst);
++
++    uint32_t lane = vx_thread_id();
++    constexpr uint32_t total_elements = tileM * tileN;
++    constexpr uint32_t elements_per_thread = total_elements / NT;
++
++    // Compute initial row/col once using div/mod, then increment
++    uint32_t idx = lane * elements_per_thread;
++    uint32_t row = idx / tileN;
++    uint32_t col = idx % tileN;
++
++    for (uint32_t i = 0; i < elements_per_thread; ++i) {
++      if constexpr (dst_layout == row_major) {
++        dst_ptr[row * ldm + col] = src[idx];
++      } else {
++        dst_ptr[col * ldm + row] = src[idx];
++      }
++      // Increment with wrap-around (avoids div/mod in loop)
++      idx++;
++      col++;
++      if (col >= tileN) { col = 0; row++; }
++    }
++  }
++
++  // UMMA: Matrix multiply-accumulate using tensor memory
++  // All data is in tensor memory, registers only hold addresses
++  static __attribute__((always_inline)) void mma_sync(
++      fragment_acc &fragD,
++      const fragment_a &fragA,
++      const fragment_b &fragB,
++      const fragment_acc &fragC) {
++
++    // Pass addresses in fixed integer registers (Register File): a0=A, a1=B, a2=C
++    register uintptr_t addr_a __asm__("a0") = static_cast<uintptr_t>(fragA.addr);
++    register uintptr_t addr_b __asm__("a1") = static_cast<uintptr_t>(fragB.addr);
++    register uintptr_t addr_c __asm__("a2") = static_cast<uintptr_t>(fragC.addr);
++    register uintptr_t addr_d __asm__("a0");  // Output address (not used, result stays in tensor memory)
++
++    // UMMA instruction encoding:
++    // - opcode = RISCV_CUSTOM0 (0x0b)
++    // - funct3 = 1 (WMMA uses funct3=0)
++    // - funct7 = 2
++    // - rd field = output format ID (Ot::id)
++    // - rs1 field = input format ID (It::id)
++    // - rs2 field = 0 (unused)
++    // - Addresses are in fixed registers a0, a1, a2 by convention (Register file)
++
++    // DEBUG: Use compile-time format IDs as literal values
++    static_assert(Ot::id >= 0 && Ot::id < 32, "Output format ID must fit in 5 bits");
++    static_assert(It::id >= 0 && It::id < 32, "Input format ID must fit in 5 bits");
++
++    // Build instruction word manually to ensure correct encoding
++    // R-type format: funct7[6:0] | rs2[4:0] | rs1[4:0] | funct3[2:0] | rd[4:0] | opcode[6:0]
++    constexpr uint32_t opcode = RISCV_CUSTOM0;
++    constexpr uint32_t funct3 = 1;
++    constexpr uint32_t funct7 = 2;
++    constexpr uint32_t rs2_val = 0;
++    constexpr uint32_t insn_word = (funct7 << 25) | (rs2_val << 20) | (It::id << 15) |
++                                   (funct3 << 12) | (Ot::id << 7) | opcode;
++
++    __asm__ volatile (
++      ".word %[insn]"
++      : "=r"(addr_d)
++      : [insn]"i"(insn_word),
++        "r"(addr_a), "r"(addr_b), "r"(addr_c)
++    );
++
++    // Result is written to tensor memory at addr_c location
++    fragD.addr = addr_c;
++  }
++};
++
+ } // namespace tensor
+ } // namespace vortex
+diff --git a/sim/common/tensor_cfg.h b/sim/common/tensor_cfg.h
+index 99136ae..591a367 100644
+--- a/sim/common/tensor_cfg.h
++++ b/sim/common/tensor_cfg.h
+@@ -173,5 +173,78 @@ public:
+   static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
+ };
+ 
++template <uint32_t NT,      // number of threads per warp
++          typename It = fp32, // input type (A,B)
++          typename Ot = fp32, // output type (C,D)
++          uint32_t XB = 4,  // vector element type size in bytes
++          uint32_t NR = 8,  // registers per fragment (TODO: what would this be for UMMA?)
++          uint32_t DP = 0   // Dot-Product Length (0 for auto)
++          >
++struct umma_config_t {
++private:
++  static constexpr uint32_t clog2(uint32_t x) {
++    return (x < 2) ? 0 : (1 + clog2(x / 2));
++  }
++  static constexpr uint32_t tile_cap = NT * NR;
++  static constexpr uint32_t lg_tile_cap = clog2(tile_cap);
++  static constexpr uint32_t tile_en = lg_tile_cap / 2;
++  static constexpr uint32_t tile_em = lg_tile_cap - tile_en;
++
++  static constexpr uint32_t block_cap = NT;
++  static constexpr uint32_t lg_block_cap = clog2(block_cap);
++  static constexpr uint32_t block_en = lg_block_cap / 2;
++  static constexpr uint32_t block_em = lg_block_cap - block_en;
++
++public:
++
++  static constexpr uint32_t i_ratio = XB / sizeof(typename It::dtype);
++  static constexpr uint32_t o_ratio = XB / sizeof(typename Ot::dtype);
++  static_assert(i_ratio * sizeof(typename It::dtype) == XB, "XB must be multiple of sizeof(It)");
++  static_assert(o_ratio * sizeof(typename Ot::dtype) == XB, "XB must be multiple of sizeof(Ot)");
++
++  static constexpr uint32_t xtileM = 1u << tile_em;
++  static constexpr uint32_t xtileN = 1u << tile_en;
++  static constexpr uint32_t xtileK = tile_cap / ((xtileM > xtileN) ? xtileM : xtileN);
++
++  static constexpr uint32_t tcM = 1u << block_em;
++  static constexpr uint32_t tcN = 1u << block_en;
++  static constexpr uint32_t tcK = (DP != 0) ? DP : (block_cap / ((tcM > tcN) ? tcM : tcN));
++
++  static constexpr uint32_t m_steps = xtileM / tcM;  // number of M steps per register
++  static constexpr uint32_t n_steps = xtileN / tcN;  // number of N steps per register
++  static constexpr uint32_t k_steps = xtileK / tcK;  // number of K steps per register
++
++  static constexpr uint32_t a_block_size = tcM * tcK;                 // size of A micro-tile
++  static constexpr uint32_t a_sub_blocks = block_cap / a_block_size;  // number of A micro-tiles per register
++  static constexpr uint32_t a_sub_steps  = m_steps / a_sub_blocks;    // number of A sub-steps per register
++
++  static constexpr uint32_t b_block_size = tcK * tcN;                 // size of B micro-tile
++  static constexpr uint32_t b_sub_blocks = block_cap / b_block_size;  // number of B micro-tiles per register
++  static constexpr uint32_t b_sub_steps  = n_steps / b_sub_blocks;    // number of B sub-steps per register
++
++  static constexpr uint32_t NRA = (xtileM * xtileK) / NT; // Number of A registers
++  static constexpr uint32_t NRB = (xtileN * xtileK) / NT; // Number of B registers
++  static constexpr uint32_t NRC = (xtileM * xtileN) / NT; // Number of C registers
++
++  static_assert((m_steps / a_sub_blocks) != 0, "tcK is too small for tile A");
++  static_assert((n_steps / b_sub_blocks) != 0, "tcK is too small for tile B");
++
++  static_assert((xtileM * xtileK <= tile_cap), "xtileM * xtileK <= tile_cap");
++  static_assert((xtileN * xtileK <= tile_cap), "xtileN * xtileK <= tile_cap");
++  static_assert((xtileM * xtileN <= tile_cap), "xtileM * xtileN <= tile_cap");
++
++  static_assert((tcM * tcK <= block_cap), "tcM * tcK <= block_cap");
++  static_assert((tcN * tcK <= block_cap), "tcN * tcK <= block_cap");
++  static_assert((tcM * tcN <= block_cap), "tcM * tcN <= block_cap");
++
++  static_assert((xtileM % tcM) == 0, "M,m divisibility");
++  static_assert((xtileN % tcN) == 0, "N,n divisibility");
++  static_assert((xtileK % tcK) == 0, "K,k divisibility");
++
++  static constexpr uint32_t tileM = xtileM;
++  static constexpr uint32_t tileN = xtileN;
++  static constexpr uint32_t tileK = xtileK * i_ratio; // Adjusted for input type size
++};
++
+ } // namespace tensor
+ } // namespace vortex
+\ No newline at end of file
+diff --git a/sim/opaesim/vortex_afu_shim.sv b/sim/opaesim/vortex_afu_shim.sv
+index 3c2ef27..2a0ed26 100644
+--- a/sim/opaesim/vortex_afu_shim.sv
++++ b/sim/opaesim/vortex_afu_shim.sv
+@@ -92,22 +92,53 @@ module vortex_afu_shim import local_mem_cfg_pkg::*; import ccip_if_pkg::*; (
+ t_if_ccip_Rx cp2af_sRxPort;
+ t_if_ccip_Tx af2cp_sTxPort;
+ 
++// Dummy wires for tensor memory interface (not used in shim)
++/* verilator lint_off UNUSEDSIGNAL */
++t_tensor_mem_data     avs_writedataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_data     avs_readdataT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_addr     avs_addressT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_waitrequestT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_writeT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_readT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_byte_mask avs_byteenableT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++t_tensor_mem_burst_cnt avs_burstcountT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++logic                 avs_readdatavalidT_dummy [`PLATFORM_MEMORY_NUM_BANKS];
++/* verilator lint_on UNUSEDSIGNAL */
++
++// Initialize unpacked arrays properly
++for (genvar i = 0; i < `PLATFORM_MEMORY_NUM_BANKS; ++i) begin : g_tmem_dummy
++    assign avs_readdataT_dummy[i] = '0;
++    assign avs_waitrequestT_dummy[i] = 1'b0;
++    assign avs_readdatavalidT_dummy[i] = 1'b0;
++end
++
+ vortex_afu #(
+-  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
++  .NUM_LOCAL_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS),
++  .NUM_TENSOR_MEM_BANKS(`PLATFORM_MEMORY_NUM_BANKS)
+ ) afu (
+     .clk(clk),
+     .reset(reset),
+     .cp2af_sRxPort(cp2af_sRxPort),
+     .af2cp_sTxPort(af2cp_sTxPort),
+-    .avs_writedata(avs_writedata),
+-    .avs_readdata(avs_readdata),
+-    .avs_address(avs_address),
+-    .avs_waitrequest(avs_waitrequest),
+-    .avs_write(avs_write),
+-    .avs_read(avs_read),
+-    .avs_byteenable(avs_byteenable),
+-    .avs_burstcount(avs_burstcount),
+-    .avs_readdatavalid(avs_readdatavalid)
++    .avs_writedataL(avs_writedata),
++    .avs_readdataL(avs_readdata),
++    .avs_addressL(avs_address),
++    .avs_waitrequestL(avs_waitrequest),
++    .avs_writeL(avs_write),
++    .avs_readL(avs_read),
++    .avs_byteenableL(avs_byteenable),
++    .avs_burstcountL(avs_burstcount),
++    .avs_readdatavalidL(avs_readdatavalid),
++    // Tensor memory pins - connect to dummy for now
++    .avs_writedataT(avs_writedataT_dummy),
++    .avs_readdataT(avs_readdataT_dummy),
++    .avs_addressT(avs_addressT_dummy),
++    .avs_waitrequestT(avs_waitrequestT_dummy),
++    .avs_writeT(avs_writeT_dummy),
++    .avs_readT(avs_readT_dummy),
++    .avs_byteenableT(avs_byteenableT_dummy),
++    .avs_burstcountT(avs_burstcountT_dummy),
++    .avs_readdatavalidT(avs_readdatavalidT_dummy)
+ );
+ 
+ t_if_ccip_c0_RxHdr c0_RxHdr;
+diff --git a/sim/simx/Makefile b/sim/simx/Makefile
+index 1eca622..c769e09 100644
+--- a/sim/simx/Makefile
++++ b/sim/simx/Makefile
+@@ -24,7 +24,7 @@ SRCS = $(SW_COMMON_DIR)/util.cpp $(SW_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softf
+ SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(SRC_DIR)/core.cpp $(SRC_DIR)/emulator.cpp
+ SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
+ SRCS += $(SRC_DIR)/execute.cpp $(SRC_DIR)/func_unit.cpp
+-SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
++SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/tensor_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
+ SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/types.cpp
+ 
+ # Add V extension sources
+diff --git a/sim/simx/arch.h b/sim/simx/arch.h
+index 6becf5c..09a4996 100644
+--- a/sim/simx/arch.h
++++ b/sim/simx/arch.h
+@@ -31,6 +31,7 @@ private:
+   uint16_t socket_size_;
+   uint16_t num_barriers_;
+   uint64_t local_mem_base_;
++  uint64_t tensor_mem_base_;
+ 
+ public:
+   Arch(uint16_t num_threads, uint16_t num_warps, uint16_t num_cores)   
+@@ -41,6 +42,7 @@ public:
+     , socket_size_(SOCKET_SIZE)
+     , num_barriers_(NUM_BARRIERS)
+     , local_mem_base_(LMEM_BASE_ADDR)
++    , tensor_mem_base_(TMEM_BASE_ADDR)
+   {}
+ 
+   uint16_t num_barriers() const {
+@@ -51,6 +53,10 @@ public:
+     return local_mem_base_;
+   }
+ 
++  uint64_t tensor_mem_base() const {
++    return tensor_mem_base_;
++  }
++
+   uint16_t num_threads() const {
+     return num_threads_;
+   }
+diff --git a/sim/simx/core.cpp b/sim/simx/core.cpp
+index 5579190..d52569d 100644
+--- a/sim/simx/core.cpp
++++ b/sim/simx/core.cpp
+@@ -79,6 +79,16 @@ Core::Core(const SimContext& ctx,
+     false
+   });
+ 
++  // create tensor memory
++  snprintf(sname, 100, "%s-tmem", this->name().c_str());
++  tensor_mem_ = TensorMem::Create(sname, TensorMem::Config{
++    (1 << TMEM_LOG_SIZE),
++    LSU_WORD_SIZE,      // or TMEM_WORD_SIZE if different
++    LSU_CHANNELS,      // number of banks/channels
++    log2ceil(TMEM_NUM_BANKS),
++    false
++  });
++
+   // create lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     snprintf(sname, 100, "%s-lmem_switch%d", this->name().c_str(), b);
+@@ -96,10 +106,27 @@ Core::Core(const SimContext& ctx,
+   snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
+   auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
+ 
++  // create tmem arbiter
++  snprintf(sname, 100, "%s-tmem_arb", this->name().c_str());
++  auto tmem_arb = LsuArbiter::Create(
++      sname,
++      ArbiterType::RoundRobin,
++      NUM_LSU_BLOCKS,    // one input per LSU block
++      1                  // single output
++  );
++
+   // create lmem adapter
+   snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
+   auto lsu_lmem_adapter = LsuMemAdapter::Create(sname, LSU_CHANNELS, 1);
+ 
++  // create tmem adapter
++  snprintf(sname, 100, "%s-lsu_tmem_adapter", this->name().c_str());
++  auto lsu_tmem_adapter = LsuMemAdapter::Create(
++      sname,
++      LSU_CHANNELS,     // physical channels
++      1                  // one input stream from arbiter
++  );
++
+   // connect lmem switch
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     lmem_switch_.at(b)->ReqDC.bind(&mem_coalescers_.at(b)->ReqIn);
+@@ -109,16 +136,32 @@ Core::Core(const SimContext& ctx,
+     lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
+   }
+ 
++  // connect tmem switch
++  for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
++    lmem_switch_.at(b)->ReqTmem.bind(&tmem_arb->ReqIn.at(b));
++    tmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspTmem);
++  }
++
+   // connect lmem arbiter
+   lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
+   lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
+ 
++  // connect tmem arbiter
++  tmem_arb->ReqOut.at(0).bind(&lsu_tmem_adapter->ReqIn);
++  lsu_tmem_adapter->RspIn.bind(&tmem_arb->RspOut.at(0));
++
+   // connect lmem adapter
+   for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
+     lsu_lmem_adapter->ReqOut.at(c).bind(&local_mem_->Inputs.at(c));
+     local_mem_->Outputs.at(c).bind(&lsu_lmem_adapter->RspOut.at(c));
+   }
+ 
++  // connect tmem adapter
++  for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
++    lsu_tmem_adapter->ReqOut.at(c).bind(&tensor_mem_->Inputs.at(c));
++    tensor_mem_->Outputs.at(c).bind(&lsu_tmem_adapter->RspOut.at(c));
++  }
++
+   // connect dcache coalescer
+   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
+     mem_coalescers_.at(b)->ReqOut.bind(&lsu_dcache_adapter.at(b)->ReqIn);
+diff --git a/sim/simx/core.h b/sim/simx/core.h
+index a8b674d..f6be86f 100644
+--- a/sim/simx/core.h
++++ b/sim/simx/core.h
+@@ -20,6 +20,7 @@
+ #include "pipeline.h"
+ #include "cache_sim.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ #include "ibuffer.h"
+ #include "scoreboard.h"
+ 
+@@ -147,6 +148,10 @@ public:
+     return local_mem_;
+   }
+ 
++  const TensorMem::Ptr& tensor_mem() const {
++    return tensor_mem_;
++  }
++
+   const MemCoalescer::Ptr& mem_coalescer(uint32_t idx) const {
+     return mem_coalescers_.at(idx);
+   }
+@@ -208,6 +213,7 @@ private:
+   std::vector<Dispatcher::Ptr> dispatchers_;
+   std::vector<FuncUnit::Ptr> func_units_;
+   LocalMem::Ptr local_mem_;
++  TensorMem::Ptr tensor_mem_;
+   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
+   std::vector<MemCoalescer::Ptr> mem_coalescers_;
+ 
+diff --git a/sim/simx/decode.cpp b/sim/simx/decode.cpp
+index 65e2abd..2106ebe 100644
+--- a/sim/simx/decode.cpp
++++ b/sim/simx/decode.cpp
+@@ -1140,6 +1140,31 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
+           }
+         }
+       } break;
++      case 1: { // UMMA - Unified MMA with tensor memory addresses
++        // For UMMA:
++        // - rd field: output format ID (fmt_d)
++        // - rs1 field: input format ID (fmt_s)
++        // - Addresses come from fixed integer registers:
++        //   a0 = A tile address, a1 = B tile address, a2 = C/D tile address
++        // Unlike WMMA, UMMA processes the entire tile at once, so we generate
++        // only ONE instruction (no micro-stepping through k/m/n).
++        uint32_t fmt_d = rd;
++        uint32_t fmt_s = rs1;
++        // Fixed register indices for addresses (a0=10, a1=11, a2=12)
++        constexpr uint32_t reg_addr_a = 10;  // a0
++        constexpr uint32_t reg_addr_b = 11;  // a1
++        constexpr uint32_t reg_addr_c = 12;  // a2
++
++        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
++        instr->setOpType(TcuType::UMMA);
++        instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, 0, 0});  // step_m=0, step_n=0 (only step)
++        // Use fixed integer registers for addresses
++        instr->setDestReg(reg_addr_c, RegType::Integer);  // D address (same as C)
++        instr->setSrcReg(0, reg_addr_a, RegType::Integer);  // A address
++        instr->setSrcReg(1, reg_addr_b, RegType::Integer);  // B address
++        instr->setSrcReg(2, reg_addr_c, RegType::Integer);  // C address
++        ibuffer.push_back(instr);
++      } break;
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/emulator.cpp b/sim/simx/emulator.cpp
+index 3eb62f9..82d96b6 100644
+--- a/sim/simx/emulator.cpp
++++ b/sim/simx/emulator.cpp
+@@ -27,6 +27,7 @@
+ #include "cluster.h"
+ #include "processor_impl.h"
+ #include "local_mem.h"
++#include "tensor_mem.h"
+ 
+ using namespace vortex;
+ 
+@@ -313,6 +314,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     try
+     {
+@@ -331,6 +334,8 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
+   auto type = get_addr_type(addr);
+   if (type == AddrType::Shared) {
+     core_->local_mem()->read(data, addr, size);
++  } else if (type == AddrType::Tensor) {
++    core_->tensor_mem()->read(data, addr, size);
+   } else {
+     mmu_.read(data, addr, size, 0);
+   }
+@@ -348,6 +353,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       try
+       {
+@@ -372,6 +379,8 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
+   } else {
+     if (type == AddrType::Shared) {
+       core_->local_mem()->write(data, addr, size);
++    } else if (type == AddrType::Tensor) {
++      core_->tensor_mem()->write(data, addr, size);
+     } else {
+       mmu_.write(data, addr, size, 0);
+     }
+@@ -461,6 +470,7 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
+   case VX_CSR_NUM_WARPS:  return arch_.num_warps();
+   case VX_CSR_NUM_CORES:  return uint32_t(arch_.num_cores()) * arch_.num_clusters();
+   case VX_CSR_LOCAL_MEM_BASE: return arch_.local_mem_base();
++  case VX_CSR_TENSOR_MEM_BASE: return arch_.tensor_mem_base();
+   case VX_CSR_MSCRATCH:   return csr_mscratch_;
+ 
+   CSR_READ_64(VX_CSR_MCYCLE, core_perf.cycles);
+diff --git a/sim/simx/execute.cpp b/sim/simx/execute.cpp
+index 6155027..557381c 100644
+--- a/sim/simx/execute.cpp
++++ b/sim/simx/execute.cpp
+@@ -1479,6 +1479,15 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
+         tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+         rd_write = true;
+       } break;
++      case TcuType::UMMA: {
++        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
++        trace->data = trace_data;
++        assert(warp.tmask.count() == num_threads);
++        // For UMMA, registers contain addresses to tensor memory
++        // TODO: Print rs1_data, rs2_data, rs3_data as addresses for DEBUG
++        tensor_unit_->umma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
++        rd_write = true;
++      } break;
+       default:
+         std::abort();
+       }
+diff --git a/sim/simx/processor.cpp b/sim/simx/processor.cpp
+index d3b730d..840bae0 100644
+--- a/sim/simx/processor.cpp
++++ b/sim/simx/processor.cpp
+@@ -92,6 +92,7 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
+             << ", num_clusters=" << arch.num_clusters()
+             << ", socket_size=" << arch.socket_size()
+             << ", local_mem_base=0x" << std::hex << arch.local_mem_base() << std::dec
++            << ", tensor_mem_base=0x" << std::hex << arch.tensor_mem_base() << std::dec
+             << ", num_barriers=" << arch.num_barriers()
+             << std::endl;
+ #endif
+diff --git a/sim/simx/tensor_mem.cpp b/sim/simx/tensor_mem.cpp
+new file mode 100644
+index 0000000..00ea555
+--- /dev/null
++++ b/sim/simx/tensor_mem.cpp
+@@ -0,0 +1,131 @@
++#include "tensor_mem.h"
++#include "core.h"
++#include <bitmanip.h>
++#include <vector>
++#include "types.h"
++
++using namespace vortex;
++
++class TensorMem::Impl {
++protected:
++	TensorMem* simobject_;
++	Config    config_;
++	RAM       ram_;
++	uint32_t 	line_bits_;
++	MemCrossBar::Ptr mem_xbar_;
++	mutable PerfStats perf_stats_;
++
++	uint64_t to_local_addr(uint64_t addr) {
++		// Convert global TMEM address to local byte offset within the RAM
++		// Note: addr is expected to be in [TMEM_BASE_ADDR, TMEM_BASE_ADDR + capacity)
++		uint64_t local = addr - TMEM_BASE_ADDR;
++		// Ensure the local address is within capacity bounds
++		return local & (config_.capacity - 1);  // Assumes capacity is power of 2
++	}
++
++public:
++	Impl(TensorMem* simobject, const Config& config)
++		: simobject_(simobject)
++		, config_(config)
++		, ram_(config.capacity)
++	{
++		uint32_t total_lines = config.capacity / config.line_size;
++		line_bits_ = log2ceil(total_lines);
++
++		char sname[100];
++		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
++		uint32_t lg2_line_size = log2ceil(config_.line_size);
++		uint32_t num_banks = 1 << config.B;
++		mem_xbar_ = MemCrossBar::Create(sname, ArbiterType::Priority, config.num_reqs, num_banks,
++		 [lg2_line_size, num_banks](const MemCrossBar::ReqType& req) {
++    	// Custom logic to calculate the output index using bank interleaving
++			return (uint32_t)((req.addr >> lg2_line_size) & (num_banks-1));
++		});
++		for (uint32_t i = 0; i < config.num_reqs; ++i) {
++			simobject->Inputs.at(i).bind(&mem_xbar_->ReqIn.at(i));
++			mem_xbar_->RspIn.at(i).bind(&simobject->Outputs.at(i));
++		}
++	}
++
++	virtual ~Impl() {}
++
++	void reset() {
++		perf_stats_ = PerfStats();
++	}
++
++	void read(void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem Read: addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.read(data, l_addr, size);
++	}
++
++	void write(const void* data, uint64_t addr, uint32_t size) {
++		auto l_addr = to_local_addr(addr);
++		DPH(3, "Tensor Mem Write: addr=0x" << std::hex << l_addr << std::dec << std::endl);
++		ram_.write(data, l_addr, size);
++	}
++
++	void tick() {
++		// process bank requets from xbar
++		uint32_t num_banks = (1 << config_.B);
++		for (uint32_t i = 0; i < num_banks; ++i) {
++			auto& xbar_req_out = mem_xbar_->ReqOut.at(i);
++			if (xbar_req_out.empty())
++				continue;
++
++			auto& bank_req = xbar_req_out.front();
++			DT(4, simobject_->name() << "-bank" << i << "-req : " << bank_req);
++
++			if (!bank_req.write || config_.write_reponse) {
++				// send xbar response
++				MemRsp bank_rsp{bank_req.tag, bank_req.cid, bank_req.uuid};
++				mem_xbar_->RspOut.at(i).push(bank_rsp);
++			}
++
++			// update perf counters
++			perf_stats_.reads += !bank_req.write;
++			perf_stats_.writes += bank_req.write;
++
++			// remove input
++			xbar_req_out.pop();
++		}
++	}
++
++	const PerfStats& perf_stats() const {
++		perf_stats_.bank_stalls = mem_xbar_->collisions();
++		return perf_stats_;
++	}
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++TensorMem::TensorMem(const SimContext& ctx, const char* name, const Config& config)
++	: SimObject<TensorMem>(ctx, name)
++	, Inputs(config.num_reqs, this)
++	, Outputs(config.num_reqs, this)
++	, impl_(new Impl(this, config))
++{}
++
++TensorMem::~TensorMem() {
++  delete impl_;
++}
++
++void TensorMem::reset() {
++  impl_->reset();
++}
++
++void TensorMem::read(void* data, uint64_t addr, uint32_t size) {
++  impl_->read(data, addr, size);
++}
++
++void TensorMem::write(const void* data, uint64_t addr, uint32_t size) {
++  impl_->write(data, addr, size);
++}
++
++void TensorMem::tick() {
++  impl_->tick();
++}
++
++const TensorMem::PerfStats& TensorMem::perf_stats() const {
++  return impl_->perf_stats();
++}
+\ No newline at end of file
+diff --git a/sim/simx/tensor_mem.h b/sim/simx/tensor_mem.h
+new file mode 100644
+index 0000000..c4cda78
+--- /dev/null
++++ b/sim/simx/tensor_mem.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <simobject.h>
++#include "types.h"
++
++namespace vortex {
++
++class TensorMem : public SimObject<TensorMem> {
++public:
++  struct Config {
++    uint32_t capacity;
++    uint32_t line_size;
++    uint32_t num_reqs;
++    uint32_t B; // log2 number of banks
++    bool write_reponse;
++  };
++
++  struct PerfStats {
++    uint64_t reads;
++    uint64_t writes;
++    uint64_t bank_stalls;
++
++    PerfStats()
++      : reads(0)
++      , writes(0)
++      , bank_stalls(0)
++    {}
++
++    PerfStats& operator+=(const PerfStats& rhs) {
++      this->reads += rhs.reads;
++      this->writes += rhs.writes;
++      this->bank_stalls += rhs.bank_stalls;
++      return *this;
++    }
++  };
++
++  std::vector<SimPort<MemReq>> Inputs;
++  std::vector<SimPort<MemRsp>> Outputs;
++
++  TensorMem(const SimContext& ctx, const char* name, const Config& config);
++  virtual ~TensorMem();
++
++  void reset();
++
++  void read(void* data, uint64_t addr, uint32_t size);
++
++  void write(const void* data, uint64_t addr, uint32_t size);
++
++  void tick();
++
++  const PerfStats& perf_stats() const;
++
++protected:
++
++  class Impl;
++  Impl* impl_;
++};
++
++}
+diff --git a/sim/simx/tensor_unit.cpp b/sim/simx/tensor_unit.cpp
+index e6cf4a3..b3397de 100644
+--- a/sim/simx/tensor_unit.cpp
++++ b/sim/simx/tensor_unit.cpp
+@@ -16,11 +16,14 @@
+ #include "tensor_cfg.h"
+ #include <rvfloats.h>
+ #include "core.h"
++#include "tensor_mem.h"
+ 
+ using namespace vortex;
+ 
+ namespace vt = vortex::tensor;
+ using cfg = vt::wmma_config_t<NUM_THREADS>;
++// UMMA config for fp16 input, fp32 output
++using umma_cfg_fp16_fp32 = vt::umma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
+ 
+ inline uint64_t nan_box(uint32_t value) {
+   return value | 0xffffffff00000000;
+@@ -161,6 +164,119 @@ struct FEDP<vt::uint4, vt::int32>{
+ 
+ using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
+ 
++// Get type size in bytes from format ID
++static uint32_t get_type_bytes(uint32_t fmt) {
++  switch (fmt) {
++  case vt::fp32::id:  return sizeof(float);
++  case vt::fp16::id:  return sizeof(uint16_t);
++  case vt::bf16::id:  return sizeof(uint16_t);
++  case vt::tf32::id:  return sizeof(uint32_t);
++  case vt::int32::id: return sizeof(int32_t);
++  case vt::int8::id:  return sizeof(int8_t);
++  case vt::uint8::id: return sizeof(uint8_t);
++  case vt::int4::id:  return 1;  // 4-bit packed, but minimum addressable is 1 byte
++  case vt::uint4::id: return 1;
++  default:
++    std::cout << "Error: unknown format type: " << fmt << std::endl;
++    std::abort();
++  }
++}
++
++// Template to execute UMMA for specific input/output types
++template <typename It, typename Ot>
++static void execute_umma(const std::shared_ptr<TensorMem>& tensor_mem,
++                         uint64_t addr_a, uint64_t addr_b, uint64_t addr_c,
++                         uint32_t tileM, uint32_t tileN, uint32_t tileK) {
++  using itype = typename It::dtype;
++  using otype = typename Ot::dtype;
++
++  uint32_t a_bytes = tileM * tileK * sizeof(itype);
++  uint32_t b_bytes = tileK * tileN * sizeof(itype);
++  uint32_t c_bytes = tileM * tileN * sizeof(otype);
++
++  std::vector<itype> a_tile(tileM * tileK);
++  std::vector<itype> b_tile(tileK * tileN);
++  std::vector<otype> c_tile(tileM * tileN);
++  std::vector<otype> d_tile(tileM * tileN);
++
++  tensor_mem->read(a_tile.data(), addr_a, a_bytes);
++  tensor_mem->read(b_tile.data(), addr_b, b_bytes);
++  tensor_mem->read(c_tile.data(), addr_c, c_bytes);
++
++  // Matrix multiply: D[m][n] = C[m][n] + sum_k(A[m][k] * B[k][n])
++  for (uint32_t m = 0; m < tileM; ++m) {
++    for (uint32_t n = 0; n < tileN; ++n) {
++      uint32_t c_idx = m * tileN + n;
++      otype acc = c_tile[c_idx];
++
++      for (uint32_t k = 0; k < tileK; ++k) {
++        uint32_t a_idx = m * tileK + k;
++        uint32_t b_idx = k * tileN + n;
++        acc = FMA<It, Ot>::eval(a_tile[a_idx], b_tile[b_idx], acc);
++      }
++
++      d_tile[c_idx] = acc;
++    }
++  }
++
++  tensor_mem->write(d_tile.data(), addr_c, c_bytes);
++}
++
++// Function pointer type for UMMA executor
++using PFN_UMMA = void (*)(const std::shared_ptr<TensorMem>&, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
++
++// Select the appropriate UMMA executor based on format types
++static PFN_UMMA select_UMMA(uint32_t IT, uint32_t OT) {
++  switch (OT) {
++  case vt::fp32::id:
++    switch (IT) {
++    case vt::fp16::id:
++      return execute_umma<vt::fp16, vt::fp32>;
++    case vt::bf16::id:
++      return execute_umma<vt::bf16, vt::fp32>;
++    case vt::tf32::id:
++      return execute_umma<vt::tf32, vt::fp32>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::fp16::id:
++    switch (IT) {
++    case vt::fp16::id:
++      return execute_umma<vt::fp16, vt::fp16>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::bf16::id:
++    switch (IT) {
++    case vt::bf16::id:
++      return execute_umma<vt::bf16, vt::bf16>;
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  case vt::int32::id:
++    switch (IT) {
++    case vt::int8::id:
++      return execute_umma<vt::int8, vt::int32>;
++    case vt::uint8::id:
++      return execute_umma<vt::uint8, vt::int32>;
++    // Note: int4/uint4 would need special handling for packed 4-bit values
++    default:
++      std::cout << "UMMA: unsupported format: " << IT << " -> " << OT << std::endl;
++      std::abort();
++    }
++    break;
++  default:
++    std::cout << "UMMA: unsupported output type: " << OT << std::endl;
++    std::abort();
++  }
++}
++
+ static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
+   switch (OT) {
+   case vt::fp32::id:
+@@ -246,6 +362,9 @@ public:
+       case TcuType::WMMA:
+         delay = 4;
+         break;
++      case TcuType::UMMA:
++        delay = 8; // Higher latency due to tensor memory access
++        break;
+       default:
+         std::abort();
+       }
+@@ -296,6 +415,70 @@ public:
+     }
+   }
+ 
++  // UMMA: Unified Matrix Multiply-Accumulate with Tensor Memory
++  // Registers contain addresses pointing to data in tensor memory
++  // Unlike WMMA (which processes one micro-tile per instruction), UMMA processes
++  // the entire tile in one instruction by loading from tensor memory.
++  //
++  // Tensor memory layout (from kernel):
++  // - A: tileM x tileK elements in input_t, row-major
++  // - B: tileK x tileN elements in input_t, row-major
++  // - C: tileM x tileN elements in output_t, row-major
++  //
++  // Where tileK = xtileK * i_ratio (i_ratio = 32bits / input_bits)
++  void umma(uint32_t wid,
++            uint32_t fmt_s,
++            uint32_t fmt_d,
++            uint32_t step_m,
++            uint32_t step_n,
++            const std::vector<reg_data_t>& rs1_data,
++            const std::vector<reg_data_t>& rs2_data,
++            const std::vector<reg_data_t>& rs3_data,
++            std::vector<reg_data_t>& rd_data,
++            ExeTraceData* trace_data) {
++    __unused(wid);
++    __unused(trace_data);
++    __unused(step_m);  // Always 0 - UMMA generates only one instruction
++    __unused(step_n);  // Always 0 - UMMA generates only one instruction
++
++    auto tensor_mem = core_->tensor_mem();
++
++    // Get base addresses from registers
++    uint64_t addr_a = rs1_data[0].u32;
++    uint64_t addr_b = rs2_data[0].u32;
++    uint64_t addr_c = rs3_data[0].u32;
++
++    DTH(3, "UMMA: wid=" << wid);
++    DTN(3, ", fmt_s=" << fmt_s << ", fmt_d=" << fmt_d);
++    DTN(3, ", addr_a=0x" << std::hex << addr_a);
++    DTN(3, ", addr_b=0x" << addr_b);
++    DTN(3, ", addr_c=0x" << addr_c << std::dec << std::endl);
++
++    // Calculate tile dimensions based on format types
++    // Base tile dimensions (for 32-bit types)
++    constexpr uint32_t xtileM = cfg::xtileM;  // 8
++    constexpr uint32_t xtileN = cfg::xtileN;  // 4
++    constexpr uint32_t xtileK = cfg::xtileK;  // 4
++
++    // Adjust K dimension based on input type size
++    // i_ratio = 4 bytes / input_type_bytes (e.g., 2 for fp16, 4 for int8)
++    uint32_t input_bytes = get_type_bytes(fmt_s);
++    uint32_t i_ratio = 4 / input_bytes;
++    uint32_t tileK = xtileK * i_ratio;
++
++    DTN(3, ", tileM=" << xtileM << ", tileN=" << xtileN << ", tileK=" << tileK << std::endl);
++
++    // Get the appropriate UMMA executor for this format combination
++    auto umma_fn = select_UMMA(fmt_s, fmt_d);
++    umma_fn(tensor_mem, addr_a, addr_b, addr_c, xtileM, xtileN, tileK);
++
++    // Return the C/D address to ALL threads
++    // All threads in the warp execute the UMMA instruction together
++    for (size_t t = 0; t < rd_data.size(); ++t) {
++      rd_data[t].u32 = static_cast<uint32_t>(addr_c);
++    }
++  }
++
+   const PerfStats& perf_stats() const {
+     return perf_stats_;
+   }
+@@ -315,6 +498,9 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
+   case TcuType::WMMA:
+     return {"WMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
+              + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
++  case TcuType::UMMA:
++    return {"UMMA." + std::string(vt::fmt_string(args.fmt_s)) + "." + std::string(vt::fmt_string(args.fmt_d))
++             + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n), ""};
+   default:
+     std::abort();
+   }
+@@ -356,4 +542,17 @@ void TensorUnit::wmma(uint32_t wid,
+                       std::vector<reg_data_t>& rd_data,
+                       ExeTraceData* trace_data) {
+   impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
++}
++
++void TensorUnit::umma(uint32_t wid,
++                      uint32_t fmt_s,
++                      uint32_t fmt_d,
++                      uint32_t step_m,
++                      uint32_t step_n,
++                      const std::vector<reg_data_t>& rs1_data,
++                      const std::vector<reg_data_t>& rs2_data,
++                      const std::vector<reg_data_t>& rs3_data,
++                      std::vector<reg_data_t>& rd_data,
++                      ExeTraceData* trace_data) {
++  impl_->umma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+ }
+\ No newline at end of file
+diff --git a/sim/simx/tensor_unit.h b/sim/simx/tensor_unit.h
+index 87cf8f6..8a63420 100644
+--- a/sim/simx/tensor_unit.h
++++ b/sim/simx/tensor_unit.h
+@@ -63,6 +63,22 @@ public:
+ 					  std::vector<reg_data_t>& rd_data,
+ 					  ExeTraceData* trace_data);
+ 
++	// UMMA: Registers contain addresses to tensor memory, not actual data
++	// rs1_data: addresses for matrix A tiles in tensor memory
++	// rs2_data: addresses for matrix B tiles in tensor memory
++	// rs3_data: addresses for accumulator C tiles in tensor memory
++	// rd_data: addresses for output D tiles in tensor memory (can be same as C)
++	void umma(uint32_t wid,
++				    uint32_t fmt_s,
++						uint32_t fmt_d,
++				    uint32_t step_m,
++						uint32_t step_n,
++	          const std::vector<reg_data_t>& rs1_data,
++					  const std::vector<reg_data_t>& rs2_data,
++					  const std::vector<reg_data_t>& rs3_data,
++					  std::vector<reg_data_t>& rd_data,
++					  ExeTraceData* trace_data);
++
+ 	const PerfStats& perf_stats() const;
+ 
+ private:
+diff --git a/sim/simx/types.cpp b/sim/simx/types.cpp
+index 56bf60c..b6c500d 100644
+--- a/sim/simx/types.cpp
++++ b/sim/simx/types.cpp
+@@ -24,6 +24,8 @@ LocalMemSwitch::LocalMemSwitch(
+   , RspIn(this)
+   , ReqLmem(this)
+   , RspLmem(this)
++  , ReqTmem(this)
++  , RspTmem(this)
+   , ReqDC(this)
+   , RspDC(this)
+   , delay_(delay)
+@@ -39,6 +41,12 @@ void LocalMemSwitch::tick() {
+     RspIn.push(out_rsp, 1);
+     RspLmem.pop();
+   }
++  if (!RspTmem.empty()) {
++    auto& out_rsp = RspTmem.front();
++    DT(4, this->name() << "-tmem-rsp: " << out_rsp);
++    RspIn.push(out_rsp, 1);
++    RspTmem.pop();
++  }
+   if (!RspDC.empty()) {
+     auto& out_rsp = RspDC.front();
+     DT(4, this->name() << "-dc-rsp: " << out_rsp);
+@@ -57,14 +65,21 @@ void LocalMemSwitch::tick() {
+     out_dc_req.uuid  = in_req.uuid;
+ 
+     LsuReq out_lmem_req(out_dc_req);
++    LsuReq out_tmem_req(out_dc_req);
+ 
+     for (uint32_t i = 0; i < in_req.mask.size(); ++i) {
+       if (in_req.mask.test(i)) {
+         auto type = get_addr_type(in_req.addrs.at(i));
+         if (type == AddrType::Shared) {
++          // LMEM
+           out_lmem_req.mask.set(i);
+           out_lmem_req.addrs.at(i) = in_req.addrs.at(i);
++        } else if (type == AddrType::Tensor) {
++          // TMEM
++          out_tmem_req.mask.set(i);
++          out_tmem_req.addrs.at(i) = in_req.addrs.at(i);
+         } else {
++          // default: global / dcache
+           out_dc_req.mask.set(i);
+           out_dc_req.addrs.at(i) = in_req.addrs.at(i);
+         }
+@@ -80,6 +95,12 @@ void LocalMemSwitch::tick() {
+       ReqLmem.push(out_lmem_req, delay_);
+       DT(4, this->name() << "-lmem-req: " << out_lmem_req);
+     }
++
++    if (!out_tmem_req.mask.none()) {
++      ReqTmem.push(out_tmem_req, delay_);
++      DT(4, this->name() << "-tmem-req: " << out_tmem_req);
++    }
++
+     ReqIn.pop();
+   }
+ }
+diff --git a/sim/simx/types.h b/sim/simx/types.h
+index 70be5ac..6c5ab35 100644
+--- a/sim/simx/types.h
++++ b/sim/simx/types.h
+@@ -643,6 +643,7 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
+ 
+ enum class TcuType {
+   WMMA,
++  UMMA,
+ };
+ 
+ struct IntrTcuArgs {
+@@ -655,6 +656,7 @@ struct IntrTcuArgs {
+ inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
+   switch (type) {
+   case TcuType::WMMA: os << "WMMA"; break;
++  case TcuType::UMMA: os << "UMMA"; break;
+   default:
+     assert(false);
+   }
+@@ -708,7 +710,8 @@ using IntrArgs = std::variant<
+ enum class AddrType {
+   Global,
+   Shared,
+-  IO
++  IO,
++  Tensor
+ };
+ 
+ inline AddrType get_addr_type(uint64_t addr) {
+@@ -720,6 +723,12 @@ inline AddrType get_addr_type(uint64_t addr) {
+         return AddrType::Shared;
+     }
+   }
++  if (EXT_TCU_ENABLED) {
++    // Use offset comparison to avoid 32-bit overflow in TMEM_END_ADDR calculation
++    if (addr >= TMEM_BASE_ADDR && (addr - TMEM_BASE_ADDR) < TMEM_SIZE) {
++      return AddrType::Tensor;
++    }
++  }
+   return AddrType::Global;
+ }
+ 
+@@ -728,6 +737,7 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
+   case AddrType::Global: os << "Global"; break;
+   case AddrType::Shared: os << "Shared"; break;
+   case AddrType::IO:     os << "IO"; break;
++  case AddrType::Tensor: os << "Tensor"; break;
+   default: assert(false);
+   }
+   return os;
+@@ -1580,6 +1590,9 @@ public:
+   SimPort<LsuReq> ReqLmem;
+   SimPort<LsuRsp> RspLmem;
+ 
++  SimPort<LsuReq> ReqTmem;
++  SimPort<LsuRsp> RspTmem;
++
+   SimPort<LsuReq> ReqDC;
+   SimPort<LsuRsp> RspDC;
+ 
+diff --git a/tests/regression/final/Makefile b/tests/regression/final/Makefile
+new file mode 100644
+index 0000000..f80fd0f
+--- /dev/null
++++ b/tests/regression/final/Makefile
+@@ -0,0 +1,16 @@
++ROOT_DIR := $(realpath ../../..)
++include $(ROOT_DIR)/config.mk
++
++PROJECT := final
++
++SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
++
++SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp
++
++VX_SRCS := $(SRC_DIR)/kernel.cpp
++
++CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
++
++LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
++
++include ../common.mk
+diff --git a/tests/regression/final/common.h b/tests/regression/final/common.h
+new file mode 100644
+index 0000000..f2cfc72
+--- /dev/null
++++ b/tests/regression/final/common.h
+@@ -0,0 +1,33 @@
++#ifndef _COMMON_H_
++#define _COMMON_H_
++
++#include <stdint.h>
++#include <VX_config.h>
++
++#ifndef NUM_THREADS
++#define NUM_THREADS 4
++#endif
++
++#ifndef ITYPE
++#define ITYPE fp16
++#endif
++
++#ifndef OTYPE
++#define OTYPE fp32
++#endif
++
++// Tensor memory base address for accumulator storage
++#ifndef TMEM_ACCUM_BASE
++#define TMEM_ACCUM_BASE TMEM_BASE_ADDR
++#endif
++
++typedef struct {
++  uint32_t grid_dim[2];
++  uint32_t block_dim[2];
++  uint32_t M, N, K;
++  uint64_t A_addr;
++  uint64_t B_addr;
++  uint64_t C_addr;
++} kernel_arg_t;
++
++#endif
+diff --git a/tests/regression/final/kernel.cpp b/tests/regression/final/kernel.cpp
+new file mode 100644
+index 0000000..b859061
+--- /dev/null
++++ b/tests/regression/final/kernel.cpp
+@@ -0,0 +1,84 @@
++#include "common.h"
++#include <vx_spawn.h>
++#include <vx_tensor.h>
++#include <vx_print.h>
++
++namespace vt = vortex::tensor;
++
++// Software fp16 to fp32 conversion for verification
++// IEEE 754 half-precision: 1 sign, 5 exponent, 10 mantissa
++// Use UMMA context - registers hold addresses to tensor memory
++using ctx = vt::umma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
++  auto pA = reinterpret_cast<ctx::input_t *>(arg->A_addr);
++  auto pB = reinterpret_cast<ctx::input_t *>(arg->B_addr);
++  auto pC = reinterpret_cast<ctx::output_t *>(arg->C_addr);
++
++  uint32_t M = arg->M;
++  uint32_t N = arg->N;
++  uint32_t K = arg->K;
++
++  // Fragments simply contain tensor memory addresses
++  ctx::fragment_a   tmemA;
++  ctx::fragment_b   tmemB;
++  ctx::fragment_acc tmemC;
++
++  // calculate tile row & column based on block index
++  uint32_t tile_row = blockIdx.y * ctx::tileM;
++  uint32_t tile_col = blockIdx.x * ctx::tileN;
++
++  // Calculate unique tensor memory addresses for this block's tiles
++  uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
++  
++  // Layout in tensor memory:
++  // - A tiles: starts at TMEM_BASE_ADDR
++  // - B tiles: after A tiles
++  // - C/D accumulators: after B tiles
++  uint32_t a_tile_size = sizeof(ctx::input_t) * ctx::tileM * ctx::tileK;
++  uint32_t b_tile_size = sizeof(ctx::input_t) * ctx::tileK * ctx::tileN;
++  uint32_t c_tile_size = sizeof(ctx::output_t) * ctx::tileM * ctx::tileN;
++
++  // Each block gets its own region in tensor memory
++  uint64_t block_tmem_base = TMEM_ACCUM_BASE + block_id * (a_tile_size + b_tile_size + c_tile_size);
++
++  // Set fragment addresses to point to tensor memory locations
++  ctx::set_fragment_addr(tmemA, reinterpret_cast<void*>(block_tmem_base));
++  ctx::set_fragment_addr(tmemB, reinterpret_cast<void*>(block_tmem_base + a_tile_size));
++  ctx::set_fragment_addr(tmemC, reinterpret_cast<void*>(block_tmem_base + a_tile_size + b_tile_size));
++
++  // Initialize accumulator in tensor memory to zero
++  ctx::fill_fragment(tmemC, 0);
++
++  // Counters for MMA verification
++
++  for (uint32_t i = 0; i < K; i += ctx::tileK) {
++    auto pTileA = pA + tile_row * K + i;
++
++    // Load A tile from global memory to tensor memory
++    ctx::load_matrix_sync(tmemA, pTileA, K);
++
++    // Load B tile
++    if constexpr (vt::ITYPE::bits < 8) {
++      // For sub-byte matrix B must be in col-major format
++      auto pTileB = pB + tile_col * K + i;
++      ctx::load_matrix_sync<vt::col_major>(tmemB, pTileB, K);
++    } else {
++      auto pTileB = pB + i * N + tile_col;
++      ctx::load_matrix_sync(tmemB, pTileB, N);
++    }
++
++    // MMA; All data stays in tensor memory, only addresses in registers
++    ctx::mma_sync(tmemC, tmemA, tmemB, tmemC);
++
++  }
++
++  // Store the computed C tile from tensor memory to global memory
++  auto pTileC = pC + tile_row * N + tile_col;
++  ctx::store_matrix_sync(pTileC, tmemC, N);
++}
++
++int main() {
++  auto arg = (kernel_arg_t *)csr_read(VX_CSR_MSCRATCH);
++  return vx_spawn_threads(2, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)kernel_body, arg);
++}
+diff --git a/tests/regression/final/main.cpp b/tests/regression/final/main.cpp
+new file mode 100644
+index 0000000..d3356c9
+--- /dev/null
++++ b/tests/regression/final/main.cpp
+@@ -0,0 +1,689 @@
++#include "common.h"
++#include <chrono>
++#include <cmath>
++#include <iostream>
++#include <rvfloats.h>
++#include <string.h>
++#include <tensor_cfg.h>
++#include <unistd.h>
++#include <util.h>
++#include <vector>
++#include <vortex.h>
++
++#define FLOAT_ULP 6
++#define MAX_ERRORS 100
++
++#define RT_CHECK(_expr)                                      \
++  do {                                                       \
++    int _ret = _expr;                                        \
++    if (0 == _ret)                                           \
++      break;                                                 \
++    printf("Error: '%s' returned %d!\n", #_expr, (int)_ret); \
++    cleanup();                                               \
++    exit(-1);                                                \
++  } while (false)
++
++using namespace vortex;
++namespace vt = tensor;
++
++static bool g_enable_sparse = false;
++///////////////////////////////////////////////////////////////////////////////
++
++static void convert_row_to_col_major_4bit(uint8_t *dst, uint32_t width, uint32_t height, const uint8_t *src) {
++  // Calculate output size and stride
++  uint32_t out_bytes = (width * height + 1) / 2;
++  memset(dst, 0, out_bytes);
++  uint32_t dst_stride = (height + 1) / 2; // Bytes per column in output
++
++  // For each column in source (which becomes row in destination)
++  for (uint32_t c = 0; c < width; ++c) {
++    uint32_t base = c * dst_stride;
++
++    // For each row in source (which becomes column in destination)
++    for (uint32_t r = 0; r < height; r += 2) {
++      // Calculate source indices (row-major)
++      uint32_t idx_even = r * width + c;
++      uint32_t idx_odd = (r + 1) * width + c;
++
++      // Extract nibbles - consistent with data_accessor_t
++      uint8_t b_even = src[idx_even / 2];
++      uint8_t b_odd = (r + 1 < height) ? src[idx_odd / 2] : 0;
++
++      uint8_t nib_even = (idx_even & 1) ? (b_even >> 4) : (b_even & 0x0F);
++      uint8_t nib_odd = (r + 1 < height)
++                            ? ((idx_odd & 1) ? (b_odd >> 4) : (b_odd & 0x0F))
++                            : 0;
++
++      // Pack into destination: even row in low nibble, odd row in high nibble
++      dst[base + r / 2] = (nib_odd << 4) | nib_even;
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename T>
++struct data_accessor_t {
++  using Type = typename T::dtype;
++  static Type read(const Type *ptr, uint32_t offset) {
++    return ptr[offset];
++  }
++  static void write(Type *ptr, uint32_t offset, Type value) {
++    ptr[offset] = value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::int4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++template <>
++struct data_accessor_t<vt::uint4> {
++  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t value8 = ptr[row_off];
++    return odd ? (value8 >> 4) : (value8 & 0x0f); // to nibble
++  }
++  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
++    uint32_t row_off = offset / 2;
++    bool odd = offset & 0x1;
++    uint8_t old_value = ptr[row_off];
++    uint8_t new_value = odd ? ((old_value & 0x0f) | (value << 4))
++                            : ((old_value & 0xf0) | (value & 0x0f));
++    ptr[offset / 2] = new_value;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename Type>
++class Comparator {};
++
++template <>
++class Comparator<vt::int8> {
++public:
++  static int8_t generate() {
++    return (int8_t)rand();
++  }
++  static bool compare(int8_t a, int8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint8> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand();
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::uint4> {
++public:
++  static uint8_t generate() {
++    return (uint8_t)rand(); // store 2 nibbles in a byte
++  }
++  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::int32> {
++public:
++  static int32_t generate() {
++    return (int32_t)rand();
++  }
++  static bool compare(int32_t a, int32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftoh_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::bf16> {
++public:
++  static uint16_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftob_s(bit_cast<uint32_t>(fvalue), 0, nullptr);
++  }
++  static bool compare(uint16_t a, uint16_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::tf32> {
++public:
++  static uint32_t generate() {
++    auto fvalue = float(rand()) / RAND_MAX;
++    return rv_ftox_s(bit_cast<uint32_t>(fvalue), 8, 10, 0, nullptr);
++  }
++  static bool compare(uint32_t a, uint32_t b, int index, int errors) {
++    if (a != b) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++template <>
++class Comparator<vt::fp32> {
++public:
++  static float generate() {
++    return static_cast<float>(rand()) / RAND_MAX;
++  }
++  static bool compare(float a, float b, int index, int errors) {
++    union fi_t {
++      float f;
++      int32_t i;
++    };
++    fi_t fa, fb;
++    fa.f = a;
++    fb.f = b;
++    auto d = std::abs(fa.i - fb.i);
++    if (d > FLOAT_ULP) {
++      if (errors < MAX_ERRORS) {
++        printf("*** error: [%d] expected=%f, actual=%f\n", index, fb.f, fa.f);
++      }
++      return false;
++    }
++    return true;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++template <typename S, typename D>
++struct muladd_t {
++  using stype = typename S::dtype;
++  using dtype = typename D::dtype;
++  static dtype eval(stype a, stype b, dtype c) {
++    return static_cast<dtype>(a) * static_cast<dtype>(b) + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::fp16, vt::fp16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_htof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_htof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_htof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftoh_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::fp32> {
++  static float eval(uint16_t a, uint16_t b, float c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::bf16, vt::bf16> {
++  static uint16_t eval(uint16_t a, uint16_t b, uint16_t c) {
++    auto fa = bit_cast<float>(rv_btof_s(a, 0, nullptr));
++    auto fb = bit_cast<float>(rv_btof_s(b, 0, nullptr));
++    auto fc = bit_cast<float>(rv_btof_s(c, 0, nullptr));
++    auto fd = fa * fb + fc;
++    return rv_ftob_s(bit_cast<uint32_t>(fd), 0, nullptr);
++  }
++};
++
++template <>
++struct muladd_t<vt::tf32, vt::fp32> {
++  static float eval(uint32_t a, uint32_t b, float c) {
++    auto fa = bit_cast<float>(rv_xtof_s(a, 8, 10, 0, nullptr));
++    auto fb = bit_cast<float>(rv_xtof_s(b, 8, 10, 0, nullptr));
++    return fa * fb + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::int4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    if (a & 0x8) {
++      a_val |= 0xFFFFFFF0; // sign extend
++    }
++    int32_t b_val = b & 0xF;
++    if (b & 0x8) {
++      b_val |= 0xFFFFFFF0; // sign extend
++    }
++    return a_val * b_val + c;
++  }
++};
++
++template <>
++struct muladd_t<vt::uint4, vt::int32> {
++  static int32_t eval(uint8_t a, uint8_t b, int32_t c) {
++    int32_t a_val = a & 0xF;
++    int32_t b_val = b & 0xF;
++    return a_val * b_val + c;
++  }
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
++using cfg = vt::wmma_config_t<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
++
++using itype_t = typename vt::ITYPE::dtype;
++using otype_t = typename vt::OTYPE::dtype;
++
++struct SparseMat {
++  std::vector<itype_t> values;   // non-zeros
++  std::vector<uint8_t> meta;     // Array of row-masks: 1 byte marks the columns
++                                  // of the 4 elements in the block that are non-zero.
++                                  // e.g. 0b0101 means 2nd and 4th elements are non-zero.
++
++  uint32_t rows, cols;           // original A dims (M × K)
++};
++
++static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
++  uint32_t subbytes = 8 / vt::ITYPE::bits;
++  uint32_t KS = subbytes ? (K * subbytes) : K;
++  for (uint32_t m = 0; m < M; ++m) {
++    for (uint32_t n = 0; n < N; ++n) {
++      otype_t sum(0);
++      for (uint32_t k = 0; k < KS; ++k) {
++        auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
++        auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
++        sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, sum);
++      }
++      data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
++    }
++  }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
++const char *kernel_file = "kernel.vxbin";
++
++uint32_t xm = 32;
++uint32_t xn = 32;
++uint32_t xk = 32;
++
++vx_device_h device = nullptr;
++vx_buffer_h A_buffer = nullptr;
++vx_buffer_h B_buffer = nullptr;
++vx_buffer_h C_buffer = nullptr;
++vx_buffer_h krnl_buffer = nullptr;
++vx_buffer_h args_buffer = nullptr;
++kernel_arg_t kernel_arg = {};
++
++std::string last_build_options;
++
++static void show_usage() {
++  std::cout << "Vortex Sgemm TCU Test." << std::endl;
++  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [-h: help]" << std::endl;
++  std::cout << "  -s  Enable 2:4 structured sparsity " << std::endl;
++}
++
++static void parse_args(int argc, char **argv) {
++  int c;
++  while ((c = getopt(argc, argv, "m:n:k:i:o:hs")) != -1) {
++    switch (c) {
++    case 'm':
++      xm = atoi(optarg);
++      break;
++    case 'n':
++      xn = atoi(optarg);
++      break;
++    case 'k':
++      xk = atoi(optarg);
++      break;
++    case 's':
++      g_enable_sparse = true;
++      std::cout << "Sparse mode enabled (-s)" << std::endl;
++      break;
++    case 'h':
++      show_usage();
++      exit(0);
++      break;
++    default:
++      show_usage();
++      exit(-1);
++    }
++  }
++}
++
++void cleanup() {
++  if (device) {
++    vx_mem_free(A_buffer);
++    vx_mem_free(B_buffer);
++    vx_mem_free(C_buffer);
++    vx_mem_free(krnl_buffer);
++    vx_mem_free(args_buffer);
++    vx_dev_close(device);
++  }
++}
++
++
++static SparseMat pruneAndCompressMatrixA(const std::vector<itype_t>& denseA,
++                                         uint32_t M, uint32_t K) {
++  SparseMat out;
++  out.rows = M;
++  out.cols = K;
++  out.values.reserve(M * K / 2); // Select 2 values every 4 values
++  out.meta.reserve(M * K / 4); // 1 byte for every 4 values
++
++  const itype_t* src = denseA.data();
++
++  for (uint32_t r = 0; r < M; ++r) {
++    for (uint32_t c = 0; c < K; c += 4) {
++      itype_t blk[4] = {src[r * K + c],
++                        src[r * K + c + 1],
++                        src[r * K + c + 2],
++                        src[r * K + c + 3]};
++
++      uint32_t idx[4] = {0, 1, 2, 3};
++      std::sort(idx, idx + 4,
++        [&](uint32_t a, uint32_t b) {
++          return std::abs((int)blk[a]) < std::abs((int)blk[b]);
++        }); //Sort the 4 elements by absolute value, ascending order
++
++      uint8_t keep0 = idx[3];
++      uint8_t keep1 = idx[2]; //idx of largest 2 elements
++
++      out.values.push_back(blk[keep0]);
++      out.values.push_back(blk[keep1]);
++
++      uint8_t m = (1u << keep0) | (1u << keep1);  // e.g. 0b0101
++      out.meta.push_back(m);
++    }
++  }
++  return out;
++}
++
++void test_pruneA() {
++  const uint32_t M = 4, K = 8;
++  std::vector<itype_t> denseA(M * K);
++  for (auto& v : denseA) v = Comparator<vt::ITYPE>::generate();
++
++  auto spA = pruneAndCompressMatrixA(denseA, M, K);
++
++  std::vector<itype_t> recovered(M * K, 0);
++  size_t v_idx = 0, m_idx = 0;
++  for (uint32_t r = 0; r < M; ++r)
++    for (uint32_t c = 0; c < K; c += 4) {
++      uint8_t m = spA.meta[m_idx++];
++      for (uint32_t i = 0; i < 4; ++i)
++        if (m & (1u << i))
++          recovered[r * K + c + i] = spA.values[v_idx++];
++    }
++
++  for (uint32_t i = 0; i < M * K; ++i)
++    assert(recovered[i] == denseA[i] || recovered[i] == 0); //Either the value is preserved or pruned
++  std::cout << "pruneAndCompressMatrixA passed\n";
++}
++
++
++int main(int argc, char *argv[]) {
++  // parse command arguments
++  parse_args(argc, argv);
++
++  if(g_enable_sparse) {
++    test_pruneA(); // Test the pruning function
++  }
++
++  std::srand(50);
++
++  // open device connection
++  std::cout << "open device connection" << std::endl;
++  RT_CHECK(vx_dev_open(&device));
++
++  uint64_t isa_flags;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_ISA_FLAGS, &isa_flags));
++  bool has_ext = (isa_flags & VX_ISA_EXT_TCU) != 0;
++  if (!has_ext) {
++    std::cout << "TCU extension not supported!" << std::endl;
++    cleanup();
++    return -1;
++  }
++
++  uint64_t NT;
++  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT));
++  if (NT != NUM_THREADS) {
++    std::cout << "Error: device warp size (" << NT << ") must match NUM_THREADS=" << NUM_THREADS << "!" << std::endl;
++    return -1;
++  }
++
++  uint32_t M = xm;
++  uint32_t N = xn;
++  uint32_t K = xk;
++
++  if ((M % cfg::tileM) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileM!" << std::endl;
++    return -1;
++  }
++
++  if ((N % cfg::tileN) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileN!" << std::endl;
++    return -1;
++  }
++
++  if ((K % cfg::tileK) != 0) {
++    std::cout << "Error: M must be a multiple of tensor tileK!" << std::endl;
++    return -1;
++  }
++
++  size_t sizeA = M * K;
++  size_t sizeB = K * N;
++  size_t sizeC = M * N;
++
++  std::cout << "input data type: " << vt::ITYPE::name << " (id=" << vt::ITYPE::id << ")" << std::endl;
++  std::cout << "output data type: " << vt::OTYPE::name << " (id=" << vt::OTYPE::id << ")" << std::endl;
++  std::cout << "UMMA Core Dimension: M=" << cfg::tcM << ", N=" << cfg::tcN << ", K=" << cfg::tcK << std::endl;
++  std::cout << "UMMA Tile Dimension: M=" << cfg::tileM << ", N=" << cfg::tileN << ", K=" << cfg::tileK << std::endl;
++  std::cout << "matrix A: " << M << "x" << K << std::endl;
++  std::cout << "matrix B: " << K << "x" << N << std::endl;
++  std::cout << "matrix C: " << M << "x" << N << std::endl;
++
++  // set block size to warp size
++  kernel_arg.grid_dim[0] = N / cfg::tileN;
++  kernel_arg.grid_dim[1] = M / cfg::tileM;
++  kernel_arg.block_dim[0] = NT; // warp sizeb
++  kernel_arg.block_dim[1] = 1;
++
++  // set matrix dimensions
++  kernel_arg.M = M;
++  kernel_arg.N = N;
++  kernel_arg.K = K;
++
++  // allocate device memory
++  std::cout << "allocate device memory" << std::endl;
++  RT_CHECK(vx_mem_alloc(device, sizeA * sizeof(itype_t), VX_MEM_READ, &A_buffer));
++  RT_CHECK(vx_mem_address(A_buffer, &kernel_arg.A_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeB * sizeof(itype_t), VX_MEM_READ, &B_buffer));
++  RT_CHECK(vx_mem_address(B_buffer, &kernel_arg.B_addr));
++  RT_CHECK(vx_mem_alloc(device, sizeC * sizeof(otype_t), VX_MEM_WRITE, &C_buffer));
++  RT_CHECK(vx_mem_address(C_buffer, &kernel_arg.C_addr));
++
++  std::cout << "A_addr=0x" << std::hex << kernel_arg.A_addr << std::endl;
++  std::cout << "B_addr=0x" << std::hex << kernel_arg.B_addr << std::endl;
++  std::cout << "C_addr=0x" << std::hex << kernel_arg.C_addr << std::endl;
++
++  // generate source data
++  std::vector<itype_t> h_A(sizeA);
++  std::vector<itype_t> h_B(sizeB);
++  for (uint32_t i = 0; i < sizeA; ++i) {
++    h_A[i] = Comparator<vt::ITYPE>::generate();
++  }
++  for (uint32_t i = 0; i < sizeB; ++i) {
++    h_B[i] = Comparator<vt::ITYPE>::generate();
++  }
++
++  // upload matrix A buffer
++  {
++    std::cout << "upload matrix A buffer" << std::endl;
++    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, sizeA * sizeof(itype_t)));
++  }
++
++  // upload matrix B buffer
++  {
++    std::cout << "upload matrix B buffer" << std::endl;
++    if constexpr (std::is_same<vt::ITYPE, vt::int4>::value || std::is_same<vt::ITYPE, vt::uint4>::value) {
++      // sub-byte matrix B must be in col-major format
++      // we convert the 4-bit row-major to col-major here
++      std::vector<uint8_t> h_B_col(sizeB);
++      convert_row_to_col_major_4bit(h_B_col.data(), N, 2 * K, (uint8_t*)h_B.data());
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B_col.data(), 0, sizeB));
++    } else {
++      RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, sizeB * sizeof(itype_t)));
++    }
++  }
++
++  // upload program
++  std::cout << "upload program" << std::endl;
++  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
++
++  // upload kernel argument
++  std::cout << "upload kernel argument" << std::endl;
++  RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
++
++  auto time_start = std::chrono::high_resolution_clock::now();
++
++  // start device
++  std::cout << "start device" << std::endl;
++  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
++
++  // wait for completion
++  std::cout << "wait for completion" << std::endl;
++  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
++
++  auto time_end = std::chrono::high_resolution_clock::now();
++  double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
++  printf("Elapsed time: %lg ms\n", elapsed);
++
++  // download destination buffer
++  std::vector<otype_t> h_C(sizeC);
++  std::cout << "download destination buffer" << std::endl;
++  RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, sizeC * sizeof(otype_t)));
++
++  // verify result
++  std::cout << "verify result" << std::endl;
++  int errors = 0;
++  {
++    std::vector<otype_t> h_ref(sizeC);
++    matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
++
++    for (uint32_t i = 0; i < h_ref.size(); ++i) {
++      if (!Comparator<vt::OTYPE>::compare(h_C[i], h_ref[i], i, errors)) {
++        ++errors;
++      }
++    }
++  }
++
++  // cleanup
++  std::cout << "cleanup" << std::endl;
++  cleanup();
++
++  if (errors != 0) {
++    std::cout << "Found " << std::dec << errors << " / " << sizeC << " errors!" << std::endl;
++    std::cout << "FAILED!" << std::endl;
++    return errors;
++  }
++
++  std::cout << "PASSED!" << std::endl;
++
++  return 0;
++}
+\ No newline at end of file
